@@ -8,6 +8,16 @@ exported name is a change to them: build and test tpm2-kira after one.
   host keys are made in the TPM under the NULL hierarchy, one per boot;
   their authorization values live in one process's memory. Do not add a
   mode that writes a key, or a secret that unlocks one, to a file.
+- **The PIN is never stored, logged or passed in argv or the environment.**
+  It comes from the terminal or a file descriptor; whatever proves it to
+  the TPM runs in a salted session, whatever carries it is encrypted.
+- **Only the PIN index is DA-protected.** The storage primary, the CA, the
+  authority key, the counter and the host keys are noDA, so that a lockout
+  after wrong PINs never stops `Issue`. Anything that holds the PIN must
+  be counted, and anything else must not be.
+- **hostkey builds with go-tpm as released.** tpm2-kira compiles assh with
+  its own go-tpm; assh's `replace` (the fork) does not reach it. Commands
+  only the fork has are used in `tpmadmin` alone.
 - **No backwards compatibility.** One file format, the current one
   (`hostkey.fileVersion`); another version is an error that says to
   create the CA again. No migrations.

@@ -18,10 +18,11 @@ import (
 )
 
 // primaryTemplate is the storage key the keys here are children of: the
-// TCG's ECC P-256 storage root template, created again on every use and
-// never persisted. Under the owner hierarchy it is the same in every boot
-// (the CA); under the NULL hierarchy it changes with every reboot (the
-// host keys).
+// TCG's ECC P-256 storage root template, noDA, created again on every use
+// and never persisted. Under the owner hierarchy it is the same in every
+// boot (the CA, the authority); under the NULL hierarchy it changes with
+// every reboot (the host keys). noDA, so that a dictionary attack lockout
+// (wrong PINs) does not stop the keys under it from loading.
 func primaryTemplate() tpm2.TPMTPublic {
 	return tpm2.TPMTPublic{
 		Type:    tpm2.TPMAlgECC,
@@ -31,6 +32,7 @@ func primaryTemplate() tpm2.TPMTPublic {
 			FixedParent:         true,
 			SensitiveDataOrigin: true,
 			UserWithAuth:        true,
+			NoDA:                true,
 			Restricted:          true,
 			Decrypt:             true,
 		},
@@ -73,18 +75,19 @@ func flush(t transport.TPM, h tpm2.TPMHandle) {
 }
 
 // keyTemplate is a signing key made in the TPM and never exported. The CA
-// is used through its policy alone; a host key with its authorization
-// value (noDA: 32 random bytes are no guess worth locking the TPM over).
+// and the authority are used through their policies alone; a host key with
+// its authorization value (32 random bytes are no guess worth locking the
+// TPM over). All are noDA: the PIN index is what counts wrong PINs.
 func keyTemplate(typ Type, policy []byte) (tpm2.TPMTPublic, error) {
 	attrs := tpm2.TPMAObject{
 		FixedTPM:            true,
 		FixedParent:         true,
 		SensitiveDataOrigin: true,
+		NoDA:                true,
 		SignEncrypt:         true,
 	}
 	if policy == nil {
 		attrs.UserWithAuth = true
-		attrs.NoDA = true
 	}
 	t := tpm2.TPMTPublic{NameAlg: tpm2.TPMAlgSHA256, ObjectAttributes: attrs, AuthPolicy: tpm2.TPM2BDigest{Buffer: policy}}
 	switch typ {
@@ -121,10 +124,11 @@ func createKey(t transport.TPM, p *primary, tmpl tpm2.TPMTPublic, auth []byte) (
 }
 
 // CreateCA makes a new CA in the TPM, bound to pcrs in bank: it signs while
-// they hold values authority approved. policyRef ties the authority's
-// signatures to this CA's use ("assh boot", say): an approval made for a CA
-// with another reference does not let this one sign. The CA has no
-// approval yet: Approve adds them.
+// they hold values authority - a key elsewhere - approved. policyRef ties
+// the authority's signatures to this CA's use ("assh boot", say): an
+// approval made for a CA with another reference does not let this one
+// sign. The CA has no approval yet: Approve adds them. Its approvals are
+// never revoked; CreatePINCA makes a CA whose are.
 func CreateCA(t transport.TPM, typ Type, bank Bank, pcrs []int, authority crypto.PublicKey, policyRef []byte) (*CA, error) {
 	if len(pcrs) == 0 {
 		return nil, errors.New("the CA is bound to no PCR")
@@ -134,11 +138,15 @@ func CreateCA(t transport.TPM, typ Type, bank Bank, pcrs []int, authority crypto
 	if len(policyRef) > 32 {
 		return nil, errors.New("a policy reference of more than 32 bytes")
 	}
-	policy, err := caPolicy(authority, policyRef)
+	at, err := authorityTemplate(authority)
 	if err != nil {
 		return nil, err
 	}
-	tmpl, err := keyTemplate(typ, policy)
+	name, err := tpm2.ObjectName(&at)
+	if err != nil {
+		return nil, err
+	}
+	tmpl, err := keyTemplate(typ, caPolicyFor(*name, policyRef))
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +155,6 @@ func CreateCA(t transport.TPM, typ Type, bank Bank, pcrs []int, authority crypto
 		return nil, err
 	}
 	// The TPM must be able to check the authority's signatures later.
-	at, _ := authorityTemplate(authority)
 	ext, err := tpm2.LoadExternal{InPublic: tpm2.New2B(at), Hierarchy: tpm2.TPMRHOwner}.Execute(t)
 	if err != nil {
 		return nil, fmt.Errorf("this TPM does not take the authority's key: %w", err)
@@ -199,26 +206,44 @@ func ReadPCRs(t transport.TPM, bank Bank, pcrs []int) (map[int][]byte, error) {
 }
 
 // MismatchError is a CA that may not sign: no approval for what the PCRs
-// hold.
+// hold, at the counter's generation.
 type MismatchError struct {
 	Changed []int // the PCRs that differ from the closest approval; all of them without one
-	None    bool  // there is no approval at all
+	None    bool  // there is no approval at all (at this generation)
+	// Revoked: the PCRs hold a state approved for an older generation
+	// (Generation); the counter is at Counter.
+	Revoked             bool
+	Generation, Counter uint64
 }
 
 func (e *MismatchError) Error() string {
-	if e.None {
+	switch {
+	case e.Revoked:
+		return fmt.Sprintf("the PCR state was approved for generation %d, the counter is at %d: revoked", e.Generation, e.Counter)
+	case e.None:
 		return "the CA has no approved PCR state"
 	}
 	return PCRList(e.Changed) + " not as approved"
 }
 
-// mismatch names the PCRs that differ from the closest approval.
-func (f *CA) mismatch(now map[int][]byte) error {
-	if len(f.Approvals) == 0 {
+// mismatch names the PCRs that differ from the closest approval at gen.
+func (f *CA) mismatch(now map[int][]byte, gen uint64) error {
+	var current []Approval
+	for _, a := range f.Approvals {
+		if a.Generation == gen {
+			current = append(current, a)
+		}
+	}
+	for _, a := range f.Approvals {
+		if a.Generation < gen && sameValues(f.PCRs, a.PCRs, now) {
+			return &MismatchError{Revoked: true, Generation: a.Generation, Counter: gen, Changed: f.PCRs}
+		}
+	}
+	if len(current) == 0 {
 		return &MismatchError{None: true, Changed: f.PCRs}
 	}
 	var best []int
-	for _, a := range f.Approvals {
+	for _, a := range current {
 		var changed []int
 		for _, i := range f.PCRs {
 			if !bytes.Equal(a.PCRs[i], now[i]) {
@@ -244,24 +269,19 @@ type caSigner struct {
 func (s *caSigner) Public() crypto.PublicKey { return s.pub }
 
 func (s *caSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
-	f, t := s.ca, s.t
-	sig, err := tpm2.Unmarshal[tpm2.TPMTSignature](s.approval.Signature)
+	f, t, a := s.ca, s.t, s.approval
+	sig, err := tpm2.Unmarshal[tpm2.TPMTSignature](a.Signature)
 	if err != nil {
 		return nil, fmt.Errorf("the approval's signature: %w", err)
 	}
-	approved, err := f.approvedPolicy(s.approval.PCRs)
+	approved, err := f.approvedPolicy(a.PCRs, a.Generation)
 	if err != nil {
 		return nil, err
 	}
-	adigest, err := f.ApprovalDigest(s.approval.PCRs)
+	adigest, err := f.approvalDigestAt(a.PCRs, a.Generation)
 	if err != nil {
 		return nil, err
 	}
-	authority, err := f.authorityKey()
-	if err != nil {
-		return nil, err
-	}
-	at, _ := authorityTemplate(authority)
 	p, err := createPrimary(t, tpm2.TPMRHOwner)
 	if err != nil {
 		return nil, err
@@ -272,43 +292,103 @@ func (s *caSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]b
 		return nil, fmt.Errorf("the CA does not load in this TPM: %w", err)
 	}
 	defer flush(t, key.ObjectHandle)
-	// The ticket must come from a key in a real hierarchy: PolicyAuthorize
-	// refuses the NULL ticket of a NULL-hierarchy key.
-	ext, err := tpm2.LoadExternal{InPublic: tpm2.New2B(at), Hierarchy: tpm2.TPMRHOwner}.Execute(t)
+	authority, name, err := f.loadAuthority(t, p)
 	if err != nil {
-		return nil, fmt.Errorf("loading the authority's key: %w", err)
+		return nil, err
 	}
-	defer flush(t, ext.ObjectHandle)
+	defer flush(t, authority)
 	ticket, err := tpm2.VerifySignature{
-		KeyHandle: ext.ObjectHandle,
+		KeyHandle: authority,
 		Digest:    tpm2.TPM2BDigest{Buffer: adigest},
 		Signature: *sig,
 	}.Execute(t)
 	if err != nil {
 		return nil, fmt.Errorf("the TPM does not accept the approval's signature: %w", err)
 	}
-	session := tpm2.Policy(tpm2.TPMAlgSHA256, 16, func(tpm transport.TPM, h tpm2.TPMISHPolicy, _ tpm2.TPM2BNonce) error {
-		if _, err := (tpm2.PolicyPCR{PolicySession: h, Pcrs: f.pcrSelection()}).Execute(tpm); err != nil {
+	session, done, err := policySession(t)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	h := session.Handle()
+	err = func() error {
+		if _, err := (tpm2.PolicyPCR{PolicySession: h, Pcrs: f.pcrSelection()}).Execute(t); err != nil {
 			return err
+		}
+		if f.Counter != nil {
+			g, err := f.counter()
+			if err != nil {
+				return err
+			}
+			gName := nvName(g)
+			if _, err := (tpm2.PolicyNV{
+				AuthHandle:    tpm2.AuthHandle{Handle: g.NVIndex, Name: gName, Auth: tpm2.PasswordAuth(nil)},
+				NVIndex:       tpm2.NamedHandle{Handle: g.NVIndex, Name: gName},
+				PolicySession: h,
+				OperandB:      tpm2.TPM2BOperand{Buffer: binary.BigEndian.AppendUint64(nil, a.Generation)},
+				Operation:     tpm2.TPMEOEq,
+			}).Execute(t); err != nil {
+				return err
+			}
 		}
 		_, err := tpm2.PolicyAuthorize{
 			PolicySession:  h,
 			ApprovedPolicy: tpm2.TPM2BDigest{Buffer: approved},
 			PolicyRef:      tpm2.TPM2BDigest{Buffer: f.PolicyRef},
-			KeySign:        ext.Name,
+			KeySign:        name,
 			CheckTicket:    ticket.Validation,
-		}.Execute(tpm)
+		}.Execute(t)
 		return err
-	})
-	out, err := sign(t, key, session, s.pub, digest, opts)
+	}()
+	var out []byte
+	if err == nil {
+		out, err = sign(t, key, session, s.pub, digest, opts)
+	}
 	if err != nil {
-		// The PCRs moved between the read and the signature.
-		if again, rerr := f.ReadPCRs(t); rerr == nil && f.Approved(again) == nil {
-			return nil, f.mismatch(again)
+		// The PCRs or the counter moved between the read and the signature.
+		if gen, gerr := f.tpmGeneration(t); gerr == nil {
+			if again, rerr := f.ReadPCRs(t); rerr == nil && f.approvedAt(again, gen) == nil {
+				return nil, f.mismatch(again, gen)
+			}
 		}
 		return nil, fmt.Errorf("the CA's signature: %w", err)
 	}
 	return out, nil
+}
+
+// loadAuthority loads the authority's key to check an approval: the key in
+// the TPM itself, or the public key of one elsewhere. Either is in the
+// owner hierarchy: PolicyAuthorize refuses the NULL ticket of a
+// NULL-hierarchy key.
+func (f *CA) loadAuthority(t transport.TPM, p *primary) (tpm2.TPMHandle, tpm2.TPM2BName, error) {
+	if f.AuthorityTPM != nil {
+		key, err := loadKey(t, p, f.AuthorityTPM.Public, f.AuthorityTPM.Private)
+		if err != nil {
+			return 0, tpm2.TPM2BName{}, fmt.Errorf("the authority does not load in this TPM: %w", err)
+		}
+		return key.ObjectHandle, key.Name, nil
+	}
+	authority, err := f.authorityKey()
+	if err != nil {
+		return 0, tpm2.TPM2BName{}, err
+	}
+	at, err := authorityTemplate(authority)
+	if err != nil {
+		return 0, tpm2.TPM2BName{}, err
+	}
+	ext, err := tpm2.LoadExternal{InPublic: tpm2.New2B(at), Hierarchy: tpm2.TPMRHOwner}.Execute(t)
+	if err != nil {
+		return 0, tpm2.TPM2BName{}, fmt.Errorf("loading the authority's key: %w", err)
+	}
+	return ext.ObjectHandle, ext.Name, nil
+}
+
+// tpmGeneration is the counter's value in the TPM, 0 without a counter.
+func (f *CA) tpmGeneration(t transport.TPM) (uint64, error) {
+	if f.Counter == nil {
+		return 0, nil
+	}
+	return f.Generation(t)
 }
 
 func loadKey(t transport.TPM, p *primary, public, private []byte) (*tpm2.LoadResponse, error) {
@@ -353,7 +433,8 @@ func (h *HostKey) SSH() ssh.Signer { return h.ssh }
 func (h *HostKey) Fingerprint() string { return ssh.FingerprintSHA256(h.Cert.Key) }
 
 // Issue makes this boot's host key in the TPM and has the CA certify it:
-// only while the PCRs hold an approved state (else a *MismatchError). The
+// only while the PCRs hold an approved state - with a counter, approved
+// for the generation it is at - (else a *MismatchError). It needs no PIN. The
 // key lives under the TPM's NULL hierarchy: it works until the next
 // reboot, from any PCR state, and never after.
 func Issue(t transport.TPM, ca *CA, o IssueOptions) (*HostKey, error) {
@@ -370,9 +451,13 @@ func Issue(t transport.TPM, ca *CA, o IssueOptions) (*HostKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := ca.Approved(now)
+	gen, err := ca.tpmGeneration(t)
+	if err != nil {
+		return nil, err
+	}
+	a := ca.approvedAt(now, gen)
 	if a == nil {
-		return nil, ca.mismatch(now)
+		return nil, ca.mismatch(now, gen)
 	}
 	caPub, err := ca.PublicKey()
 	if err != nil {
@@ -465,5 +550,15 @@ func (f *CA) Describe() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s CA held in the TPM, %s\n", f.Type, f.Fingerprint())
 	fmt.Fprintf(&b, "signs while %s (%s) hold an approved state; %d approved\n", PCRList(f.PCRs), f.Bank, len(f.Approvals))
+	if f.AuthorityTPM != nil {
+		pPub, _, _ := f.pinIndex()
+		gPub, _ := f.counter()
+		fmt.Fprintf(&b, "authority: in the TPM, opened by a PIN (index 0x%08X); counter 0x%08X at generation %d in this file\n",
+			uint32(pPub.NVIndex), uint32(gPub.NVIndex), f.FileGeneration())
+	} else if k, err := f.authorityKey(); err == nil {
+		if sk, err := ssh.NewPublicKey(k); err == nil {
+			fmt.Fprintf(&b, "authority: a key elsewhere, %s; approvals are never revoked\n", ssh.FingerprintSHA256(sk))
+		}
+	}
 	return b.String()
 }

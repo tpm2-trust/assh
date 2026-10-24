@@ -102,3 +102,66 @@ func (s *SWTPM) Open(t *testing.T) transport.TPMCloser {
 func (s *SWTPM) Opener() func() (transport.TPMCloser, error) {
 	return func() (transport.TPMCloser, error) { return transport.OpenTPM(s.Sock) }
 }
+
+// LockoutAuth is the lockout authorization SetLockout gives the TPM.
+var LockoutAuth = []byte("swtpmtest lockout")
+
+// SetLockout gives the TPM a lockout authorization (LockoutAuth) and the
+// dictionary attack parameters maxTries, recovery and lockoutRecovery.
+func (s *SWTPM) SetLockout(t *testing.T, maxTries, recovery, lockoutRecovery uint32) {
+	t.Helper()
+	c := s.Open(t)
+	if _, err := (tpm2.HierarchyChangeAuth{AuthHandle: tpm2.TPMRHLockout, NewAuth: tpm2.TPM2BAuth{Buffer: LockoutAuth}}).Execute(c); err != nil {
+		t.Fatal(err)
+	}
+	lockout := tpm2.AuthHandle{Handle: tpm2.TPMRHLockout, Auth: tpm2.PasswordAuth(LockoutAuth)}
+	if _, err := (tpm2.DictionaryAttackParameters{AuthHandle: lockout, MaxTries: maxTries, RecoveryTime: recovery, LockoutRecovery: lockoutRecovery}).Execute(c); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ResetLockout forgets the counted authorization failures (needs
+// SetLockout first).
+func (s *SWTPM) ResetLockout(t *testing.T) {
+	t.Helper()
+	c := s.Open(t)
+	lockout := tpm2.AuthHandle{Handle: tpm2.TPMRHLockout, Auth: tpm2.PasswordAuth(LockoutAuth)}
+	if _, err := (tpm2.DictionaryAttackLockReset{LockHandle: lockout}).Execute(c); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// NoneLeft fails the test when the TPM holds a transient object or a
+// session: without a resource manager, whatever a command leaves stays.
+// Leftovers are flushed.
+func NoneLeft(t *testing.T, c transport.TPM, after string) {
+	t.Helper()
+	for _, first := range []uint32{0x80000000, 0x02000000} {
+		rsp, err := tpm2.GetCapability{Capability: tpm2.TPMCapHandles, Property: first, PropertyCount: 64}.Execute(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hs, err := rsp.CapabilityData.Data.Handles()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range hs.Handle {
+			t.Errorf("%s: handle 0x%08X left in the TPM", after, uint32(h))
+			tpm2.FlushContext{FlushHandle: h}.Execute(c)
+		}
+	}
+}
+
+// Recorder is a TPM that keeps every byte sent to it and back.
+type Recorder struct {
+	transport.TPM
+	Bytes []byte
+}
+
+// Send implements transport.TPM.
+func (r *Recorder) Send(cmd []byte) ([]byte, error) {
+	r.Bytes = append(r.Bytes, cmd...)
+	rsp, err := r.TPM.Send(cmd)
+	r.Bytes = append(r.Bytes, rsp...)
+	return rsp, err
+}

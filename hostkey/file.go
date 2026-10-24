@@ -9,6 +9,11 @@
 // for every state the CA may sign in - after a firmware update, say - so
 // the CA and the clients' trust in it stay the same for its whole life.
 //
+// The authority is a key elsewhere (a file, a token: CreateCA), or a key in
+// this TPM opened by a PIN (CreatePINCA). The second comes with a counter
+// in the TPM that every approval names: incrementing it (NextGeneration)
+// revokes every approval made before.
+//
 // At its start a server asks for a host key (Issue): the TPM makes a new
 // one under its NULL hierarchy, whose seed changes at every reboot, and
 // the CA certifies it - while the PCRs hold an approved state. The host
@@ -92,7 +97,7 @@ func (b Bank) size() int {
 
 // fileVersion is the one format read; another is an error that says to
 // create the CA again.
-const fileVersion = 1
+const fileVersion = 2
 
 // CA is the certificate authority: the TPM's wrapped copy of its key, the
 // authority that approves the PCR states it signs in, and its approvals.
@@ -111,19 +116,27 @@ type CA struct {
 	Authority []byte `json:"authority"`  // the authority's public key, PKIX DER
 	PolicyRef []byte `json:"policy_ref"` // what its signatures are bound to
 
+	// AuthorityTPM is the authority when it is a key in this TPM, opened
+	// by a PIN; nil for a key elsewhere.
+	AuthorityTPM *TPMAuthority `json:"authority_tpm,omitempty"`
+	// Counter is the counter every approval names; with AuthorityTPM only.
+	Counter *Counter `json:"counter,omitempty"`
+
 	Approvals []Approval `json:"approvals,omitempty"`
 }
 
 // Approval is a PCR state the authority signed: the CA signs while the
-// PCRs hold these values.
+// PCRs hold these values - and, with a counter, while it holds Generation.
 type Approval struct {
-	PCRs      map[int][]byte `json:"pcrs"`
-	Signature []byte         `json:"signature"` // TPMT_SIGNATURE over ApprovalDigest
+	PCRs       map[int][]byte `json:"pcrs"`
+	Generation uint64         `json:"generation,omitempty"` // the counter's value; 0 without one
+	Signature  []byte         `json:"signature"`            // TPMT_SIGNATURE over ApprovalDigest
 }
 
-// Equal is whether b is the same approval: the same values, signed alike.
+// Equal is whether b is the same approval: the same values and generation,
+// signed alike.
 func (a Approval) Equal(b *Approval) bool {
-	if b == nil || len(a.PCRs) != len(b.PCRs) || string(a.Signature) != string(b.Signature) {
+	if b == nil || len(a.PCRs) != len(b.PCRs) || a.Generation != b.Generation || string(a.Signature) != string(b.Signature) {
 		return false
 	}
 	for i, v := range a.PCRs {
@@ -166,6 +179,9 @@ func ParseCA(data []byte) (*CA, error) {
 		return nil, errors.New("the CA is bound to no PCR")
 	}
 	if _, err := f.PublicKey(); err != nil {
+		return nil, err
+	}
+	if err := f.checkTPMAuthority(); err != nil {
 		return nil, err
 	}
 	if _, err := f.authorityKey(); err != nil {
@@ -273,11 +289,25 @@ func (f *CA) KnownHosts(hosts string) (string, error) {
 	return "@cert-authority " + hosts + " " + strings.TrimSpace(string(k)), nil
 }
 
-// Approved is the approval for exactly these values, nil when there is
-// none.
+// FileGeneration is the generation the file is at: the one Approve signs for.
+// 0 without a counter. The TPM's counter decides what the CA signs
+// (Generation, Sync).
+func (f *CA) FileGeneration() uint64 {
+	if f.Counter == nil {
+		return 0
+	}
+	return f.Counter.Generation
+}
+
+// Approved is the approval for exactly these values at the file's
+// generation, nil when there is none.
 func (f *CA) Approved(values map[int][]byte) *Approval {
+	return f.approvedAt(values, f.FileGeneration())
+}
+
+func (f *CA) approvedAt(values map[int][]byte, gen uint64) *Approval {
 	for i := range f.Approvals {
-		if sameValues(f.PCRs, f.Approvals[i].PCRs, values) {
+		if f.Approvals[i].Generation == gen && sameValues(f.PCRs, f.Approvals[i].PCRs, values) {
 			return &f.Approvals[i]
 		}
 	}

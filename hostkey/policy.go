@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
@@ -21,13 +22,14 @@ import (
 //
 //	CA key:   PolicyAuthorize(authority, policyRef)
 //	approved: PolicyPCR(the CA's PCRs, H(values in index order))
+//	          ; PolicyNV(counter == generation)    with a counter
 //
 // The authority signs ApprovalDigest = SHA-256(approved || policyRef); when
 // the CA signs, the TPM checks that signature (VerifySignature) and accepts
 // the session that reached the approved digest (PolicyAuthorize).
 
-// authorityTemplate is the authority's public key as the TPM loads it to
-// check a signature. Its Name - a hash of exactly this - is part of the
+// authorityTemplate is an authority's public key elsewhere as the TPM loads
+// it to check a signature. Its Name - a hash of exactly this - is part of the
 // CA's policy, so it must not change.
 func authorityTemplate(pub crypto.PublicKey) (tpm2.TPMTPublic, error) {
 	switch k := pub.(type) {
@@ -96,6 +98,13 @@ func pad(b []byte, n int) []byte {
 }
 
 func (f *CA) authorityKey() (crypto.PublicKey, error) {
+	if f.AuthorityTPM != nil {
+		pub, err := tpm2.Unmarshal[tpm2.TPMTPublic](f.AuthorityTPM.Public)
+		if err != nil {
+			return nil, fmt.Errorf("the authority's public part: %w", err)
+		}
+		return tpm2.Pub(*pub)
+	}
 	pub, err := x509.ParsePKIXPublicKey(f.Authority)
 	if err != nil {
 		return nil, fmt.Errorf("the authority's public key: %w", err)
@@ -112,27 +121,39 @@ func (f *CA) AuthorityKey() crypto.PublicKey {
 	return k
 }
 
-// caPolicy is the CA key's policy: whatever the authority approves.
-func caPolicy(authority crypto.PublicKey, policyRef []byte) ([]byte, error) {
-	t, err := authorityTemplate(authority)
-	if err != nil {
-		return nil, err
+// authorityName is the Name of the authority's key as the TPM checks its
+// signatures: the key in the TPM itself, or the template of one elsewhere.
+func (f *CA) authorityName() (tpm2.TPM2BName, error) {
+	var pub tpm2.TPMTPublic
+	if f.AuthorityTPM != nil {
+		p, err := tpm2.Unmarshal[tpm2.TPMTPublic](f.AuthorityTPM.Public)
+		if err != nil {
+			return tpm2.TPM2BName{}, err
+		}
+		pub = *p
+	} else {
+		k, err := f.authorityKey()
+		if err != nil {
+			return tpm2.TPM2BName{}, err
+		}
+		if pub, err = authorityTemplate(k); err != nil {
+			return tpm2.TPM2BName{}, err
+		}
 	}
-	name, err := tpm2.ObjectName(&t)
+	name, err := tpm2.ObjectName(&pub)
 	if err != nil {
-		return nil, err
+		return tpm2.TPM2BName{}, err
 	}
-	calc, err := tpm2.NewPolicyCalculator(tpm2.TPMAlgSHA256)
-	if err != nil {
-		return nil, err
-	}
-	if err := (tpm2.PolicyAuthorize{
+	return *name, nil
+}
+
+// caPolicyFor is the CA key's policy: whatever the authority of this Name
+// approves.
+func caPolicyFor(authority tpm2.TPM2BName, policyRef []byte) []byte {
+	return policyDigest(tpm2.PolicyAuthorize{
 		PolicyRef: tpm2.TPM2BDigest{Buffer: policyRef},
-		KeySign:   *name,
-	}).Update(calc); err != nil {
-		return nil, err
-	}
-	return calc.Hash().Digest, nil
+		KeySign:   authority,
+	}.Update)
 }
 
 // pcrSelection is the CA's PCRs in its bank.
@@ -151,9 +172,9 @@ func pcrBitmap(pcrs []int) []byte {
 	return b
 }
 
-// approvedPolicy is the PolicyPCR digest of a session that finds values in
-// the CA's PCRs.
-func (f *CA) approvedPolicy(values map[int][]byte) ([]byte, error) {
+// approvedPolicy is the digest of a session that finds values in the CA's
+// PCRs and, with a counter, gen in it.
+func (f *CA) approvedPolicy(values map[int][]byte, gen uint64) ([]byte, error) {
 	if err := f.checkValues(values); err != nil {
 		return nil, err
 	}
@@ -171,15 +192,32 @@ func (f *CA) approvedPolicy(values map[int][]byte) ([]byte, error) {
 	}).Update(calc); err != nil {
 		return nil, err
 	}
+	if f.Counter != nil {
+		g, err := f.counter()
+		if err != nil {
+			return nil, err
+		}
+		if err := (tpm2.PolicyNV{
+			NVIndex:   tpm2.NamedHandle{Handle: g.NVIndex, Name: nvName(g)},
+			OperandB:  tpm2.TPM2BOperand{Buffer: binary.BigEndian.AppendUint64(nil, gen)},
+			Operation: tpm2.TPMEOEq,
+		}).Update(calc); err != nil {
+			return nil, err
+		}
+	}
 	return calc.Hash().Digest, nil
 }
 
-// ApprovalDigest is what the authority signs to approve values: SHA-256
-// over the approved policy and the CA's policy reference. A signer that
-// is not at hand (a token elsewhere) signs it there; AddApproval takes the
-// signature.
+// ApprovalDigest is what the authority signs to approve values at the
+// file's generation: SHA-256 over the approved policy and the CA's policy
+// reference. A signer that is not at hand (a token elsewhere) signs it
+// there; AddApproval takes the signature.
 func (f *CA) ApprovalDigest(values map[int][]byte) ([]byte, error) {
-	policy, err := f.approvedPolicy(values)
+	return f.approvalDigestAt(values, f.FileGeneration())
+}
+
+func (f *CA) approvalDigestAt(values map[int][]byte, gen uint64) ([]byte, error) {
+	policy, err := f.approvedPolicy(values, gen)
 	if err != nil {
 		return nil, err
 	}
@@ -189,8 +227,9 @@ func (f *CA) ApprovalDigest(values map[int][]byte) ([]byte, error) {
 	return h.Sum(nil), nil
 }
 
-// Approve signs values with the authority's private key and adds the
-// approval. The signer may be a token: it is asked for one signature over
+// Approve signs values at the file's generation with the authority's
+// private key and adds the approval. The signer may be a token, or the
+// authority in the TPM (TPMAuthority): it is asked for one signature over
 // a SHA-256 digest.
 func (f *CA) Approve(authority crypto.Signer, values map[int][]byte) error {
 	digest, err := f.ApprovalDigest(values)
@@ -207,8 +246,8 @@ func (f *CA) Approve(authority crypto.Signer, values map[int][]byte) error {
 // AddApproval adds values with the authority's signature over their
 // ApprovalDigest: PKCS #1 v1.5 for RSA, ASN.1 DER for ECDSA, as Go's
 // crypto.Signer and openssl make them. A signature the authority did not
-// make is refused here, not at the boot. Values already approved get the
-// new signature.
+// make is refused here, not at the boot. Values already approved at this
+// generation get the new signature.
 func (f *CA) AddApproval(values map[int][]byte, sig []byte) error {
 	digest, err := f.ApprovalDigest(values)
 	if err != nil {
@@ -231,7 +270,7 @@ func (f *CA) AddApproval(values map[int][]byte, sig []byte) error {
 		a.Signature = b
 		return nil
 	}
-	f.Approvals = append(f.Approvals, Approval{PCRs: copied, Signature: b})
+	f.Approvals = append(f.Approvals, Approval{PCRs: copied, Generation: f.FileGeneration(), Signature: b})
 	return nil
 }
 
