@@ -7,7 +7,8 @@ exported name is a change to them: build and test tpm2-kira after one.
 - **No host key and no secret of one is stored.** The CA lives in the TPM;
   host keys are made in the TPM under the NULL hierarchy, one per boot;
   their authorization values live in one process's memory. Do not add a
-  mode that writes a key, or a secret that unlocks one, to a file.
+  mode that writes a key, or a secret that unlocks one, to a file. A
+  cleared TPM loses the CA, and that is accepted: no backup, no export.
 - **The PIN is never stored, logged or passed in argv or the environment.**
   It comes from the terminal or a file descriptor; whatever proves it to
   the TPM runs in a salted session, whatever carries it is encrypted.

@@ -9,10 +9,13 @@
 // for every state the CA may sign in - after a firmware update, say - so
 // the CA and the clients' trust in it stay the same for its whole life.
 //
-// The authority is a key elsewhere (a file, a token: CreateCA), or a key in
-// this TPM opened by a PIN (CreatePINCA). The second comes with a counter
-// in the TPM that every approval names: incrementing it (NextGeneration)
-// revokes every approval made before.
+// The authority is a key elsewhere (a file, a token: CreateCA), whose
+// private key never comes to the TPM, or a key made in this TPM and opened
+// by a PIN alone, with no PCR condition (CreatePINCA). The second comes
+// with a counter in the TPM that every approval names: incrementing it
+// (NextGeneration) revokes every approval made before. Either way an
+// approval is a signature, kept in the CA file, that the TPM checks each
+// time the CA signs.
 //
 // At its start a server asks for a host key (Issue): the TPM makes a new
 // one under its NULL hierarchy, whose seed changes at every reboot, and
@@ -24,6 +27,8 @@
 // any other process, gets no certificate.
 //
 // Nothing here is a secret outside the TPM, and no secret ever leaves it.
+// So a cleared TPM, or another one, loses the CA: there is no backup of it,
+// and a new CA means a new known_hosts line on every client.
 // Clients trust the CA, not a key: a known_hosts line
 //
 //	@cert-authority <hosts> <the CA's public key>

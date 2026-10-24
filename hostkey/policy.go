@@ -24,9 +24,12 @@ import (
 //	approved: PolicyPCR(the CA's PCRs, H(values in index order))
 //	          ; PolicyNV(counter == generation)    with a counter
 //
-// The authority signs ApprovalDigest = SHA-256(approved || policyRef); when
-// the CA signs, the TPM checks that signature (VerifySignature) and accepts
-// the session that reached the approved digest (PolicyAuthorize).
+// The authority signs ApprovalDigest = SHA-256(approved || policyRef). When
+// the CA signs (caSigner.Sign), the TPM checks that signature
+// (VerifySignature, a ticket), a session runs PolicyPCR and PolicyNV over
+// the TPM's state as it is, and PolicyAuthorize with the ticket turns the
+// approved digest into the CA's policy. No PCR value is in the CA's policy:
+// a new state needs a new approval, never a new CA.
 
 // authorityTemplate is an authority's public key elsewhere as the TPM loads
 // it to check a signature. Its Name - a hash of exactly this - is part of the
