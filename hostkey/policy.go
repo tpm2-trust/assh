@@ -1,0 +1,272 @@
+package hostkey
+
+import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/asn1"
+	"errors"
+	"fmt"
+	"math/big"
+
+	"github.com/google/go-tpm/tpm2"
+)
+
+// The policies, computed here as the TPM computes them in a SHA-256
+// session:
+//
+//	CA key:   PolicyAuthorize(authority, policyRef)
+//	approved: PolicyPCR(the CA's PCRs, H(values in index order))
+//
+// The authority signs ApprovalDigest = SHA-256(approved || policyRef); when
+// the CA signs, the TPM checks that signature (VerifySignature) and accepts
+// the session that reached the approved digest (PolicyAuthorize).
+
+// authorityTemplate is the authority's public key as the TPM loads it to
+// check a signature. Its Name - a hash of exactly this - is part of the
+// CA's policy, so it must not change.
+func authorityTemplate(pub crypto.PublicKey) (tpm2.TPMTPublic, error) {
+	switch k := pub.(type) {
+	case *rsa.PublicKey:
+		switch k.N.BitLen() {
+		case 2048, 3072, 4096:
+		default:
+			return tpm2.TPMTPublic{}, fmt.Errorf("an RSA authority of %d bits (2048, 3072 or 4096)", k.N.BitLen())
+		}
+		exp := uint32(k.E)
+		if k.E == 65537 {
+			exp = 0 // the TPM's default
+		}
+		return tpm2.TPMTPublic{
+			Type:             tpm2.TPMAlgRSA,
+			NameAlg:          tpm2.TPMAlgSHA256,
+			ObjectAttributes: tpm2.TPMAObject{SignEncrypt: true},
+			Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgRSA, &tpm2.TPMSRSAParms{
+				Scheme: tpm2.TPMTRSAScheme{
+					Scheme:  tpm2.TPMAlgRSASSA,
+					Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgRSASSA, &tpm2.TPMSSigSchemeRSASSA{HashAlg: tpm2.TPMAlgSHA256}),
+				},
+				KeyBits:  tpm2.TPMKeyBits(k.N.BitLen()),
+				Exponent: exp,
+			}),
+			Unique: tpm2.NewTPMUPublicID(tpm2.TPMAlgRSA, &tpm2.TPM2BPublicKeyRSA{Buffer: pad(k.N.Bytes(), k.N.BitLen()/8)}),
+		}, nil
+	case *ecdsa.PublicKey:
+		var curve tpm2.TPMECCCurve
+		switch k.Curve {
+		case elliptic.P256():
+			curve = tpm2.TPMECCNistP256
+		case elliptic.P384():
+			curve = tpm2.TPMECCNistP384
+		default:
+			return tpm2.TPMTPublic{}, errors.New("an ECDSA authority on another curve than P-256 or P-384")
+		}
+		n := (k.Curve.Params().BitSize + 7) / 8
+		return tpm2.TPMTPublic{
+			Type:             tpm2.TPMAlgECC,
+			NameAlg:          tpm2.TPMAlgSHA256,
+			ObjectAttributes: tpm2.TPMAObject{SignEncrypt: true},
+			Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgECC, &tpm2.TPMSECCParms{
+				Scheme: tpm2.TPMTECCScheme{
+					Scheme:  tpm2.TPMAlgECDSA,
+					Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgECDSA, &tpm2.TPMSSigSchemeECDSA{HashAlg: tpm2.TPMAlgSHA256}),
+				},
+				CurveID: curve,
+			}),
+			Unique: tpm2.NewTPMUPublicID(tpm2.TPMAlgECC, &tpm2.TPMSECCPoint{
+				X: tpm2.TPM2BECCParameter{Buffer: pad(k.X.Bytes(), n)},
+				Y: tpm2.TPM2BECCParameter{Buffer: pad(k.Y.Bytes(), n)},
+			}),
+		}, nil
+	}
+	return tpm2.TPMTPublic{}, fmt.Errorf("an authority of type %T (RSA or ECDSA)", pub)
+}
+
+func pad(b []byte, n int) []byte {
+	if len(b) >= n {
+		return b
+	}
+	out := make([]byte, n)
+	copy(out[n-len(b):], b)
+	return out
+}
+
+func (f *CA) authorityKey() (crypto.PublicKey, error) {
+	pub, err := x509.ParsePKIXPublicKey(f.Authority)
+	if err != nil {
+		return nil, fmt.Errorf("the authority's public key: %w", err)
+	}
+	if _, err := authorityTemplate(pub); err != nil {
+		return nil, err
+	}
+	return pub, nil
+}
+
+// AuthorityKey is the public key whose signatures approve PCR states.
+func (f *CA) AuthorityKey() crypto.PublicKey {
+	k, _ := f.authorityKey()
+	return k
+}
+
+// caPolicy is the CA key's policy: whatever the authority approves.
+func caPolicy(authority crypto.PublicKey, policyRef []byte) ([]byte, error) {
+	t, err := authorityTemplate(authority)
+	if err != nil {
+		return nil, err
+	}
+	name, err := tpm2.ObjectName(&t)
+	if err != nil {
+		return nil, err
+	}
+	calc, err := tpm2.NewPolicyCalculator(tpm2.TPMAlgSHA256)
+	if err != nil {
+		return nil, err
+	}
+	if err := (tpm2.PolicyAuthorize{
+		PolicyRef: tpm2.TPM2BDigest{Buffer: policyRef},
+		KeySign:   *name,
+	}).Update(calc); err != nil {
+		return nil, err
+	}
+	return calc.Hash().Digest, nil
+}
+
+// pcrSelection is the CA's PCRs in its bank.
+func (f *CA) pcrSelection() tpm2.TPMLPCRSelection {
+	return tpm2.TPMLPCRSelection{PCRSelections: []tpm2.TPMSPCRSelection{{
+		Hash:      f.Bank.alg(),
+		PCRSelect: pcrBitmap(f.PCRs),
+	}}}
+}
+
+func pcrBitmap(pcrs []int) []byte {
+	b := make([]byte, 3)
+	for _, p := range pcrs {
+		b[p/8] |= 1 << (p % 8)
+	}
+	return b
+}
+
+// approvedPolicy is the PolicyPCR digest of a session that finds values in
+// the CA's PCRs.
+func (f *CA) approvedPolicy(values map[int][]byte) ([]byte, error) {
+	if err := f.checkValues(values); err != nil {
+		return nil, err
+	}
+	h := sha256.New() // the session's hash, whatever the bank
+	for _, i := range f.PCRs {
+		h.Write(values[i])
+	}
+	calc, err := tpm2.NewPolicyCalculator(tpm2.TPMAlgSHA256)
+	if err != nil {
+		return nil, err
+	}
+	if err := (tpm2.PolicyPCR{
+		PcrDigest: tpm2.TPM2BDigest{Buffer: h.Sum(nil)},
+		Pcrs:      f.pcrSelection(),
+	}).Update(calc); err != nil {
+		return nil, err
+	}
+	return calc.Hash().Digest, nil
+}
+
+// ApprovalDigest is what the authority signs to approve values: SHA-256
+// over the approved policy and the CA's policy reference. A signer that
+// is not at hand (a token elsewhere) signs it there; AddApproval takes the
+// signature.
+func (f *CA) ApprovalDigest(values map[int][]byte) ([]byte, error) {
+	policy, err := f.approvedPolicy(values)
+	if err != nil {
+		return nil, err
+	}
+	h := sha256.New()
+	h.Write(policy)
+	h.Write(f.PolicyRef)
+	return h.Sum(nil), nil
+}
+
+// Approve signs values with the authority's private key and adds the
+// approval. The signer may be a token: it is asked for one signature over
+// a SHA-256 digest.
+func (f *CA) Approve(authority crypto.Signer, values map[int][]byte) error {
+	digest, err := f.ApprovalDigest(values)
+	if err != nil {
+		return err
+	}
+	sig, err := authority.Sign(rand.Reader, digest, crypto.SHA256)
+	if err != nil {
+		return fmt.Errorf("the authority's signature: %w", err)
+	}
+	return f.AddApproval(values, sig)
+}
+
+// AddApproval adds values with the authority's signature over their
+// ApprovalDigest: PKCS #1 v1.5 for RSA, ASN.1 DER for ECDSA, as Go's
+// crypto.Signer and openssl make them. A signature the authority did not
+// make is refused here, not at the boot. Values already approved get the
+// new signature.
+func (f *CA) AddApproval(values map[int][]byte, sig []byte) error {
+	digest, err := f.ApprovalDigest(values)
+	if err != nil {
+		return err
+	}
+	pub, err := f.authorityKey()
+	if err != nil {
+		return err
+	}
+	tsig, err := tpmSignature(pub, digest, sig)
+	if err != nil {
+		return err
+	}
+	b := tpm2.Marshal(tsig)
+	copied := map[int][]byte{}
+	for _, i := range f.PCRs {
+		copied[i] = append([]byte(nil), values[i]...)
+	}
+	if a := f.Approved(values); a != nil {
+		a.Signature = b
+		return nil
+	}
+	f.Approvals = append(f.Approvals, Approval{PCRs: copied, Signature: b})
+	return nil
+}
+
+// tpmSignature checks sig over digest with the authority's key and gives
+// it as the TPM takes it.
+func tpmSignature(pub crypto.PublicKey, digest, sig []byte) (tpm2.TPMTSignature, error) {
+	switch k := pub.(type) {
+	case *rsa.PublicKey:
+		if err := rsa.VerifyPKCS1v15(k, crypto.SHA256, digest, sig); err != nil {
+			return tpm2.TPMTSignature{}, errors.New("the signature is not the authority's (RSA PKCS #1 v1.5 over SHA-256)")
+		}
+		return tpm2.TPMTSignature{
+			SigAlg: tpm2.TPMAlgRSASSA,
+			Signature: tpm2.NewTPMUSignature(tpm2.TPMAlgRSASSA, &tpm2.TPMSSignatureRSA{
+				Hash: tpm2.TPMAlgSHA256,
+				Sig:  tpm2.TPM2BPublicKeyRSA{Buffer: sig},
+			}),
+		}, nil
+	case *ecdsa.PublicKey:
+		if !ecdsa.VerifyASN1(k, digest, sig) {
+			return tpm2.TPMTSignature{}, errors.New("the signature is not the authority's (ECDSA, ASN.1 DER)")
+		}
+		var rs struct{ R, S *big.Int }
+		if _, err := asn1.Unmarshal(sig, &rs); err != nil {
+			return tpm2.TPMTSignature{}, err
+		}
+		n := (k.Curve.Params().BitSize + 7) / 8
+		return tpm2.TPMTSignature{
+			SigAlg: tpm2.TPMAlgECDSA,
+			Signature: tpm2.NewTPMUSignature(tpm2.TPMAlgECDSA, &tpm2.TPMSSignatureECC{
+				Hash:       tpm2.TPMAlgSHA256,
+				SignatureR: tpm2.TPM2BECCParameter{Buffer: pad(rs.R.Bytes(), n)},
+				SignatureS: tpm2.TPM2BECCParameter{Buffer: pad(rs.S.Bytes(), n)},
+			}),
+		}, nil
+	}
+	return tpm2.TPMTSignature{}, fmt.Errorf("an authority of type %T", pub)
+}
