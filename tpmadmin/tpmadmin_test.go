@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/go-tpm/tpm2/transport"
+
 	"github.com/tpm2-trust/assh/hostkey"
 	"github.com/tpm2-trust/assh/internal/swtpmtest"
 )
@@ -24,7 +26,16 @@ func approve(t *testing.T, sw *swtpmtest.SWTPM, ca *hostkey.CA, pin []byte) erro
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ca.Approve(a, now)
+	return ca.Approve(a, 0, now)
+}
+
+// certified is why the CA did not certify a host key, nil when it did.
+func certified(tpm transport.TPM, sw *swtpmtest.SWTPM, ca *hostkey.CA) error {
+	hk, err := hostkey.Issue(tpm, ca, hostkey.IssueOptions{Open: sw.Opener()})
+	if err != nil {
+		return err
+	}
+	return hk.Temporary
 }
 
 // A PIN change: the old PIN opens nothing, the new one approves, the CA and
@@ -34,7 +45,7 @@ func TestChangePIN(t *testing.T) {
 	sw.SetLockout(t, 3, 1800, 1800)
 	tpm := sw.Open(t)
 	oldPIN, newPIN := []byte("old-pin-1"), []byte("new-pin-2")
-	ca, err := hostkey.CreatePINCA(tpm, hostkey.PINCAOptions{Type: hostkey.P256, Bank: hostkey.SHA256, PCRs: []int{7}, PIN: pinOf(oldPIN)})
+	ca, err := hostkey.CreatePINCA(tpm, hostkey.PINCAOptions{CAOptions: hostkey.CAOptions{Type: hostkey.P256, Bank: hostkey.SHA256, PCRs: []int{7}}, PIN: pinOf(oldPIN)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +80,7 @@ func TestChangePIN(t *testing.T) {
 	if after, _ := ca.Marshal(); !bytes.Equal(before, after) {
 		t.Fatal("the PIN change changed the CA file")
 	}
-	if _, err := hostkey.Issue(tpm, ca, hostkey.IssueOptions{Open: sw.Opener()}); err != nil {
+	if err := certified(tpm, sw, ca); err != nil {
 		t.Fatalf("issue with the approval from before the change: %v", err)
 	}
 	if err := ca.NextGeneration(tpm, pinOf(newPIN)); err != nil {
@@ -78,7 +89,7 @@ func TestChangePIN(t *testing.T) {
 	if err := approve(t, sw, ca, newPIN); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := hostkey.Issue(tpm, ca, hostkey.IssueOptions{Open: sw.Opener()}); err != nil {
+	if err := certified(tpm, sw, ca); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -100,7 +111,7 @@ func TestDA(t *testing.T) {
 		t.Fatalf("%+v", s)
 	}
 
-	ca, err := hostkey.CreatePINCA(tpm, hostkey.PINCAOptions{Type: hostkey.P256, Bank: hostkey.SHA256, PCRs: []int{7}, PIN: pinOf([]byte("the-pin"))})
+	ca, err := hostkey.CreatePINCA(tpm, hostkey.PINCAOptions{CAOptions: hostkey.CAOptions{Type: hostkey.P256, Bank: hostkey.SHA256, PCRs: []int{7}}, PIN: pinOf([]byte("the-pin"))})
 	if err != nil {
 		t.Fatal(err)
 	}

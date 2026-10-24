@@ -21,7 +21,7 @@ import (
 // session:
 //
 //	CA key:   PolicyAuthorize(authority, policyRef)
-//	approved: PolicyPCR(the CA's PCRs, H(values in index order))
+//	approved: PolicyPCR(a slot's PCRs, H(values in index order))
 //	          ; PolicyNV(counter == generation)    with a counter
 //
 // The authority signs ApprovalDigest = SHA-256(approved || policyRef). When
@@ -159,11 +159,11 @@ func caPolicyFor(authority tpm2.TPM2BName, policyRef []byte) []byte {
 	}.Update)
 }
 
-// pcrSelection is the CA's PCRs in its bank.
-func (f *CA) pcrSelection() tpm2.TPMLPCRSelection {
+// pcrSelection is a slot's PCRs in the CA's bank.
+func (f *CA) pcrSelection(s *Slot) tpm2.TPMLPCRSelection {
 	return tpm2.TPMLPCRSelection{PCRSelections: []tpm2.TPMSPCRSelection{{
 		Hash:      f.Bank.alg(),
-		PCRSelect: pcrBitmap(f.PCRs),
+		PCRSelect: pcrBitmap(s.PCRs),
 	}}}
 }
 
@@ -175,14 +175,14 @@ func pcrBitmap(pcrs []int) []byte {
 	return b
 }
 
-// approvedPolicy is the digest of a session that finds values in the CA's
-// PCRs and, with a counter, gen in it.
-func (f *CA) approvedPolicy(values map[int][]byte, gen uint64) ([]byte, error) {
-	if err := f.checkValues(values); err != nil {
+// approvedPolicy is the digest of a session that finds values in the
+// slot's PCRs and, with a counter, gen in it.
+func (f *CA) approvedPolicy(s *Slot, values map[int][]byte, gen uint64) ([]byte, error) {
+	if err := f.checkValues(s, values); err != nil {
 		return nil, err
 	}
 	h := sha256.New() // the session's hash, whatever the bank
-	for _, i := range f.PCRs {
+	for _, i := range s.PCRs {
 		h.Write(values[i])
 	}
 	calc, err := tpm2.NewPolicyCalculator(tpm2.TPMAlgSHA256)
@@ -191,7 +191,7 @@ func (f *CA) approvedPolicy(values map[int][]byte, gen uint64) ([]byte, error) {
 	}
 	if err := (tpm2.PolicyPCR{
 		PcrDigest: tpm2.TPM2BDigest{Buffer: h.Sum(nil)},
-		Pcrs:      f.pcrSelection(),
+		Pcrs:      f.pcrSelection(s),
 	}).Update(calc); err != nil {
 		return nil, err
 	}
@@ -211,16 +211,21 @@ func (f *CA) approvedPolicy(values map[int][]byte, gen uint64) ([]byte, error) {
 	return calc.Hash().Digest, nil
 }
 
-// ApprovalDigest is what the authority signs to approve values at the
-// file's generation: SHA-256 over the approved policy and the CA's policy
-// reference. A signer that is not at hand (a token elsewhere) signs it
-// there; AddApproval takes the signature.
-func (f *CA) ApprovalDigest(values map[int][]byte) ([]byte, error) {
-	return f.approvalDigestAt(values, f.FileGeneration())
+// ApprovalDigest is what the authority signs to approve values in slot at
+// the file's generation: SHA-256 over the approved policy and the CA's
+// policy reference. A signer that is not at hand (a token elsewhere) signs
+// it there; AddApproval takes the signature. Values of PCRs the slot does
+// not read are no part of it.
+func (f *CA) ApprovalDigest(slot int, values map[int][]byte) ([]byte, error) {
+	s := f.Slot(slot)
+	if s == nil {
+		return nil, fmt.Errorf("no slot %d", slot)
+	}
+	return f.approvalDigestAt(s, values, f.FileGeneration())
 }
 
-func (f *CA) approvalDigestAt(values map[int][]byte, gen uint64) ([]byte, error) {
-	policy, err := f.approvedPolicy(values, gen)
+func (f *CA) approvalDigestAt(s *Slot, values map[int][]byte, gen uint64) ([]byte, error) {
+	policy, err := f.approvedPolicy(s, values, gen)
 	if err != nil {
 		return nil, err
 	}
@@ -230,12 +235,12 @@ func (f *CA) approvalDigestAt(values map[int][]byte, gen uint64) ([]byte, error)
 	return h.Sum(nil), nil
 }
 
-// Approve signs values at the file's generation with the authority's
-// private key and adds the approval. The signer may be a token, or the
-// authority in the TPM (TPMAuthority): it is asked for one signature over
-// a SHA-256 digest.
-func (f *CA) Approve(authority crypto.Signer, values map[int][]byte) error {
-	digest, err := f.ApprovalDigest(values)
+// Approve signs values in slot at the file's generation with the
+// authority's private key and adds the approval. The signer may be a
+// token, or the authority in the TPM (TPMAuthority): it is asked for one
+// signature over a SHA-256 digest.
+func (f *CA) Approve(authority crypto.Signer, slot int, values map[int][]byte) error {
+	digest, err := f.ApprovalDigest(slot, values)
 	if err != nil {
 		return err
 	}
@@ -243,16 +248,16 @@ func (f *CA) Approve(authority crypto.Signer, values map[int][]byte) error {
 	if err != nil {
 		return fmt.Errorf("the authority's signature: %w", err)
 	}
-	return f.AddApproval(values, sig)
+	return f.AddApproval(slot, values, sig)
 }
 
 // AddApproval adds values with the authority's signature over their
 // ApprovalDigest: PKCS #1 v1.5 for RSA, ASN.1 DER for ECDSA, as Go's
 // crypto.Signer and openssl make them. A signature the authority did not
-// make is refused here, not at the boot. Values already approved at this
-// generation get the new signature.
-func (f *CA) AddApproval(values map[int][]byte, sig []byte) error {
-	digest, err := f.ApprovalDigest(values)
+// make is refused here, not at the boot. Values already approved in the
+// slot at this generation get the new signature.
+func (f *CA) AddApproval(slot int, values map[int][]byte, sig []byte) error {
+	digest, err := f.ApprovalDigest(slot, values)
 	if err != nil {
 		return err
 	}
@@ -265,15 +270,19 @@ func (f *CA) AddApproval(values map[int][]byte, sig []byte) error {
 		return err
 	}
 	b := tpm2.Marshal(tsig)
+	s := f.Slot(slot)
 	copied := map[int][]byte{}
-	for _, i := range f.PCRs {
+	for _, i := range s.PCRs {
 		copied[i] = append([]byte(nil), values[i]...)
 	}
-	if a := f.Approved(values); a != nil {
-		a.Signature = b
-		return nil
+	gen := f.FileGeneration()
+	for i := range f.Approvals {
+		if a := &f.Approvals[i]; a.Slot == slot && a.Generation == gen && sameValues(s.PCRs, a.PCRs, values) {
+			a.Signature = b
+			return nil
+		}
 	}
-	f.Approvals = append(f.Approvals, Approval{PCRs: copied, Generation: f.FileGeneration(), Signature: b})
+	f.Approvals = append(f.Approvals, Approval{Slot: slot, PCRs: copied, Generation: gen, Signature: b})
 	return nil
 }
 

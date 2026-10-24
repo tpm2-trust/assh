@@ -169,10 +169,16 @@ func agentCommand(args []string) error {
 		return err
 	}
 	pub := filepath.Join(*dir, "host.pub")
-	if err := os.WriteFile(pub, sshAuthorizedKey(hk.Cert.Key), 0o644); err != nil {
+	if err := os.WriteFile(pub, sshAuthorizedKey(hk.PublicKey()), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(*dir, "host-cert.pub"), sshAuthorizedKey(hk.Cert), 0o644); err != nil {
+	certPath := filepath.Join(*dir, "host-cert.pub")
+	if hk.Cert != nil {
+		if err := os.WriteFile(certPath, sshAuthorizedKey(hk.Cert), 0o644); err != nil {
+			return err
+		}
+	} else if err := os.Remove(certPath); err != nil && !os.IsNotExist(err) {
+		// A temporary key has no certificate: none of another boot stays.
 		return err
 	}
 	signer, err := plainSigner(hk)
@@ -184,7 +190,11 @@ func agentCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	logger(fmt.Sprintf("agent at %s: HostKey %s, HostCertificate %s/host-cert.pub, HostKeyAgent %s", sock, pub, *dir, sock))
+	if hk.Cert != nil {
+		logger(fmt.Sprintf("agent at %s: HostKey %s, HostCertificate %s, HostKeyAgent %s", sock, pub, certPath, sock))
+	} else {
+		logger(fmt.Sprintf("agent at %s: HostKey %s (temporary, no certificate), HostKeyAgent %s", sock, pub, sock))
+	}
 	go agent.New(signer, hk.Cert, logger).Serve(ln, *uid)
 	notifyReady()
 	<-signalled()

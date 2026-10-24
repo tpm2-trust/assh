@@ -8,6 +8,9 @@
 // (TPM2_PolicyAuthorize over a PolicyPCR). The authority signs an approval
 // for every state the CA may sign in - after a firmware update, say - so
 // the CA and the clients' trust in it stay the same for its whole life.
+// The CA's policy names no PCR, so it has up to 16 slots, each a PCR
+// selection with approvals of its own; Issue takes the first slot, from 0
+// up, approved for the PCRs as they are.
 //
 // The authority is a key elsewhere (a file, a token: CreateCA), whose
 // private key never comes to the TPM, or a key made in this TPM and opened
@@ -19,12 +22,14 @@
 //
 // At its start a server asks for a host key (Issue): the TPM makes a new
 // one under its NULL hierarchy, whose seed changes at every reboot, and
-// the CA certifies it - while the PCRs hold an approved state. The host
-// key then signs every key exchange of this boot, whatever the PCRs hold
-// later; at the next reboot it is gone for good. Once the window is closed
-// - a PCR extended right after the Issue (Close), or the boot moving on -
-// the CA signs nothing until the next boot, so a server started later, or
-// any other process, gets no certificate.
+// the CA certifies it - while the PCRs hold a state approved in a slot.
+// When none is, the key is temporary: not certified, so a client that
+// trusts the CA asks before it takes it. The host key signs every key
+// exchange of this boot, whatever the PCRs hold later; at the next reboot
+// it is gone for good. Once the window is closed - the CA's window PCR,
+// which every slot reads, extended right after the Issue (Close), or the
+// boot moving on - the CA signs nothing until the next boot, so a server
+// started later, or any other process, gets no certificate.
 //
 // Nothing here is a secret outside the TPM, and no secret ever leaves it.
 // So a cleared TPM, or another one, loses the CA: there is no backup of it,
@@ -41,6 +46,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -102,18 +108,26 @@ func (b Bank) size() int {
 
 // fileVersion is the one format read; another is an error that says to
 // create the CA again.
-const fileVersion = 2
+const fileVersion = 3
+
+// MaxSlots is how many slots a CA has room for: 0 to MaxSlots-1.
+const MaxSlots = 16
 
 // CA is the certificate authority: the TPM's wrapped copy of its key, the
-// authority that approves the PCR states it signs in, and its approvals.
-// Nothing in it is a secret outside this TPM.
+// authority that approves the PCR states it signs in, its slots and their
+// approvals. Nothing in it is a secret outside this TPM.
 type CA struct {
 	Version int  `json:"version"`
 	Type    Type `json:"type"`
-	// The PCRs the CA is bound to, in one bank: every approval gives
-	// values for exactly these.
-	Bank Bank  `json:"bank"`
-	PCRs []int `json:"pcrs"`
+	// Bank is the PCR bank every slot reads.
+	Bank Bank `json:"bank"`
+	// Slots are the PCR selections approvals are made for, in the order
+	// Issue scans them: the lowest number first.
+	Slots []Slot `json:"slots"`
+	// Window is the PCR whose extension closes the CA for the rest of the
+	// boot (Close); every slot holds it. 0: none, the boot closes the CA
+	// by itself.
+	Window int `json:"window,omitempty"`
 
 	Public  []byte `json:"public"`  // the CA key's TPMT_PUBLIC
 	Private []byte `json:"private"` // its TPM2B_PRIVATE buffer
@@ -130,18 +144,28 @@ type CA struct {
 	Approvals []Approval `json:"approvals,omitempty"`
 }
 
-// Approval is a PCR state the authority signed: the CA signs while the
-// PCRs hold these values - and, with a counter, while it holds Generation.
+// Slot is a PCR selection the authority approves states of. The CA's
+// policy names no PCR, so a slot needs no key of its own: it is worth
+// nothing until the authority approves a state in it.
+type Slot struct {
+	Number int   `json:"slot"`
+	PCRs   []int `json:"pcrs"`
+}
+
+// Approval is a PCR state of a slot the authority signed: the CA signs
+// while the slot's PCRs hold these values - and, with a counter, while it
+// holds Generation.
 type Approval struct {
+	Slot       int            `json:"slot"`
 	PCRs       map[int][]byte `json:"pcrs"`
 	Generation uint64         `json:"generation,omitempty"` // the counter's value; 0 without one
 	Signature  []byte         `json:"signature"`            // TPMT_SIGNATURE over ApprovalDigest
 }
 
-// Equal is whether b is the same approval: the same values and generation,
-// signed alike.
+// Equal is whether b is the same approval: the same slot, values and
+// generation, signed alike.
 func (a Approval) Equal(b *Approval) bool {
-	if b == nil || len(a.PCRs) != len(b.PCRs) || a.Generation != b.Generation || string(a.Signature) != string(b.Signature) {
+	if b == nil || a.Slot != b.Slot || len(a.PCRs) != len(b.PCRs) || a.Generation != b.Generation || string(a.Signature) != string(b.Signature) {
 		return false
 	}
 	for i, v := range a.PCRs {
@@ -180,8 +204,8 @@ func ParseCA(data []byte) (*CA, error) {
 	if f.Bank != SHA256 && f.Bank != SHA1 {
 		return nil, fmt.Errorf("unknown PCR bank %q", f.Bank)
 	}
-	if len(f.PCRs) == 0 {
-		return nil, errors.New("the CA is bound to no PCR")
+	if err := f.checkSlots(); err != nil {
+		return nil, err
 	}
 	if _, err := f.PublicKey(); err != nil {
 		return nil, err
@@ -304,16 +328,21 @@ func (f *CA) FileGeneration() uint64 {
 	return f.Counter.Generation
 }
 
-// Approved is the approval for exactly these values at the file's
-// generation, nil when there is none.
+// Approved is the approval that lets the CA sign when the PCRs hold
+// values, at the file's generation: the first slot's that has one, nil
+// when there is none.
 func (f *CA) Approved(values map[int][]byte) *Approval {
 	return f.approvedAt(values, f.FileGeneration())
 }
 
+// approvedAt scans the slots from the lowest number up.
 func (f *CA) approvedAt(values map[int][]byte, gen uint64) *Approval {
-	for i := range f.Approvals {
-		if f.Approvals[i].Generation == gen && sameValues(f.PCRs, f.Approvals[i].PCRs, values) {
-			return &f.Approvals[i]
+	for _, s := range f.Slots {
+		for i := range f.Approvals {
+			a := &f.Approvals[i]
+			if a.Slot == s.Number && a.Generation == gen && sameValues(s.PCRs, a.PCRs, values) {
+				return a
+			}
 		}
 	}
 	return nil
@@ -328,16 +357,137 @@ func sameValues(pcrs []int, a, b map[int][]byte) bool {
 	return true
 }
 
-// checkValues makes sure values has one value of the bank's size for each
-// of the CA's PCRs, and nothing else.
-func (f *CA) checkValues(values map[int][]byte) error {
-	if len(values) != len(f.PCRs) {
-		return fmt.Errorf("values for %d PCRs, the CA is bound to %s", len(values), PCRList(f.PCRs))
+// Slot is slot n, nil when the CA has none of that number.
+func (f *CA) Slot(n int) *Slot {
+	for i := range f.Slots {
+		if f.Slots[i].Number == n {
+			return &f.Slots[i]
+		}
 	}
-	for _, i := range f.PCRs {
+	return nil
+}
+
+// PCRs are the PCRs any slot reads, in index order: what a server records
+// of a boot, for an approval in any slot.
+func (f *CA) PCRs() []int {
+	seen := map[int]bool{}
+	var out []int
+	for _, s := range f.Slots {
+		for _, p := range s.PCRs {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+// AddSlot gives the CA slot n, reading pcrs. It needs no authority: the
+// slot lets the CA sign nothing until the authority approves a state in
+// it. pcrs must hold the window's PCR, and differ from every other slot's.
+func (f *CA) AddSlot(n int, pcrs []int) error {
+	if f.Slot(n) != nil {
+		return fmt.Errorf("slot %d is in use", n)
+	}
+	s, err := newSlot(n, pcrs, f.Window)
+	if err != nil {
+		return err
+	}
+	for _, o := range f.Slots {
+		if slices.Equal(o.PCRs, s.PCRs) {
+			return fmt.Errorf("slot %d reads %s already", o.Number, PCRList(s.PCRs))
+		}
+	}
+	f.Slots = append(f.Slots, s)
+	sort.Slice(f.Slots, func(i, j int) bool { return f.Slots[i].Number < f.Slots[j].Number })
+	return nil
+}
+
+// RemoveSlot takes slot n and its approvals away. The last slot stays: a
+// CA without one never signs.
+func (f *CA) RemoveSlot(n int) error {
+	if f.Slot(n) == nil {
+		return fmt.Errorf("no slot %d", n)
+	}
+	if len(f.Slots) == 1 {
+		return errors.New("the CA's last slot: a CA without one never signs")
+	}
+	f.Slots = slices.DeleteFunc(f.Slots, func(s Slot) bool { return s.Number == n })
+	f.Approvals = slices.DeleteFunc(f.Approvals, func(a Approval) bool { return a.Slot == n })
+	return nil
+}
+
+func newSlot(n int, pcrs []int, window int) (Slot, error) {
+	if n < 0 || n >= MaxSlots {
+		return Slot{}, fmt.Errorf("slot %d: the slots are 0 to %d", n, MaxSlots-1)
+	}
+	if len(pcrs) == 0 {
+		return Slot{}, fmt.Errorf("slot %d reads no PCR", n)
+	}
+	pcrs = slices.Clone(pcrs)
+	sort.Ints(pcrs)
+	for i, p := range pcrs {
+		if p < 0 || p > 23 || (i > 0 && pcrs[i-1] == p) {
+			return Slot{}, fmt.Errorf("slot %d: not a PCR selection: %v", n, pcrs)
+		}
+	}
+	if window != 0 && !slices.Contains(pcrs, window) {
+		return Slot{}, fmt.Errorf("slot %d does not read PCR %d, the window: the window would not close it", n, window)
+	}
+	return Slot{Number: n, PCRs: pcrs}, nil
+}
+
+// checkWindow makes sure pcr can be the window: one a boot cannot reset
+// (16 and 23 can), and not the firmware's PCR 0, which 0 means none of.
+func checkWindow(pcr int) error {
+	if pcr < 0 || pcr > 23 || pcr == 16 || pcr == 23 {
+		return fmt.Errorf("PCR %d cannot be the window (1 to 22, not 16: a window must not be reset)", pcr)
+	}
+	return nil
+}
+
+// checkSlots makes sure the file's slots and approvals fit together.
+func (f *CA) checkSlots() error {
+	if f.Window != 0 {
+		if err := checkWindow(f.Window); err != nil {
+			return err
+		}
+	}
+	if len(f.Slots) == 0 {
+		return errors.New("the CA has no slot")
+	}
+	for i, s := range f.Slots {
+		if i > 0 && f.Slots[i-1].Number >= s.Number {
+			return errors.New("the slots are not in order")
+		}
+		if _, err := newSlot(s.Number, s.PCRs, f.Window); err != nil {
+			return err
+		}
+		if !slices.IsSorted(s.PCRs) {
+			return fmt.Errorf("slot %d: its PCRs are not in order", s.Number)
+		}
+	}
+	for _, a := range f.Approvals {
+		s := f.Slot(a.Slot)
+		if s == nil {
+			return fmt.Errorf("an approval for slot %d, which the CA does not have", a.Slot)
+		}
+		if err := f.checkValues(s, a.PCRs); err != nil || len(a.PCRs) != len(s.PCRs) {
+			return fmt.Errorf("an approval for slot %d with other PCRs than the slot's", a.Slot)
+		}
+	}
+	return nil
+}
+
+// checkValues makes sure values has one value of the bank's size for each
+// of the slot's PCRs; values for other PCRs are no part of it.
+func (f *CA) checkValues(s *Slot, values map[int][]byte) error {
+	for _, i := range s.PCRs {
 		v, ok := values[i]
 		if !ok {
-			return fmt.Errorf("no value for PCR %d", i)
+			return fmt.Errorf("no value for PCR %d (slot %d reads %s)", i, s.Number, PCRList(s.PCRs))
 		}
 		if len(v) != f.Bank.size() {
 			return fmt.Errorf("PCR %d: %d bytes, a %s value has %d", i, len(v), f.Bank, f.Bank.size())

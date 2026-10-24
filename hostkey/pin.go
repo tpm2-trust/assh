@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -91,12 +90,9 @@ type Counter struct {
 	Generation uint64 `json:"generation"` // the value this file was last at
 }
 
-// PINCAOptions are what CreatePINCA takes.
+// PINCAOptions are what CreatePINCA takes: the CA's, and the PIN's.
 type PINCAOptions struct {
-	Type      Type
-	Bank      Bank
-	PCRs      []int
-	PolicyRef []byte
+	CAOptions
 	// The NV handles of P and G; default DefaultPINHandle and
 	// DefaultCounterHandle.
 	PINHandle, CounterHandle tpm2.TPMHandle
@@ -279,13 +275,9 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	if o.PINHandle == o.CounterHandle {
 		return nil, errors.New("the PIN index and the counter need two handles")
 	}
-	if len(o.PCRs) == 0 {
-		return nil, errors.New("the CA is bound to no PCR")
-	}
-	pcrs := append([]int(nil), o.PCRs...)
-	sort.Ints(pcrs)
-	if len(o.PolicyRef) > 32 {
-		return nil, errors.New("a policy reference of more than 32 bytes")
+	ca, err = newCA(o.CAOptions)
+	if err != nil {
+		return nil, err
 	}
 	if o.PIN == nil {
 		return nil, errors.New("no PIN")
@@ -369,12 +361,8 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	}
 	defined = append(defined, gPub)
 
-	ca = &CA{
-		Version: fileVersion, Type: o.Type, Bank: o.Bank, PCRs: pcrs,
-		Authority: authorityDER, PolicyRef: append([]byte(nil), o.PolicyRef...),
-		AuthorityTPM: auth,
-		Counter:      &Counter{Public: tpm2.Marshal(written(gPub))},
-	}
+	ca.Authority, ca.AuthorityTPM = authorityDER, auth
+	ca.Counter = &Counter{Public: tpm2.Marshal(written(gPub))}
 	if err := ca.incrementCounter(t, p, gPub, pin); err != nil {
 		return nil, fmt.Errorf("the counter's first increment: %w", err)
 	}
