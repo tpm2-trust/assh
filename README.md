@@ -10,7 +10,8 @@ unencrypted boot image. It is a Go library and a command:
 | `hostkey` | the CA in the TPM, the approvals of the PCR states it signs in, the per-boot host key and its certificate |
 | `server` | an SSH server split in two: the side that speaks SSH runs as nobody, in namespaces of its own, under Landlock, and holds neither the key nor what a login leads to |
 | `agent` | an ssh-agent socket that lends the host key to OpenSSH's sshd (`HostKeyAgent`) |
-| `cmd/assh` | the command: `ca create`, `ca show`, `ca approve`, `serve`, `agent` |
+| `tpmadmin` | what the TPM itself holds for an authority with a PIN: the PIN, the dictionary attack parameters, the lockout authorization |
+| `cmd/assh` | the command: `ca create`, `ca show`, `ca approve`, `ca pin`, `tpm da`, `serve`, `agent` |
 
 [tpm2-kira](https://github.com/mrwiora/tpm2-kira) uses it, as a git
 submodule, for the SSH server of its boot image.
@@ -18,8 +19,10 @@ submodule, for the SSH server of its boot image.
 ## How the keys are held
 
 ```
-authority key (yours: a file, a YubiKey, an HSM)
+authority key: elsewhere (a file, a YubiKey, an HSM),
+               or in the TPM, opened by a PIN typed on the device
    │ signs approvals: "the CA may sign while PCR 0, 7, ... hold these values"
+   │                  (in the TPM: "... and while the counter is at n")
    ▼
 SSH CA ─ ECDSA P-256 or RSA-2048, created in the TPM, never exported
    │ policy: PolicyAuthorize(authority) over PolicyPCR - no password
@@ -33,7 +36,8 @@ every key exchange of this boot, signed by the TPM
 
 - **The CA** (`ca create`) is created inside the TPM. Its file holds only
   the TPM's wrapped copy, which loads in this TPM alone, the authority's
-  public key and the approvals; nothing in it is a secret.
+  public key and the approvals; nothing in it is a secret. The CA and the
+  host keys are noDA: a dictionary attack lockout never stops them.
 - **An approval** (`ca approve`) is the authority's signature over a PCR
   state. The CA signs only while the PCRs hold an approved state. After a
   firmware update the authority approves the new state: the CA and the
@@ -67,10 +71,99 @@ host key's authorization value from its memory (the process is not
 dumpable, which keeps other users and core dumps out) and have the TPM
 sign with it - until the next reboot, and on this machine only.
 
+### The authority in the TPM: a PIN, and revocation
+
+With `ca create --authority-tpm` there is no key outside the machine. Three
+things in the TPM, none of them secret outside it:
+
+```
+P  PIN index   NV counter at 0x01802913, its authorization value = the PIN.
+               Written once when it is made, holding that value k for good.
+               Its policy allows one more thing: a PIN change (NV_ChangeAuth).
+A  authority   ECDSA P-256 key; its wrapped copy is in the CA file. Usable
+               through PolicySecret(P) ; PolicyNV(P == k) ; Sign - the PIN.
+G  counter     NV counter at 0x01802912, incremented through P - the PIN.
+               Every approval names its value: PolicyPCR ; PolicyNV(G == n).
+```
+
+- **Use stays automatic.** While the PCRs hold a state approved for the
+  counter's current value, `Issue` (the agent, `serve`) gets its
+  certificate with no PIN - also after an OS update that leaves the bound
+  PCRs as they were. It reads G, which is NO_DA and needs no authorization.
+- **A move** to another state (another safespace combination) is
+  `ca approve --next-generation`, with the PIN: G is incremented, then A
+  signs the new state for the new value. Every approval of an older value
+  stops working inside the TPM; one put back into the file is refused too.
+- **The PIN** is what a TPM takes as an authorization value: 6 to 32 bytes,
+  any values, the last not zero (the TPM drops trailing zeros). No hashing,
+  no normalization. It is read from the terminal without echo, or from a
+  file descriptor (`--pin-fd N`, every byte as it is: `printf '%s'`, not
+  `echo`) - never from argv or the environment, never stored, never logged.
+  Everything that proves it runs in a salted HMAC session, everything that
+  carries it is encrypted: it never crosses the bus in the clear.
+- **Wrong PINs** are counted by the TPM's dictionary attack protection, P
+  being the only object here that is not noDA: guessed through A or
+  through G, it is one counter. With `tpm da --max-tries 3 --recovery 1800`
+  three wrong PINs lock it out, then one try per 30 minutes. During a
+  lockout the right PIN is refused too; `Issue` is not affected.
+- **A PIN change** (`ca pin`) changes P's authorization value in place:
+  the old PIN opens nothing afterwards, from any copy of any file, and the
+  CA, its approvals and the clients' known_hosts line stay as they are.
+
+The dictionary attack parameters and the failure count belong to the TPM,
+not to assh: every object in the TPM that is not noDA shares them (a volume
+unlocked with a TPM PIN, say), and anyone who can use the TPM can spend the
+tries - which keeps the owner from approving for a while, never `Issue`
+from working.
+
+**The lockout authorization must be set**, and kept off the machine:
+without one any process may reset the lockout and try PINs without end.
+`ca create --authority-tpm` refuses a TPM without one (`assh tpm da
+--new-lockout-auth`). It is also what clears the TPM.
+
+What the authority in the TPM protects against (root on the device, the
+owner authorization empty as on most machines):
+
+| attack | result |
+|---|---|
+| guessing the PIN, through A or G | the TPM's lockout, which root cannot reset without the lockout authorization |
+| an approval of an older generation, in the file or put back into it | refused by PolicyNV in the TPM |
+| undefining P and defining it again alike, with a PIN of one's own | the clone has P's Name but never its value k: the TPM sets a counter's first value above any value a counter of that Name had (TPM 2.0 Part 1, 37.2.6.3). It opens neither A nor G |
+| undefining G and defining it again alike | until it is incremented its Name differs and the CA signs nothing; it cannot be incremented without the PIN; the owner's next `--next-generation` lands above every old value |
+| replacing G with another index | the CA signs nothing; `ca approve --redefine-counter`, with the PIN, puts G back |
+| copying the CA file to another TPM | neither the CA nor A loads there |
+
+What it does not protect against:
+
+- **Deleting** G stops the CA until `--redefine-counter`; **deleting P**
+  ends approvals for good (no P can hold k again: the rule that stops the
+  clone). `Issue` keeps working with the current approval; after the next
+  change of the bound PCRs the CA must be created again, with a new
+  known_hosts line. Both need only the owner authorization, which is empty
+  on most machines: a denial of service, never a way in.
+- **Root that watches the PIN being typed** - reading the terminal or
+  assh's memory - has it. Type it only in a system you trust (for
+  safespace: the combination being moved to).
+- The key that salts the PIN's sessions is read from the TPM over the same
+  bus; an active interposer on the bus could substitute it. It is not
+  checked against the TPM's endorsement key.
+
 ## The command
 
 ```bash
-# The authority: any RSA or ECDSA key (P-256, P-384); keep it off the machine
+# The authority in the TPM, opened by a PIN typed on the device
+assh tpm da --new-lockout-auth --max-tries 3 --recovery 1800 --lockout-recovery 1800
+assh ca create --out /etc/assh/os-ca.json --authority-tpm --pcrs 7,15     # asks for the PIN twice
+assh ca approve --ca /etc/assh/os-ca.json                                 # asks for the PIN
+# ... after booting another state: approve what the agent recorded, and
+# revoke every approval before it
+assh ca approve --ca /etc/assh/os-ca.json --values /run/assh/agent.pcrs.json --next-generation
+assh ca pin --ca /etc/assh/os-ca.json                                     # change the PIN
+assh tpm da --ask-lockout-auth --reset                                    # end a lockout
+```
+
+```bash
+# Or the authority elsewhere: any RSA or ECDSA key (P-256, P-384); keep it off the machine
 openssl ecparam -name prime256v1 -genkey -noout -out authority.key
 openssl ec -in authority.key -pubout -out authority.pub
 
@@ -87,6 +180,12 @@ assh ca approve --ca /etc/assh/os-ca.json --values /run/assh/agent.pcrs.json --s
 
 assh ca show --ca /etc/assh/os-ca.json
 ```
+
+An authority elsewhere suits approvals made by someone who is not at the
+device - an administrator of many machines signing the states they
+report, offline, or tpm2-kira's signing key. Its approvals are never
+revoked: whoever holds the key decides, and removing an approval from the
+file revokes nothing.
 
 ### A server of its own: `assh serve`
 
@@ -160,6 +259,18 @@ srv, err := server.Start(server.Options{
 // and in main(): if os.Args[1] == "ssh-child" { server.ChildMain() }
 ```
 
+With the authority in the TPM (the PIN is a callback, asked when the TPM
+needs it):
+
+```go
+ca, _ := hostkey.CreatePINCA(tpm, hostkey.PINCAOptions{Type: hostkey.P256, Bank: hostkey.SHA256,
+	PCRs: []int{7, 15}, PIN: askPIN})
+ca.NextGeneration(tpm, askPIN)                  // a move: older approvals stop working
+a, _ := ca.TPMAuthority(tpm, askPIN)            // a crypto.Signer
+ca.Approve(a, values)
+tpmadmin.ChangePIN(tpm, ca, askOldPIN, askNewPIN)
+```
+
 `server` takes any `ssh.Signer`; `hostkey` works without `server`, and
 `agent` with any signer.
 
@@ -170,10 +281,10 @@ go test -count=1 ./...
 ```
 
 Needs `swtpm` for the TPM tests (they are skipped without it), and
-OpenSSH's `ssh`, `ssh-keygen` and `openssl` for the command's test, which
-logs in with OpenSSH's client through a `@cert-authority` line, approves a
-recorded state with a signature openssl made, and runs the agent after a
-reboot of the software TPM.
+OpenSSH's `ssh`, `ssh-keygen` and `openssl` for the command's tests, which
+log in with OpenSSH's client through a `@cert-authority` line, approve a
+recorded state with a signature openssl made, move a CA with a PIN to
+another state, and run the agent after reboots of the software TPM.
 
 ## Known limits
 
@@ -183,6 +294,12 @@ reboot of the software TPM.
   TPM drops only trailing ones, and a random host key authorization value
   then fails about one time in eight. Move to the first release with the
   fix.
+- **assh builds with a fork of go-tpm** (`replace` in go.mod,
+  github.com/mrwiora/go-tpm): it adds TPM2_NV_ChangeAuth and
+  TPM2_DictionaryAttackLockReset, and checks the response of a command that
+  changes an authorization value with the new value. Only `tpmadmin` needs
+  it; a program that uses `hostkey` without `tpmadmin` (tpm2-kira) builds
+  with go-tpm as released. Drop the replace once upstream has them.
 - **RSA-2048 host keys** sign rsa-sha2-256 in `serve` (many TPMs lack
   SHA-512); the agent offers rsa-sha2-512 too and fails it on such a TPM -
   set sshd's `HostKeyAlgorithms` then, or use P-256.
