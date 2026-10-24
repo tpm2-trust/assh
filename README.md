@@ -12,7 +12,8 @@ unencrypted boot image. It is a Go library and a command:
 | `agent` | an ssh-agent socket that lends the host key to OpenSSH's sshd (`HostKeyAgent`) |
 | `cmd/assh` | the command: `ca create`, `ca show`, `ca approve`, `serve`, `agent` |
 
-[tpm2-kira](../tpm2-kira) uses it for the SSH server of its boot image.
+[tpm2-kira](https://github.com/mrwiora/tpm2-kira) uses it, as a git
+submodule, for the SSH server of its boot image.
 
 ## How the keys are held
 

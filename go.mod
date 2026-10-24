@@ -1,4 +1,4 @@
-module github.com/mrwiora/assh
+module github.com/tpm2-trust/assh
 
 go 1.26.0
 

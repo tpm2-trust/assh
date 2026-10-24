@@ -18,7 +18,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2/transport"
 
-	"github.com/mrwiora/assh/hostkey"
+	"github.com/tpm2-trust/assh/hostkey"
 )
 
 const usage = `assh - an SSH host key in the TPM

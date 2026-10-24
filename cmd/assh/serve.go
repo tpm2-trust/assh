@@ -16,9 +16,9 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/mrwiora/assh/agent"
-	"github.com/mrwiora/assh/hostkey"
-	"github.com/mrwiora/assh/server"
+	"github.com/tpm2-trust/assh/agent"
+	"github.com/tpm2-trust/assh/hostkey"
+	"github.com/tpm2-trust/assh/server"
 )
 
 // childArg starts this binary as the server's unprivileged half.

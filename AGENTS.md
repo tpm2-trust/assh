@@ -1,8 +1,8 @@
 # Notes for agents working on aSSH
 
-aSSH is used by other projects (tpm2-kira, `../tpm2-kira`, through a
-`replace` in its go.mod). A change to an exported name is a change to them:
-build and test tpm2-kira after one.
+aSSH is used by other projects (tpm2-kira includes it as the git
+submodule `assh/`, through a `replace` in its go.mod). A change to an
+exported name is a change to them: build and test tpm2-kira after one.
 
 - **No host key and no secret of one is stored.** The CA lives in the TPM;
   host keys are made in the TPM under the NULL hierarchy, one per boot;

@@ -21,7 +21,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	sshagent "golang.org/x/crypto/ssh/agent"
 
-	"github.com/mrwiora/assh/internal/swtpmtest"
+	"github.com/tpm2-trust/assh/internal/swtpmtest"
 )
 
 // TestMain is also the assh command, when a test starts this binary with

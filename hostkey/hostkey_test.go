@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/mrwiora/assh/internal/swtpmtest"
+	"github.com/tpm2-trust/assh/internal/swtpmtest"
 )
 
 func authority(t *testing.T) *ecdsa.PrivateKey {

@@ -7,7 +7,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 
-	"github.com/mrwiora/assh/internal/swtpmtest"
+	"github.com/tpm2-trust/assh/internal/swtpmtest"
 )
 
 // A host key signs whatever zero bytes its authorization value holds: the
