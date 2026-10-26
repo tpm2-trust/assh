@@ -338,13 +338,18 @@ ASSH_AGENT_UID=%d
 	if out := run(t, "ca", "show", "--config", conf); !strings.Contains(out, "\n  @cert-authority * ecdsa-sha2-nistp256 ") {
 		t.Fatalf("show names no known_hosts line:\n%s", out)
 	}
-	// The window is closed: no certificate in this boot.
+	// The window is closed: no certificate in this boot; the state of the
+	// boot's first start stays as it was.
 	ag = start(t, "agent", "--config", conf)
 	ag.wait(t, "agent at")
 	ag.stop()
-	if !strings.Contains(ag.String(), "TEMPORARY") || !strings.Contains(ag.String(), "slot 0: PCR 15 not as approved") {
+	if !strings.Contains(ag.String(), "TEMPORARY") || !strings.Contains(ag.String(), "slot 0: PCR 15 not as approved") || !strings.Contains(ag.String(), "stays in "+state) {
 		t.Fatalf("the agent in the boot of the creation:\n%s", ag.String())
 	}
+	if again, _ := os.ReadFile(state); !bytes.Equal(again, b) {
+		t.Fatal("a restart replaced the state of the boot's first start")
+	}
+	os.Remove(state) // /run is empty after a reboot
 
 	sw.Reboot(t)
 	boot()

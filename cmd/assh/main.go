@@ -679,6 +679,23 @@ type stateFile struct {
 	PCRs map[string]string `json:"pcrs"` // index: hex
 }
 
+// recordState writes the PCR state of the boot's first start to path: an
+// existing file is kept. A later start of the same boot (a restart) finds
+// the window closed, and its state is none a boot ever has again; path is in
+// /run, so a reboot starts it afresh.
+func recordState(path string, bank hostkey.Bank, values map[int][]byte, log func(string)) {
+	if path == "" {
+		return
+	}
+	if _, err := os.Stat(path); err == nil {
+		log("the PCR state of this boot's first start stays in " + path)
+		return
+	}
+	if err := writeState(path, bank, values); err != nil {
+		log("the PCR state is not recorded: " + err.Error())
+	}
+}
+
 func writeState(path string, bank hostkey.Bank, values map[int][]byte) error {
 	s := stateFile{Bank: bank, PCRs: map[string]string{}}
 	for i, v := range values {
@@ -792,7 +809,7 @@ func (h *hostKeyFlags) add(fs *flag.FlagSet, cfg config.Config, defaultState str
 	h.conf = cfg
 	fs.StringVar(&h.tpm, "tpm", cfg.TPM, "the TPM")
 	fs.StringVar(&h.ca, "ca", cfg.CA, "the CA file ('ca create')")
-	fs.StringVar(&h.state, "state", defaultState, "where the PCR values before closing are written, for 'ca approve --values'")
+	fs.StringVar(&h.state, "state", defaultState, "where the PCR values of the boot's first start are written, for 'ca approve --values' (kept when there: a restart finds the window closed; put it in /run)")
 	fs.StringVar(&h.keyType, "key-type", string(cfg.HostKeyType), "the host key: p256 or rsa2048")
 	fs.StringVar(&h.principals, "principals", strings.Join(cfg.Principals, ","), "the host names the certificate is valid for, comma-separated; * any (the clients' known_hosts patterns still choose the hosts)")
 	fs.StringVar(&h.keyID, "key-id", cfg.KeyID, "the certificate's name in the clients' logs")
@@ -837,10 +854,8 @@ func (h *hostKeyFlags) issue(log func(string)) (*hostkey.HostKey, error) {
 	defer tpm.Close()
 	if values, err := ca.ReadPCRs(tpm); err != nil {
 		return nil, err
-	} else if h.state != "" {
-		if err := writeState(h.state, ca.Bank, values); err != nil {
-			log("the PCR state is not recorded: " + err.Error())
-		}
+	} else {
+		recordState(h.state, ca.Bank, values, log)
 	}
 	principals := config.SplitList(h.principals)
 	hk, ierr := hostkey.Issue(tpm, ca, hostkey.IssueOptions{Type: typ, Principals: principals, KeyID: h.keyID, Open: open})
@@ -894,11 +909,7 @@ func (h *hostKeyFlags) noCA(typ hostkey.Type, log func(string)) (*hostkey.HostKe
 	if err != nil {
 		return nil, err
 	}
-	if h.state != "" {
-		if err := writeState(h.state, h.conf.Bank, values); err != nil {
-			log("the PCR state is not recorded: " + err.Error())
-		}
-	}
+	recordState(h.state, h.conf.Bank, values, log)
 	hk, err := hostkey.TemporaryKey(tpm, fmt.Errorf("no CA at %s yet", h.ca), hostkey.IssueOptions{Type: typ, Open: open})
 	if closePCR > 0 {
 		if cerr := hostkey.Close(tpm, closePCR, "assh: closed"); cerr != nil {

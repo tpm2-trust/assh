@@ -142,7 +142,9 @@ CA and the clients' trust in it stay as they are.
 1. **Boot the new state.** `agent` and `serve` record the PCR values of
    every PCR a slot reads, before they close the window, also when the CA
    does not sign (`--state`; `/run/assh/agent.pcrs.json`,
-   `/run/assh/serve.pcrs.json`), and serve a temporary key (below).
+   `/run/assh/serve.pcrs.json`), and serve a temporary key (below). The
+   file holds the boot's first start: a restart keeps it (it would find
+   the window closed), and `/run` starts it afresh at the next boot.
 2. **The authority approves that file** for a slot (`--slot N`, 0 by
    default): a key elsewhere (below) or the PIN (below).
 3. **Reboot.** The window was closed at this boot; the approval takes
