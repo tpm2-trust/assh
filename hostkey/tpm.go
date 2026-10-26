@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/google/go-tpm/tpm2"
@@ -77,6 +78,28 @@ func flush(t transport.TPM, h tpm2.TPMHandle) {
 // and the authority are used through their policies alone; a host key with
 // its authorization value (32 random bytes are no guess worth locking the
 // TPM over). All are noDA: the PIN index is what counts wrong PINs.
+// ResolveType is t, or for a list the first type the TPM accepts
+// (TPM2_TestParms): every TPM 2.0 should take both, an old one may not.
+func ResolveType(tp transport.TPM, t Type) (Type, error) {
+	c := t.Choices()
+	if len(c) == 1 {
+		return c[0], nil
+	}
+	var refused []string
+	for _, x := range c {
+		tmpl, err := keyTemplate(x, nil)
+		if err != nil {
+			return "", err
+		}
+		_, err = tpm2.TestParms{Parameters: tpm2.TPMTPublicParms{Type: tmpl.Type, Parameters: tmpl.Parameters}}.Execute(tp)
+		if err == nil {
+			return x, nil
+		}
+		refused = append(refused, fmt.Sprintf("%s: %v", x, err))
+	}
+	return "", fmt.Errorf("the TPM takes none of the key types %s (%s)", t, strings.Join(refused, "; "))
+}
+
 func keyTemplate(typ Type, policy []byte) (tpm2.TPMTPublic, error) {
 	attrs := tpm2.TPMAObject{
 		FixedTPM:            true,
@@ -139,12 +162,15 @@ type CAOptions struct {
 
 // newCA is the CA file of o, without its key; bank Auto is resolved on t.
 func newCA(t transport.TPM, o CAOptions) (*CA, error) {
-	if o.Type != P256 && o.Type != RSA2048 {
-		return nil, fmt.Errorf("unknown key type %q", o.Type)
-	}
 	var err error
 	if o.Bank, err = ResolveBank(t, o.Bank); err != nil {
 		return nil, err
+	}
+	if o.Type, err = ResolveType(t, o.Type); err != nil {
+		return nil, err
+	}
+	if o.Type != P256 && o.Type != RSA2048 {
+		return nil, fmt.Errorf("unknown key type %q", o.Type)
 	}
 	if o.Bank != SHA256 && o.Bank != SHA1 {
 		return nil, fmt.Errorf("unknown PCR bank %q", o.Bank)
@@ -182,7 +208,7 @@ func CreateCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, er
 	if err != nil {
 		return nil, err
 	}
-	tmpl, err := keyTemplate(o.Type, caPolicyFor(*name, o.PolicyRef))
+	tmpl, err := keyTemplate(ca.Type, caPolicyFor(*name, o.PolicyRef))
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +230,7 @@ func CreateCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, er
 	defer flush(t, p.handle)
 	key, err := createKey(t, p, tmpl, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating the %s CA in the TPM: %w", o.Type, err)
+		return nil, fmt.Errorf("creating the %s CA in the TPM: %w", ca.Type, err)
 	}
 	pub, err := key.OutPublic.Contents()
 	if err != nil {
@@ -562,7 +588,11 @@ func TemporaryKey(t transport.TPM, why error, o IssueOptions) (*HostKey, error) 
 // newHostKey makes a key under the NULL hierarchy, with a random
 // authorization value that stays in this process.
 func newHostKey(t transport.TPM, o IssueOptions) (*HostKey, error) {
-	tmpl, err := keyTemplate(o.Type, nil)
+	typ, err := ResolveType(t, o.Type)
+	if err != nil {
+		return nil, err
+	}
+	tmpl, err := keyTemplate(typ, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -594,6 +624,15 @@ func newHostKey(t transport.TPM, o IssueOptions) (*HostKey, error) {
 	return &HostKey{Signer: signer, Slot: -1, key: hostSSH.PublicKey(), ssh: hostSSH}, nil
 }
 
+// numbersOf is "0,7,15".
+func numbersOf(n []int) string {
+	s := make([]string, len(n))
+	for i, v := range n {
+		s[i] = strconv.Itoa(v)
+	}
+	return strings.Join(s, ",")
+}
+
 // certify has the CA certify the key through the first slot approved for
 // now, or says why it does not.
 func (h *HostKey) certify(t transport.TPM, ca *CA, now map[int][]byte, o IssueOptions) error {
@@ -619,7 +658,9 @@ func (h *HostKey) certify(t transport.TPM, ca *CA, now map[int][]byte, o IssueOp
 		Key:             h.key,
 		Serial:          binary.BigEndian.Uint64(serial),
 		CertType:        ssh.HostCert,
-		KeyId:           o.KeyID,
+		// The slot it was certified through, for a person to see (ssh -v):
+		// "approved exactly" or "Secure Boot and the combination only".
+		KeyId:           strings.TrimSpace(fmt.Sprintf("%s slot=%d pcrs=%s", o.KeyID, a.Slot, numbersOf(ca.Slot(a.Slot).PCRs))),
 		ValidPrincipals: o.Principals,
 		// The key dies with the boot; the certificate needs no end, and
 		// no clock is trusted for its start.

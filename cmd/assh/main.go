@@ -172,7 +172,7 @@ func caCommand(args []string) error {
 		pinHandle := fs.String("pin-handle", fmt.Sprintf("0x%08X", cfg.PINHandle), "the NV handle of the PIN index (--authority-tpm)")
 		counterHandle := fs.String("counter-handle", fmt.Sprintf("0x%08X", cfg.CounterHdl), "the NV handle of the counter (--authority-tpm)")
 		pinFd := fs.Int("pin-fd", -1, "read the new PIN from this file descriptor (every byte); default: ask the terminal twice")
-		typ := fs.String("type", string(cfg.CAType), "the CA's key: p256 or rsa2048")
+		typ := fs.String("type", string(cfg.CAType), "the CA's key: p256 or rsa2048, or a list in order of preference (rsa2048,p256: the first the TPM takes)")
 		slot0 := "0,7"
 		if p, ok := cfg.Slots[0]; ok {
 			slot0 = numbers(p)
@@ -933,7 +933,7 @@ func (h *hostKeyFlags) add(fs *flag.FlagSet, cfg config.Config, defaultState str
 	fs.StringVar(&h.tpm, "tpm", cfg.TPM, "the TPM")
 	fs.StringVar(&h.ca, "ca", cfg.CA, "the CA file ('ca create')")
 	fs.StringVar(&h.state, "state", defaultState, "where the PCR values of the boot's first start are written, for 'ca approve --values' (kept when there: a restart finds the window closed; put it in /run)")
-	fs.StringVar(&h.keyType, "key-type", string(cfg.HostKeyType), "the host key: p256 or rsa2048")
+	fs.StringVar(&h.keyType, "key-type", string(cfg.HostKeyType), "the host key: p256 or rsa2048, or a list in order of preference (the first the TPM takes)")
 	fs.StringVar(&h.principals, "principals", strings.Join(cfg.Principals, ","), "the host names the certificate is valid for, comma-separated; * any (the clients' known_hosts patterns still choose the hosts)")
 	fs.StringVar(&h.keyID, "key-id", cfg.KeyID, "the certificate's name in the clients' logs")
 	fs.IntVar(&h.closePCR, "close-pcr", cfg.ClosePCR, "extend this PCR after the host key is made: the CA signs nothing more until the next boot (default: the CA's window; every slot must read it)")

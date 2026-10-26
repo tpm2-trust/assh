@@ -63,15 +63,35 @@ const (
 	RSA2048 Type = "rsa2048" // RSA with 2048 bits, ssh's rsa-sha2-256
 )
 
-// ParseType reads a type as a person writes it.
+// ParseType reads a type as a person writes it, or a list of them in order
+// of preference ("rsa2048,p256"): a key is made with the first the TPM
+// accepts (ResolveType).
 func ParseType(s string) (Type, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "p256", "p-256", "ecdsa", "nistp256":
-		return P256, nil
-	case "rsa2048", "rsa-2048", "rsa":
-		return RSA2048, nil
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		var t Type
+		switch strings.ToLower(strings.TrimSpace(p)) {
+		case "p256", "p-256", "ecdsa", "nistp256":
+			t = P256
+		case "rsa2048", "rsa-2048", "rsa":
+			t = RSA2048
+		default:
+			return "", fmt.Errorf("unknown key type %q (p256 or rsa2048, or a list of them)", p)
+		}
+		if !slices.Contains(out, string(t)) {
+			out = append(out, string(t))
+		}
 	}
-	return "", fmt.Errorf("unknown key type %q (p256 or rsa2048)", s)
+	return Type(strings.Join(out, ",")), nil
+}
+
+// Choices are the types of t, a list's in order.
+func (t Type) Choices() []Type {
+	var out []Type
+	for _, p := range strings.Split(string(t), ",") {
+		out = append(out, Type(p))
+	}
+	return out
 }
 
 // Bank is a PCR bank the CA's policy reads.

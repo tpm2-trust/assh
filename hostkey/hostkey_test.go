@@ -64,7 +64,7 @@ func TestCertifiedHostKey(t *testing.T) {
 				t.Fatal(err)
 			}
 			hk := certified(t, tpm, ca, opts, 0)
-			if hk.Cert.KeyId != "test boot" || hk.Cert.CertType != ssh.HostCert {
+			if hk.Cert.KeyId != "test boot slot=0 pcrs=0,7,15" || hk.Cert.CertType != ssh.HostCert {
 				t.Fatalf("cert %+v", hk.Cert)
 			}
 			checkTrusted(t, ca, hk)

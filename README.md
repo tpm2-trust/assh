@@ -430,12 +430,12 @@ ASSH_PRINCIPALS=host.example,192.0.2.10
 |---|---|---|
 | `ASSH_TPM` | `--tpm` | `/dev/tpmrm0` |
 | `ASSH_CA` | `--ca`, `ca create --out` | - (a file, or `efi:NAME`) |
-| `ASSH_CA_TYPE`, `ASSH_CA_BANK` | `ca create --type`, `--bank` (`sha256`, `sha1`, `auto`) | `p256`, `sha256` |
+| `ASSH_CA_TYPE`, `ASSH_CA_BANK` | `ca create --type` (`p256`, `rsa2048`, or a list in order of preference, `rsa2048,p256`: the first the TPM takes), `--bank` (`sha256`, `sha1`, `auto`) | `p256`, `sha256` |
 | `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0), `ca slot --add N --pcrs` | slot 0 `0,7` |
 | `ASSH_CA_WINDOW`, `ASSH_CA_REF` | `ca create --window`, `--ref` | none, `assh` |
 | `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM` | `ca create --authority`, `--authority-tpm` (`yes`/`no`) | - |
 | `ASSH_PIN_HANDLE`, `ASSH_COUNTER_HANDLE` | `--pin-handle`, `--counter-handle` | `0x01802913`, `0x01802912` |
-| `ASSH_HOSTKEY_TYPE`, `ASSH_PRINCIPALS`, `ASSH_KEY_ID` | `--key-type`, `--principals`, `--key-id` | `p256`, `*`, `assh` |
+| `ASSH_HOSTKEY_TYPE`, `ASSH_PRINCIPALS`, `ASSH_KEY_ID` | `--key-type` (as `ASSH_CA_TYPE`, a list too), `--principals`, `--key-id` | `p256`, `*`, `assh` |
 | `ASSH_CLOSE_PCR`, `ASSH_STATE` | `--close-pcr`, `--state` | the CA's window, the command's own |
 | `ASSH_LISTEN`, `ASSH_AUTHORIZED_KEYS`, `ASSH_USER`, `ASSH_SOCKET` | `serve --listen`, `--authorized-keys`, `--user`, `--socket` | `:22` |
 | `ASSH_AGENT_DIR`, `ASSH_AGENT_UID` | `agent --dir`, `--uid` | `/run/assh`, `0` |
@@ -509,6 +509,14 @@ assh agent --config /etc/assh/assh.conf   # systemd/assh-agent.service; closes t
 # /etc/ssh/sshd_config.d/assh.conf
 Include /run/assh/sshd.conf
 ```
+
+A certificate's key ID names the slot it was certified through and that slot's PCRs
+(`assh slot=1 pcrs=7,15`): a person sees in `ssh -v` ("Server host certificate") whether the
+boot was approved exactly or through a looser slot. It is information, signed with the rest:
+whoever must rely on the state checks it himself (a quote, an unlock that the TPM binds).
+
+The agent writes `status` beside its socket, for anyone to read (a login message, a
+prompt): `key=`, `certified=yes|no`, and `slot=`, `key_id=`, `ca=` or `why=`.
 
 The agent writes `sshd.conf` beside its socket: `HostKey`,
 `HostCertificate` (only when the CA certified the key), `HostKeyAgent`

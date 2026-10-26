@@ -328,6 +328,9 @@ ASSH_AGENT_UID=%d
 	if b, _ := os.ReadFile(filepath.Join(runDir, "sshd.conf")); string(b) != fmt.Sprintf("HostKey %s/host.pub\nHostKeyAgent %s/agent.sock\nHostKeyAlgorithms ecdsa-sha2-nistp256\n", runDir, runDir) {
 		t.Fatalf("sshd.conf of a temporary key:\n%s", b)
 	}
+	if b, _ := os.ReadFile(filepath.Join(runDir, "status")); !strings.Contains(string(b), "\ncertified=no\nwhy=no CA at "+ca+" yet\n") || !strings.HasPrefix(string(b), "key=SHA256:") {
+		t.Fatalf("status of a temporary key:\n%s", b)
+	}
 	b, err := os.ReadFile(state)
 	if err != nil || !strings.Contains(string(b), `"0"`) || !strings.Contains(string(b), `"7"`) || !strings.Contains(string(b), `"15"`) {
 		t.Fatalf("the state recorded: %v\n%s", err, b)
@@ -368,6 +371,9 @@ ASSH_AGENT_UID=%d
 	if b, _ := os.ReadFile(filepath.Join(runDir, "sshd.conf")); !strings.Contains(string(b), "HostCertificate "+runDir+"/host-cert.pub\n") ||
 		!strings.HasSuffix(string(b), "HostKeyAlgorithms ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp256\n") {
 		t.Fatalf("sshd.conf of a certified key:\n%s", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(runDir, "status")); !strings.Contains(string(b), "\ncertified=yes\nslot=0\nkey_id=assh slot=0 pcrs=0,7,15\nca=SHA256:") {
+		t.Fatalf("status of a certified key:\n%s", b)
 	}
 	if bytes.Contains(s.out.Bytes(), pin) || bytes.Contains(s.out.Bytes(), lockout) {
 		t.Fatal("a secret in the output")

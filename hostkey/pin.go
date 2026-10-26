@@ -374,13 +374,13 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	if err != nil {
 		return nil, err
 	}
-	tmpl, err := keyTemplate(o.Type, caPolicyFor(*name, o.PolicyRef))
+	tmpl, err := keyTemplate(ca.Type, caPolicyFor(*name, o.PolicyRef))
 	if err != nil {
 		return nil, err
 	}
 	key, err := createKey(t, p, tmpl, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating the %s CA in the TPM: %w", o.Type, err)
+		return nil, fmt.Errorf("creating the %s CA in the TPM: %w", ca.Type, err)
 	}
 	pub, err := key.OutPublic.Contents()
 	if err != nil {

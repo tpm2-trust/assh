@@ -118,6 +118,12 @@ func TestMatch(t *testing.T) {
 		t.Fatalf("the same: %v %v", changed, err)
 	}
 	if d := c; true {
+		d.CAType = "rsa2048,p256"
+		if changed, err := d.Match(ca); err != nil || changed {
+			t.Fatalf("a list that names the CA's type: %v %v", changed, err)
+		}
+	}
+	if d := c; true {
 		d.Bank = hostkey.Auto
 		if changed, err := d.Match(ca); err != nil || changed {
 			t.Fatalf("auto, a CA of any bank: %v %v", changed, err)

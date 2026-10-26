@@ -360,7 +360,7 @@ ASSH_STATE=%s
 		t.Fatalf("serve:\n%s", srv.String())
 	}
 	cert, ok := offeredKey(t, port).(*ssh.Certificate)
-	if !ok || cert.KeyId != "configured host" {
+	if !ok || cert.KeyId != "configured host slot=0 pcrs=0,2,7,15" {
 		t.Fatalf("the host certificate: %v", cert)
 	}
 	pub, _ := os.ReadFile(ca + ".pub")

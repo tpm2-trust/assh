@@ -400,7 +400,7 @@ func (c Config) Match(ca *hostkey.CA) (changed bool, err error) {
 	switch {
 	case c.Window != ca.Window:
 		return false, fmt.Errorf("ASSH_CA_WINDOW is %d, the CA's window %d: a window is the CA's for good, create the CA again", c.Window, ca.Window)
-	case c.CAType != ca.Type:
+	case !slices.Contains(c.CAType.Choices(), ca.Type):
 		return false, fmt.Errorf("ASSH_CA_TYPE is %s, the CA's key %s: create the CA again", c.CAType, ca.Type)
 	case c.Bank != hostkey.Auto && c.Bank != ca.Bank:
 		return false, fmt.Errorf("ASSH_CA_BANK is %s, the CA's bank %s: create the CA again", c.Bank, ca.Bank)

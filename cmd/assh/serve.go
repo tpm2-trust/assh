@@ -212,6 +212,9 @@ func agentCommand(args []string) error {
 	if err := os.WriteFile(filepath.Join(*dir, "sshd.conf"), []byte(conf), 0o644); err != nil {
 		return err
 	}
+	if err := os.WriteFile(filepath.Join(*dir, "status"), statusOf(hk), 0o644); err != nil {
+		return err
+	}
 	if hk.Cert != nil {
 		logger(fmt.Sprintf("agent at %s: HostKey %s, HostCertificate %s, HostKeyAgent %s (sshd: %s)", sock, pub, certPath, sock, filepath.Join(*dir, "sshd.conf")))
 	} else {
@@ -225,6 +228,24 @@ func agentCommand(args []string) error {
 }
 
 func sshAuthorizedKey(k ssh.PublicKey) []byte { return ssh.MarshalAuthorizedKey(k) }
+
+// statusOf is what this boot's host key is, for anyone to read (a login
+// message, a prompt): KEY=VALUE lines, nothing secret.
+//
+//	key=SHA256:...                  the host key's fingerprint
+//	certified=yes|no
+//	slot=N, key_id=..., ca=SHA256:...   when certified
+//	why=...                         when not: why the key is temporary
+func statusOf(hk *hostkey.HostKey) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "key=%s\n", hk.Fingerprint())
+	if hk.Cert != nil {
+		fmt.Fprintf(&b, "certified=yes\nslot=%d\nkey_id=%s\nca=%s\n", hk.Slot, hk.Cert.KeyId, ssh.FingerprintSHA256(hk.Cert.SignatureKey))
+	} else {
+		fmt.Fprintf(&b, "certified=no\nwhy=%s\n", strings.ReplaceAll(fmt.Sprint(hk.Temporary), "\n", " "))
+	}
+	return []byte(b.String())
+}
 
 // hostKeyAlgorithms are the algorithms sshd may offer for hk: what the
 // TPM signs in (RSA: rsa-sha2-512 only where it has SHA-512, never SHA-1's
