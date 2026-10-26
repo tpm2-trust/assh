@@ -289,3 +289,72 @@ func TestPINCommand(t *testing.T) {
 		})
 	}
 }
+
+// The first boot of a machine, before its CA exists: the agent, with
+// assh.conf naming the slots, serves a temporary key, records the PCRs of
+// the slots and closes the window. In the same boot the CA is created and
+// this recorded state approved in both slots with one PIN - and still
+// nothing certifies before the next boot (the window is closed). The next
+// boot, in the same state, certifies through slot 0.
+func TestAgentBeforeTheCA(t *testing.T) {
+	sw := swtpmtest.Start(t)
+	dir := t.TempDir()
+	s := &secrets{t: t}
+	ca, state, runDir := filepath.Join(dir, "ca.json"), filepath.Join(dir, "agent.pcrs.json"), filepath.Join(dir, "run")
+	pin, lockout := []byte("pin-first-8Hk2"), []byte("lockout-first-Wd61")
+	conf := filepath.Join(dir, "assh.conf")
+	os.WriteFile(conf, []byte(fmt.Sprintf(`ASSH_TPM=%s
+ASSH_CA=%s
+ASSH_AUTHORITY_TPM=yes
+ASSH_CA_SLOT_0=0,7,15
+ASSH_CA_SLOT_1=7,15
+ASSH_CA_WINDOW=15
+ASSH_STATE=%s
+ASSH_AGENT_DIR=%s
+ASSH_AGENT_UID=%d
+`, sw.Sock, ca, state, runDir, os.Getuid())), 0o644)
+	boot := func() { extend(t, sw, 15, "combination:a") } // what the initrd measures
+
+	boot()
+	ag := start(t, "agent", "--config", conf)
+	ag.wait(t, "agent at")
+	ag.stop()
+	if !strings.Contains(ag.String(), "is TEMPORARY: there is no CA at "+ca+" yet") || !strings.Contains(ag.String(), "PCR 15 is extended") {
+		t.Fatalf("the agent before the CA:\n%s", ag.String())
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "host-cert.pub")); err == nil {
+		t.Fatal("a certificate without a CA")
+	}
+	b, err := os.ReadFile(state)
+	if err != nil || !strings.Contains(string(b), `"0"`) || !strings.Contains(string(b), `"7"`) || !strings.Contains(string(b), `"15"`) {
+		t.Fatalf("the state recorded: %v\n%s", err, b)
+	}
+
+	s.must([][]byte{lockout}, "tpm", "da", "--config", conf, "--new-lockout-auth-fd", "3", "--max-tries", "3", "--recovery", "1800", "--lockout-recovery", "1800")
+	s.must([][]byte{pin}, "ca", "create", "--config", conf, "--pin-fd", "3")
+	if out := s.must([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state, "--pin-fd", "3"); !strings.Contains(out, "Approved in slots 0 and 1 at generation 1") {
+		t.Fatalf("approve:\n%s", out)
+	}
+	// The window is closed: no certificate in this boot.
+	ag = start(t, "agent", "--config", conf)
+	ag.wait(t, "agent at")
+	ag.stop()
+	if !strings.Contains(ag.String(), "TEMPORARY") || !strings.Contains(ag.String(), "slot 0: PCR 15 not as approved") {
+		t.Fatalf("the agent in the boot of the creation:\n%s", ag.String())
+	}
+
+	sw.Reboot(t)
+	boot()
+	ag = start(t, "agent", "--config", conf)
+	ag.wait(t, "agent at")
+	ag.stop()
+	if !strings.Contains(ag.String(), "through slot 0") {
+		t.Fatalf("the next boot:\n%s", ag.String())
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "host-cert.pub")); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(s.out.Bytes(), pin) || bytes.Contains(s.out.Bytes(), lockout) {
+		t.Fatal("a secret in the output")
+	}
+}

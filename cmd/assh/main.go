@@ -676,8 +676,8 @@ type stateFile struct {
 	PCRs map[string]string `json:"pcrs"` // index: hex
 }
 
-func writeState(path string, ca *hostkey.CA, values map[int][]byte) error {
-	s := stateFile{Bank: ca.Bank, PCRs: map[string]string{}}
+func writeState(path string, bank hostkey.Bank, values map[int][]byte) error {
+	s := stateFile{Bank: bank, PCRs: map[string]string{}}
 	for i, v := range values {
 		s.PCRs[fmt.Sprint(i)] = hex.EncodeToString(v)
 	}
@@ -777,12 +777,16 @@ func readPrivateKey(path string) (crypto.Signer, error) {
 type hostKeyFlags struct {
 	tpm, ca, state, keyType, principals, keyID string
 	closePCR                                   int
+	// conf is assh.conf: its slots and window are what a CA not created
+	// yet will read (noCA).
+	conf config.Config
 }
 
 func (h *hostKeyFlags) add(fs *flag.FlagSet, cfg config.Config, defaultState string) {
 	if cfg.State != "" {
 		defaultState = cfg.State
 	}
+	h.conf = cfg
 	fs.StringVar(&h.tpm, "tpm", cfg.TPM, "the TPM")
 	fs.StringVar(&h.ca, "ca", cfg.CA, "the CA file ('ca create')")
 	fs.StringVar(&h.state, "state", defaultState, "where the PCR values before closing are written, for 'ca approve --values'")
@@ -800,11 +804,14 @@ func (h *hostKeyFlags) issue(log func(string)) (*hostkey.HostKey, error) {
 	if err := hostkey.NoDump(); err != nil {
 		log("this process can be dumped: " + err.Error())
 	}
-	ca, err := hostkey.LoadCA(h.ca)
+	typ, err := hostkey.ParseType(h.keyType)
 	if err != nil {
 		return nil, err
 	}
-	typ, err := hostkey.ParseType(h.keyType)
+	ca, err := hostkey.LoadCA(h.ca)
+	if os.IsNotExist(err) && len(h.conf.Slots) > 0 {
+		return h.noCA(typ, log)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -828,7 +835,7 @@ func (h *hostKeyFlags) issue(log func(string)) (*hostkey.HostKey, error) {
 	if values, err := ca.ReadPCRs(tpm); err != nil {
 		return nil, err
 	} else if h.state != "" {
-		if err := writeState(h.state, ca, values); err != nil {
+		if err := writeState(h.state, ca.Bank, values); err != nil {
 			log("the PCR state is not recorded: " + err.Error())
 		}
 	}
@@ -852,6 +859,54 @@ func (h *hostKeyFlags) issue(log func(string)) (*hostkey.HostKey, error) {
 		return hk, nil
 	}
 	log(fmt.Sprintf("host key %s, certified by the CA %s through slot %d", hk.Fingerprint(), ca.Fingerprint(), hk.Slot))
+	return hk, nil
+}
+
+// noCA is a boot before the CA is created: assh.conf names its slots, so
+// the PCRs they read are recorded as at a boot with the CA, for the
+// creation to approve ('ca approve --values'); the host key is temporary,
+// and the window is closed all the same - else, once the CA is created and
+// approved in this boot, any process could have it certify.
+func (h *hostKeyFlags) noCA(typ hostkey.Type, log func(string)) (*hostkey.HostKey, error) {
+	closePCR := h.closePCR
+	if closePCR < 0 {
+		closePCR = h.conf.Window
+	}
+	var pcrs []int
+	for _, n := range h.conf.SlotNumbers() {
+		for _, p := range h.conf.Slots[n] {
+			if !slices.Contains(pcrs, p) {
+				pcrs = append(pcrs, p)
+			}
+		}
+	}
+	slices.Sort(pcrs)
+	open := openTPM(h.tpm)
+	tpm, err := open()
+	if err != nil {
+		return nil, err
+	}
+	defer tpm.Close()
+	values, err := hostkey.ReadPCRs(tpm, h.conf.Bank, pcrs)
+	if err != nil {
+		return nil, err
+	}
+	if h.state != "" {
+		if err := writeState(h.state, h.conf.Bank, values); err != nil {
+			log("the PCR state is not recorded: " + err.Error())
+		}
+	}
+	hk, err := hostkey.TemporaryKey(tpm, fmt.Errorf("no CA at %s yet", h.ca), hostkey.IssueOptions{Type: typ, Open: open})
+	if closePCR > 0 {
+		if cerr := hostkey.Close(tpm, closePCR, "assh: closed"); cerr != nil {
+			return nil, cerr
+		}
+		log(fmt.Sprintf("PCR %d is extended: no CA created in this boot can sign before the next one", closePCR))
+	}
+	if err != nil {
+		return nil, err
+	}
+	log(fmt.Sprintf("host key %s is TEMPORARY: there is no CA at %s yet. The PCR state of its slots is recorded in %s: create the CA and approve it there (assh ca create, then assh ca approve --values %s); the next boot certifies", hk.Fingerprint(), h.ca, h.state, h.state))
 	return hk, nil
 }
 

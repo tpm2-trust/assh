@@ -180,6 +180,13 @@ remove it once the state is approved.
   Do not use it for such a host.
 - A CA file that cannot be read, or a TPM that cannot be opened, is an
   error, not a temporary key.
+- **Before the CA exists** - its file (or EFI variable) not there, and
+  `assh.conf` naming the slots - `agent` and `serve` serve the temporary
+  key too, record the PCRs of those slots (`--state`) and close the window.
+  The CA can then be created and this boot's recorded state approved in the
+  same boot (`ca create`, `ca approve --values STATE`), one command for a
+  machine's first identity; the next boot certifies. Not before: the window
+  is closed, or any process could have the new CA certify in this boot.
 
 ## The authority elsewhere
 
