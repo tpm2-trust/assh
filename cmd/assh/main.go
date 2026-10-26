@@ -311,6 +311,9 @@ func caCommand(args []string) error {
 			return err
 		}
 		fmt.Print(ca.Describe())
+		if line, err := ca.KnownHosts("*"); err == nil {
+			fmt.Printf("Clients trust it with this known_hosts line (narrow the * to the host's names):\n  %s\n", line)
+		}
 		tpm, err := openTPM(*tpmPath)()
 		if err != nil {
 			listApprovals(ca, ca.FileGeneration())

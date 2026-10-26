@@ -335,6 +335,9 @@ ASSH_AGENT_UID=%d
 	if out := s.must([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state, "--pin-fd", "3"); !strings.Contains(out, "Approved in slots 0 and 1 at generation 1") {
 		t.Fatalf("approve:\n%s", out)
 	}
+	if out := run(t, "ca", "show", "--config", conf); !strings.Contains(out, "\n  @cert-authority * ecdsa-sha2-nistp256 ") {
+		t.Fatalf("show names no known_hosts line:\n%s", out)
+	}
 	// The window is closed: no certificate in this boot.
 	ag = start(t, "agent", "--config", conf)
 	ag.wait(t, "agent at")
