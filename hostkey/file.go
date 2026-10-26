@@ -18,7 +18,8 @@
 // with a counter in the TPM that every approval names: incrementing it
 // (NextGeneration) revokes every approval made before. Either way an
 // approval is a signature, kept in the CA file, that the TPM checks each
-// time the CA signs.
+// time the CA signs. The CA file may be an EFI variable ("efi:NAME",
+// efivar.go).
 //
 // At its start a server asks for a host key (Issue): the TPM makes a new
 // one under its NULL hierarchy, whose seed changes at every reboot, and
@@ -176,9 +177,15 @@ func (a Approval) Equal(b *Approval) bool {
 	return true
 }
 
-// LoadCA reads a CA file.
+// LoadCA reads a CA file, or the EFI variable "efi:NAME".
 func LoadCA(path string) (*CA, error) {
-	data, err := os.ReadFile(path)
+	var data []byte
+	var err error
+	if IsVar(path) {
+		data, err = readVar(path)
+	} else {
+		data, err = os.ReadFile(path)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -229,8 +236,16 @@ func (f *CA) Marshal() ([]byte, error) {
 }
 
 // Save writes the file, readable by its owner alone, in place of what is
-// at path: written beside it and renamed, so a reader never sees half.
+// at path: written beside it and renamed, so a reader never sees half. An
+// EFI variable ("efi:NAME") is written compact, in one piece.
 func (f *CA) Save(path string) error {
+	if IsVar(path) {
+		b, err := json.Marshal(f)
+		if err != nil {
+			return err
+		}
+		return writeVar(path, b)
+	}
 	b, err := f.Marshal()
 	if err != nil {
 		return err

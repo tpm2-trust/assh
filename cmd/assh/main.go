@@ -21,6 +21,7 @@ import (
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 
+	"github.com/tpm2-trust/assh/config"
 	"github.com/tpm2-trust/assh/hostkey"
 	"github.com/tpm2-trust/assh/tpmadmin"
 )
@@ -31,8 +32,9 @@ const usage = `assh - an SSH host key in the TPM
                    [--type p256|rsa2048] [--pcrs 0,7] [--window N] [--bank sha256] [--ref TEXT]
                    [--pin-handle 0x01802913] [--counter-handle 0x01802912] [--pin-fd N]
   assh ca slot     --ca FILE (--add N --pcrs 0,7 | --remove N)
+  assh ca sync     --ca FILE
   assh ca show     --ca FILE
-  assh ca approve  --ca FILE [--slot N] [--values FILE]
+  assh ca approve  --ca FILE [--slot N[,N...]] [--values FILE]
                    authority in the TPM: [--next-generation] [--redefine-counter] [--pin-fd N]
                    key elsewhere: (--authority-key KEY.pem | --signature FILE | --digest FILE)
   assh ca pin      --ca FILE [--pin-fd N] [--new-pin-fd N]
@@ -46,7 +48,16 @@ const usage = `assh - an SSH host key in the TPM
 Host key options: [--key-type p256|rsa2048] [--principals '*'] [--key-id TEXT]
                   [--close-pcr N] [--state FILE]
 
-Every command takes --tpm PATH (default /dev/tpmrm0).
+Every command takes --config FILE, assh.conf (default ` + config.DefaultPath + ` when it
+is there): KEY=VALUE lines that set what the flags set - ASSH_CA,
+ASSH_CA_SLOT_<N>=PCRs, ASSH_CA_WINDOW, ASSH_LISTEN, ASSH_AUTHORIZED_KEYS
+and the rest (README) - so that 'assh agent --config FILE' is all a
+service needs; a flag given wins over the file. 'ca create' makes every
+slot the file names, 'ca sync' makes an existing CA's slots the file's.
+Every command takes --tpm PATH (default /dev/tpmrm0). A CA FILE may be an
+EFI variable instead, efi:NAME (efivarfs, vendor GUID ` + hostkey.VarGUID + `):
+where nothing else survives a reboot, or outside the boot image a slot
+measures.
 
 The CA is created in the TPM and never leaves it. It has up to 16 slots,
 each a PCR selection ('ca create --pcrs' is slot 0, 'ca slot' adds more),
@@ -106,25 +117,65 @@ func openTPM(path string) func() (transport.TPMCloser, error) {
 	}
 }
 
+// commandConfig is assh.conf for a command's arguments: the file --config
+// names, else config.DefaultPath when it is there, else the defaults. The
+// flags take their defaults from it, so that a flag given wins.
+func commandConfig(fs *flag.FlagSet, args []string) (config.Config, error) {
+	path, named := config.DefaultPath, false
+	for i, a := range args {
+		if a == "--" {
+			break
+		}
+		name, val, hasVal := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if !strings.HasPrefix(a, "-") || name != "config" {
+			continue
+		}
+		if !hasVal {
+			if i+1 >= len(args) {
+				return config.Default(), errors.New("--config needs a file")
+			}
+			val = args[i+1]
+		}
+		path, named = val, true
+	}
+	fs.String("config", path, "assh.conf: the settings the flags set; a flag given wins over it")
+	if path == "" {
+		return config.Default(), nil
+	}
+	c, err := config.Load(path)
+	if os.IsNotExist(err) && !named {
+		return config.Default(), nil
+	}
+	return c, err
+}
+
 func caCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("ca needs create, slot, show, approve or pin")
+		return errors.New("ca needs create, slot, sync, show, approve or pin")
 	}
 	fs := flag.NewFlagSet("ca "+args[0], flag.ExitOnError)
-	tpmPath := fs.String("tpm", "/dev/tpmrm0", "the TPM")
+	cfg, err := commandConfig(fs, args[1:])
+	if err != nil {
+		return err
+	}
+	tpmPath := fs.String("tpm", cfg.TPM, "the TPM")
 	switch args[0] {
 	case "create":
-		out := fs.String("out", "", "the CA file to write (its public key goes beside it, .pub)")
-		authPath := fs.String("authority", "", "the authority's public key (PEM), a key elsewhere: it approves the PCR states")
-		authTPM := fs.Bool("authority-tpm", false, "make the authority in the TPM, opened by a PIN, with a counter that revokes old approvals")
-		pinHandle := fs.String("pin-handle", fmt.Sprintf("0x%08X", uint32(hostkey.DefaultPINHandle)), "the NV handle of the PIN index (--authority-tpm)")
-		counterHandle := fs.String("counter-handle", fmt.Sprintf("0x%08X", uint32(hostkey.DefaultCounterHandle)), "the NV handle of the counter (--authority-tpm)")
+		out := fs.String("out", cfg.CA, "the CA file to write (its public key goes beside it, .pub), or efi:NAME")
+		authPath := fs.String("authority", cfg.Authority, "the authority's public key (PEM), a key elsewhere: it approves the PCR states")
+		authTPM := fs.Bool("authority-tpm", cfg.AuthTPM, "make the authority in the TPM, opened by a PIN, with a counter that revokes old approvals")
+		pinHandle := fs.String("pin-handle", fmt.Sprintf("0x%08X", cfg.PINHandle), "the NV handle of the PIN index (--authority-tpm)")
+		counterHandle := fs.String("counter-handle", fmt.Sprintf("0x%08X", cfg.CounterHdl), "the NV handle of the counter (--authority-tpm)")
 		pinFd := fs.Int("pin-fd", -1, "read the new PIN from this file descriptor (every byte); default: ask the terminal twice")
-		typ := fs.String("type", "p256", "the CA's key: p256 or rsa2048")
-		pcrs := fs.String("pcrs", "0,7", "slot 0's PCRs ('ca slot' adds more slots)")
-		window := fs.Int("window", 0, "the PCR whose extension closes the CA for the rest of the boot; every slot reads it (0: none)")
-		bank := fs.String("bank", "sha256", "their bank: sha256 or sha1")
-		ref := fs.String("ref", "assh", "what the authority's approvals are bound to (at most 32 bytes)")
+		typ := fs.String("type", string(cfg.CAType), "the CA's key: p256 or rsa2048")
+		slot0 := "0,7"
+		if p, ok := cfg.Slots[0]; ok {
+			slot0 = numbers(p)
+		}
+		pcrs := fs.String("pcrs", slot0, "slot 0's PCRs (the other slots of assh.conf are made too; 'ca slot' adds more)")
+		window := fs.Int("window", cfg.Window, "the PCR whose extension closes the CA for the rest of the boot; every slot reads it (0: none)")
+		bank := fs.String("bank", string(cfg.Bank), "their bank: sha256 or sha1")
+		ref := fs.String("ref", cfg.PolicyRef, "what the authority's approvals are bound to (at most 32 bytes)")
 		fs.Parse(args[1:])
 		if *out == "" || (*authPath == "") == !*authTPM {
 			return errors.New("ca create needs --out, and --authority or --authority-tpm")
@@ -174,12 +225,22 @@ func caCommand(args []string) error {
 				return err
 			}
 		}
+		for _, n := range cfg.SlotNumbers() {
+			if n == 0 {
+				continue
+			}
+			if err := ca.AddSlot(n, cfg.Slots[n]); err != nil {
+				return fmt.Errorf("assh.conf's slot %d: %w", n, err)
+			}
+		}
 		if err := ca.Save(*out); err != nil {
 			return err
 		}
-		pub, _ := ca.AuthorizedKey()
-		if err := os.WriteFile(*out+".pub", pub, 0o644); err != nil {
-			return err
+		if !hostkey.IsVar(*out) {
+			pub, _ := ca.AuthorizedKey()
+			if err := os.WriteFile(*out+".pub", pub, 0o644); err != nil {
+				return err
+			}
 		}
 		fmt.Print(ca.Describe())
 		line, _ := ca.KnownHosts("*")
@@ -187,7 +248,7 @@ func caCommand(args []string) error {
 		fmt.Printf("Approve the PCR state it may sign in: assh ca approve --ca %s ...\n", *out)
 		return nil
 	case "slot":
-		caPath := fs.String("ca", "", "the CA file")
+		caPath := fs.String("ca", cfg.CA, "the CA file")
 		add := fs.Int("add", -1, "add this slot (0 to 15), reading --pcrs")
 		remove := fs.Int("remove", -1, "remove this slot and its approvals")
 		pcrs := fs.String("pcrs", "", "the new slot's PCRs")
@@ -218,8 +279,32 @@ func caCommand(args []string) error {
 			fmt.Printf("Slot %d lets the CA sign nothing until a state in it is approved: assh ca approve --ca %s --slot %d ...\n", *add, *caPath, *add)
 		}
 		return nil
+	case "sync":
+		caPath := fs.String("ca", cfg.CA, "the CA file")
+		fs.Parse(args[1:])
+		if len(cfg.Slots) == 0 {
+			return errors.New("ca sync makes the CA's slots those of assh.conf (ASSH_CA_SLOT_<N>), and it names none")
+		}
+		ca, err := hostkey.LoadCA(*caPath)
+		if err != nil {
+			return err
+		}
+		changed, err := cfg.Match(ca)
+		if err != nil {
+			return err
+		}
+		if changed {
+			if err := ca.Save(*caPath); err != nil {
+				return err
+			}
+		}
+		fmt.Print(ca.Describe())
+		if !changed {
+			fmt.Println("The CA's slots are assh.conf's already.")
+		}
+		return nil
 	case "show":
-		caPath := fs.String("ca", "", "the CA file")
+		caPath := fs.String("ca", cfg.CA, "the CA file")
 		fs.Parse(args[1:])
 		ca, err := hostkey.LoadCA(*caPath)
 		if err != nil {
@@ -257,8 +342,8 @@ func caCommand(args []string) error {
 		}
 		return nil
 	case "approve":
-		caPath := fs.String("ca", "", "the CA file, which gets the approval")
-		slot := fs.Int("slot", 0, "the slot the approval is for")
+		caPath := fs.String("ca", cfg.CA, "the CA file, which gets the approval")
+		slotList := fs.String("slot", slotsDefault(cfg), "the slots the approval is for, 0,1 say: one PIN for all (default: assh.conf's slots, else 0)")
 		keyPath := fs.String("authority-key", "", "the authority's private key (PEM): signs here")
 		sigPath := fs.String("signature", "", "the authority's signature over the digest, made elsewhere (PKCS #1 v1.5 or ECDSA DER, as openssl pkeyutl -sign makes it)")
 		digestPath := fs.String("digest", "", "write the digest to sign to this file, and approve nothing")
@@ -271,6 +356,10 @@ func caCommand(args []string) error {
 		if err != nil {
 			return err
 		}
+		slots, err := parseSlots(ca, *slotList)
+		if err != nil {
+			return err
+		}
 		values, err := approveValues(ca, *valuesPath, *tpmPath)
 		if err != nil {
 			return err
@@ -279,21 +368,25 @@ func caCommand(args []string) error {
 			if *keyPath != "" || *sigPath != "" || *digestPath != "" {
 				return errors.New("the CA's authority is in the TPM: it signs with the PIN, not with --authority-key, --signature or --digest")
 			}
-			return approveInTPM(ca, *caPath, *tpmPath, *slot, values, *next, *redefine, *pinFd)
+			return approveInTPM(ca, *caPath, *tpmPath, slots, values, *next, *redefine, *pinFd)
 		}
 		if *next || *redefine {
 			return errors.New("the CA's authority is a key elsewhere: it has no counter, and its approvals are never revoked")
 		}
+		if len(slots) > 1 && (*digestPath != "" || *sigPath != "") {
+			return errors.New("--digest and --signature are for one slot: a digest and a signature each")
+		}
+		slot := slots[0]
 		switch {
 		case *digestPath != "":
-			d, err := ca.ApprovalDigest(*slot, values)
+			d, err := ca.ApprovalDigest(slot, values)
 			if err != nil {
 				return err
 			}
 			if err := os.WriteFile(*digestPath, d, 0o644); err != nil {
 				return err
 			}
-			fmt.Printf("Sign %s (SHA-256 digest %s) with the authority, then: assh ca approve --ca %s --slot %d --signature SIG", *digestPath, hex.EncodeToString(d), *caPath, *slot)
+			fmt.Printf("Sign %s (SHA-256 digest %s) with the authority, then: assh ca approve --ca %s --slot %d --signature SIG", *digestPath, hex.EncodeToString(d), *caPath, slot)
 			if *valuesPath != "" {
 				fmt.Printf(" --values %s", *valuesPath)
 			}
@@ -305,7 +398,7 @@ func caCommand(args []string) error {
 			if err != nil {
 				return err
 			}
-			if err := ca.AddApproval(*slot, values, sig); err != nil {
+			if err := ca.AddApproval(slot, values, sig); err != nil {
 				return err
 			}
 		case *keyPath != "":
@@ -313,8 +406,10 @@ func caCommand(args []string) error {
 			if err != nil {
 				return err
 			}
-			if err := ca.Approve(key, *slot, values); err != nil {
-				return err
+			for _, n := range slots {
+				if err := ca.Approve(key, n, values); err != nil {
+					return err
+				}
 			}
 		default:
 			return errors.New("ca approve needs --authority-key, --signature or --digest")
@@ -322,10 +417,10 @@ func caCommand(args []string) error {
 		if err := ca.Save(*caPath); err != nil {
 			return err
 		}
-		fmt.Printf("Approved in slot %d: %d state(s) in %s\n", *slot, len(ca.Approvals), *caPath)
+		fmt.Printf("Approved in %s: %d state(s) in %s\n", slotsText(slots), len(ca.Approvals), *caPath)
 		return nil
 	case "pin":
-		caPath := fs.String("ca", "", "the CA file")
+		caPath := fs.String("ca", cfg.CA, "the CA file")
 		pinFd := fs.Int("pin-fd", -1, "read the PIN from this file descriptor (every byte); default: ask the terminal")
 		newPinFd := fs.Int("new-pin-fd", -1, "read the new PIN from this file descriptor; default: ask the terminal twice")
 		fs.Parse(args[1:])
@@ -356,10 +451,7 @@ func caCommand(args []string) error {
 
 // approveInTPM approves values with the authority in the TPM, after the
 // counter's next generation or its redefinition if asked: one PIN for all.
-func approveInTPM(ca *hostkey.CA, caPath, tpmPath string, slot int, values map[int][]byte, next, redefine bool, pinFd int) error {
-	if ca.Slot(slot) == nil {
-		return fmt.Errorf("no slot %d", slot)
-	}
+func approveInTPM(ca *hostkey.CA, caPath, tpmPath string, slots []int, values map[int][]byte, next, redefine bool, pinFd int) error {
 	tpm, err := openTPM(tpmPath)()
 	if err != nil {
 		return err
@@ -395,17 +487,64 @@ func approveInTPM(ca *hostkey.CA, caPath, tpmPath string, slot int, values map[i
 	if err != nil {
 		return err
 	}
-	if err := ca.Approve(signer, slot, values); err != nil {
-		if moved {
-			return fmt.Errorf("%w (the CA has no approval of generation %d yet: approve again)", err, ca.FileGeneration())
+	for _, n := range slots {
+		if err := ca.Approve(signer, n, values); err != nil {
+			if moved {
+				return fmt.Errorf("%w (the CA has no approval of generation %d yet: approve again)", err, ca.FileGeneration())
+			}
+			return err
 		}
-		return err
 	}
 	if err := ca.Save(caPath); err != nil {
 		return err
 	}
-	fmt.Printf("Approved in slot %d at generation %d: %d state(s) in %s\n", slot, ca.FileGeneration(), len(ca.Approvals), caPath)
+	fmt.Printf("Approved in %s at generation %d: %d state(s) in %s\n", slotsText(slots), ca.FileGeneration(), len(ca.Approvals), caPath)
 	return nil
+}
+
+// slotsDefault is what 'ca approve' approves without --slot: every slot
+// assh.conf names, else slot 0.
+func slotsDefault(cfg config.Config) string {
+	if len(cfg.Slots) == 0 {
+		return "0"
+	}
+	return numbers(cfg.SlotNumbers())
+}
+
+// numbers is "0,2,7".
+func numbers(n []int) string {
+	s := make([]string, len(n))
+	for i, v := range n {
+		s[i] = strconv.Itoa(v)
+	}
+	return strings.Join(s, ",")
+}
+
+// parseSlots reads "0,1": slots of ca, each once.
+func parseSlots(ca *hostkey.CA, s string) ([]int, error) {
+	var slots []int
+	for _, f := range strings.Split(s, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(f))
+		if err != nil {
+			return nil, fmt.Errorf("--slot %q: %w", s, err)
+		}
+		if ca.Slot(n) == nil {
+			return nil, fmt.Errorf("no slot %d", n)
+		}
+		if slices.Contains(slots, n) {
+			return nil, fmt.Errorf("--slot %q names slot %d twice", s, n)
+		}
+		slots = append(slots, n)
+	}
+	return slots, nil
+}
+
+// slotsText is "slot 0" or "slots 0 and 1".
+func slotsText(slots []int) string {
+	if len(slots) == 1 {
+		return fmt.Sprintf("slot %d", slots[0])
+	}
+	return "slots " + strings.TrimPrefix(hostkey.PCRList(slots), "PCR ")
 }
 
 // listApprovals prints each slot's approvals, those below gen as revoked.
@@ -466,7 +605,11 @@ func tpmCommand(args []string) error {
 		return errors.New("tpm needs da")
 	}
 	fs := flag.NewFlagSet("tpm da", flag.ExitOnError)
-	tpmPath := fs.String("tpm", "/dev/tpmrm0", "the TPM")
+	cfg, err := commandConfig(fs, args[1:])
+	if err != nil {
+		return err
+	}
+	tpmPath := fs.String("tpm", cfg.TPM, "the TPM")
 	maxTries := fs.Uint("max-tries", 0, "authorization failures that lock the TPM out (with --recovery and --lockout-recovery)")
 	recovery := fs.Uint("recovery", 0, "seconds after which one failure is forgotten")
 	lockoutRecovery := fs.Uint("lockout-recovery", 0, "seconds after a wrong lockout authorization before the next try")
@@ -636,14 +779,17 @@ type hostKeyFlags struct {
 	closePCR                                   int
 }
 
-func (h *hostKeyFlags) add(fs *flag.FlagSet, defaultState string) {
-	fs.StringVar(&h.tpm, "tpm", "/dev/tpmrm0", "the TPM")
-	fs.StringVar(&h.ca, "ca", "", "the CA file ('ca create')")
+func (h *hostKeyFlags) add(fs *flag.FlagSet, cfg config.Config, defaultState string) {
+	if cfg.State != "" {
+		defaultState = cfg.State
+	}
+	fs.StringVar(&h.tpm, "tpm", cfg.TPM, "the TPM")
+	fs.StringVar(&h.ca, "ca", cfg.CA, "the CA file ('ca create')")
 	fs.StringVar(&h.state, "state", defaultState, "where the PCR values before closing are written, for 'ca approve --values'")
-	fs.StringVar(&h.keyType, "key-type", "p256", "the host key: p256 or rsa2048")
-	fs.StringVar(&h.principals, "principals", "*", "the host names the certificate is valid for, comma-separated; * any (the clients' known_hosts patterns still choose the hosts)")
-	fs.StringVar(&h.keyID, "key-id", "assh", "the certificate's name in the clients' logs")
-	fs.IntVar(&h.closePCR, "close-pcr", -1, "extend this PCR after the host key is made: the CA signs nothing more until the next boot (default: the CA's window; every slot must read it)")
+	fs.StringVar(&h.keyType, "key-type", string(cfg.HostKeyType), "the host key: p256 or rsa2048")
+	fs.StringVar(&h.principals, "principals", strings.Join(cfg.Principals, ","), "the host names the certificate is valid for, comma-separated; * any (the clients' known_hosts patterns still choose the hosts)")
+	fs.StringVar(&h.keyID, "key-id", cfg.KeyID, "the certificate's name in the clients' logs")
+	fs.IntVar(&h.closePCR, "close-pcr", cfg.ClosePCR, "extend this PCR after the host key is made: the CA signs nothing more until the next boot (default: the CA's window; every slot must read it)")
 }
 
 // issue makes this boot's host key: certified through the first slot
@@ -686,12 +832,7 @@ func (h *hostKeyFlags) issue(log func(string)) (*hostkey.HostKey, error) {
 			log("the PCR state is not recorded: " + err.Error())
 		}
 	}
-	var principals []string
-	for _, p := range strings.Split(h.principals, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			principals = append(principals, p)
-		}
-	}
+	principals := config.SplitList(h.principals)
 	hk, ierr := hostkey.Issue(tpm, ca, hostkey.IssueOptions{Type: typ, Principals: principals, KeyID: h.keyID, Open: open})
 	if closePCR >= 0 {
 		if err := hostkey.Close(tpm, closePCR, "assh: closed"); err != nil {

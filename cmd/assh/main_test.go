@@ -175,8 +175,18 @@ func TestCommand(t *testing.T) {
 	if out := run(t, "ca", "slot", "--ca", ca, "--add", "1", "--pcrs", "7,15"); !strings.Contains(out, "slot 1: signs while PCR 7 and 15") {
 		t.Fatalf("slot --add:\n%s", out)
 	}
+	if out, err := assh("ca", "approve", tpm, "--ca", ca, "--slot", "0,1", "--digest", filepath.Join(dir, "d")).CombinedOutput(); err == nil || !strings.Contains(string(out), "for one slot") {
+		t.Fatalf("a digest for two slots: %v\n%s", err, out)
+	}
+	if out := run(t, "ca", "approve", tpm, "--ca", ca, "--slot", "0,1", "--authority-key", filepath.Join(dir, "auth.key")); !strings.Contains(out, "Approved in slots 0 and 1: 2 state(s)") {
+		t.Fatalf("approve two slots:\n%s", out)
+	}
 	run(t, "ca", "slot", "--ca", ca, "--remove", "1")
-	run(t, "ca", "approve", tpm, "--ca", ca, "--authority-key", filepath.Join(dir, "auth.key"))
+	for _, bad := range []string{"0,0", "0,3", "x"} {
+		if out, err := assh("ca", "approve", tpm, "--ca", ca, "--slot", bad, "--authority-key", filepath.Join(dir, "auth.key")).CombinedOutput(); err == nil {
+			t.Fatalf("--slot %s: %s", bad, out)
+		}
+	}
 	if out := run(t, "ca", "show", tpm, "--ca", ca); !strings.Contains(out, "approved in slot 0 now: the CA signs") {
 		t.Fatalf("show:\n%s", out)
 	}
@@ -276,5 +286,87 @@ func TestCommand(t *testing.T) {
 	caKey, _, _, _, _ := ssh.ParseAuthorizedKey(caPub)
 	if cert, ok := certKey.(*ssh.Certificate); !ok || !bytes.Equal(cert.SignatureKey.Marshal(), caKey.Marshal()) || !bytes.Equal(cert.Key.Marshal(), pub.Marshal()) {
 		t.Fatalf("certificate %v", certKey)
+	}
+}
+
+// assh.conf in place of the flags: 'ca create' makes every slot it names,
+// 'ca approve' approves them all, 'ca sync' follows the file's slots after
+// an edit, and 'serve' takes its CA, address, keys and certificate name
+// from it; a flag given wins over the file, and a --config file that is
+// not there is an error.
+func TestConfig(t *testing.T) {
+	for _, tool := range []string{"ssh", "ssh-keygen"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skip(tool + " not installed")
+		}
+	}
+	sw := swtpmtest.Start(t)
+	dir := t.TempDir()
+	auth, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	der, _ := x509.MarshalPKCS8PrivateKey(auth)
+	writePEM(t, filepath.Join(dir, "auth.key"), "PRIVATE KEY", der)
+	der, _ = x509.MarshalPKIXPublicKey(auth.Public())
+	writePEM(t, filepath.Join(dir, "auth.pub"), "PUBLIC KEY", der)
+	client := filepath.Join(dir, "client")
+	if out, err := exec.Command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", client).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	ca := filepath.Join(dir, "ca.json")
+	port := freePort(t)
+	conf := filepath.Join(dir, "assh.conf")
+	write := func(slot1 string) {
+		t.Helper()
+		c := fmt.Sprintf(`# a test's
+ASSH_TPM=%s
+ASSH_CA=%s
+ASSH_CA_SLOT_0=0,2,7,15
+ASSH_CA_SLOT_1=%s
+ASSH_CA_WINDOW=15
+ASSH_AUTHORITY=%s
+ASSH_LISTEN=127.0.0.1:%d
+ASSH_AUTHORIZED_KEYS=%s
+ASSH_KEY_ID="configured host"
+ASSH_STATE=%s
+`, sw.Sock, ca, slot1, filepath.Join(dir, "auth.pub"), port, client+".pub", filepath.Join(dir, "state.json"))
+		if err := os.WriteFile(conf, []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("7,15")
+
+	if out := run(t, "ca", "create", "--config", conf); !strings.Contains(out, "slot 0: signs while PCR 0, 2, 7 and 15") || !strings.Contains(out, "slot 1: signs while PCR 7 and 15") {
+		t.Fatalf("create:\n%s", out)
+	}
+	if out := run(t, "ca", "approve", "--config="+conf, "--authority-key", filepath.Join(dir, "auth.key")); !strings.Contains(out, "Approved in slots 0 and 1: 2 state(s)") {
+		t.Fatalf("approve:\n%s", out)
+	}
+	write("0,7,15")
+	if out := run(t, "ca", "sync", "--config", conf); !strings.Contains(out, "slot 1: signs while PCR 0, 7 and 15 (sha256) hold an approved state; 0 approved") || !strings.Contains(out, "slot 0: signs while PCR 0, 2, 7 and 15 (sha256) hold an approved state; 1 approved") {
+		t.Fatalf("sync:\n%s", out)
+	}
+	if out := run(t, "ca", "sync", "--config", conf); !strings.Contains(out, "assh.conf's already") {
+		t.Fatalf("sync again:\n%s", out)
+	}
+	if out, err := assh("ca", "show", "--config", conf, "--ca", filepath.Join(dir, "none.json")).CombinedOutput(); err == nil || !strings.Contains(string(out), "none.json") {
+		t.Fatalf("--ca wins: %v\n%s", err, out)
+	}
+	if out, err := assh("ca", "show", "--config", filepath.Join(dir, "none.conf")).CombinedOutput(); err == nil || !strings.Contains(string(out), "none.conf") {
+		t.Fatalf("a --config that is not there: %v\n%s", err, out)
+	}
+
+	srv := start(t, "serve", "--config", conf, "--", "/bin/sh", "-c", "echo hello from $ASSH_USER")
+	srv.wait(t, "listening on")
+	if !strings.Contains(srv.String(), "through slot 0") || !strings.Contains(srv.String(), "PCR 15 is extended") {
+		t.Fatalf("serve:\n%s", srv.String())
+	}
+	cert, ok := offeredKey(t, port).(*ssh.Certificate)
+	if !ok || cert.KeyId != "configured host" {
+		t.Fatalf("the host certificate: %v", cert)
+	}
+	pub, _ := os.ReadFile(ca + ".pub")
+	known := filepath.Join(dir, "known_hosts")
+	os.WriteFile(known, []byte("@cert-authority 127.0.0.1 "+string(pub)), 0o644)
+	if out, err := sshLogin(client, known, port); err != nil || !strings.Contains(out, "hello from someone") {
+		t.Fatalf("login: %v\n%s", err, out)
 	}
 }

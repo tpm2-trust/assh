@@ -47,12 +47,16 @@ type Header struct {
 
 func serveCommand(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	cfg, err := commandConfig(fs, args)
+	if err != nil {
+		return err
+	}
 	var h hostKeyFlags
-	h.add(fs, "/run/assh/serve.pcrs.json")
-	listen := fs.String("listen", ":22", "the address to listen on")
-	authPath := fs.String("authorized-keys", "", "the keys that may log in (authorized_keys; lines with options are left out)")
-	socket := fs.String("socket", "", "hand each session to the program listening on this Unix socket")
-	userName := fs.String("user", "", "run the command as this user (default: as assh runs)")
+	h.add(fs, cfg, "/run/assh/serve.pcrs.json")
+	listen := fs.String("listen", cfg.Listen, "the address to listen on")
+	authPath := fs.String("authorized-keys", cfg.AuthorizedKeys, "the keys that may log in (authorized_keys; lines with options are left out)")
+	socket := fs.String("socket", cfg.Socket, "hand each session to the program listening on this Unix socket")
+	userName := fs.String("user", cfg.User, "run the command as this user (default: as assh runs)")
 	fs.Parse(args)
 	command := fs.Args()
 	if (*socket == "") == (len(command) == 0) {
@@ -153,10 +157,14 @@ func forward(s *server.Session, path string) {
 
 func agentCommand(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
+	cfg, err := commandConfig(fs, args)
+	if err != nil {
+		return err
+	}
 	var h hostKeyFlags
-	h.add(fs, "")
-	dir := fs.String("dir", "/run/assh", "where the socket, the public key and the certificate go")
-	uid := fs.Int("uid", 0, "the only user answered (sshd: root)")
+	h.add(fs, cfg, "")
+	dir := fs.String("dir", cfg.AgentDir, "where the socket, the public key and the certificate go")
+	uid := fs.Int("uid", cfg.AgentUID, "the only user answered (sshd: root)")
 	fs.Parse(args)
 	if h.state == "" {
 		h.state = filepath.Join(*dir, "agent.pcrs.json")

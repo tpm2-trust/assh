@@ -25,6 +25,13 @@ exported name is a change to them: build and test tpm2-kira after one.
   under the NULL hierarchy, never in software, and never certified. It is
   what a server serves when no slot certifies; an unreadable CA file or a
   TPM that does not open stays an error.
+- **A CA file may be an EFI variable** (`efi:NAME`, assh's GUID): plain,
+  not authenticated, because the TPM checks everything in it. Keep it so:
+  nothing that the TPM does not check goes into a CA file.
+- **Every setting has a key in assh.conf** (`config`, `ASSH_*`), and a
+  flag given wins over it. A new flag of how a CA, host key or server is
+  set up gets its key too, in `Config`, `set`, `Lines` and the README's
+  table. Nothing secret goes into it, and nothing in it is trusted.
 - **No backwards compatibility.** One file format, the current one
   (`hostkey.fileVersion`); another version is an error that says to
   create the CA again. No migrations.

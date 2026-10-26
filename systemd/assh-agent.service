@@ -2,8 +2,8 @@
 Description=aSSH: sshd's host key, held in the TPM
 Documentation=file:///usr/share/doc/assh/README.md
 # Early, ahead of anything that could ask the CA too: the window closes
-# (--close-pcr) once the host key is certified, and stays closed until
-# the next boot. sshd starts after it and asks it for every signature.
+# once the host key is certified, and stays closed until the next boot.
+# The CA, its window and the host key's settings are in assh.conf. sshd starts after it and asks it for every signature.
 DefaultDependencies=no
 After=local-fs.target tpm2.target
 Wants=tpm2.target
@@ -13,7 +13,7 @@ Before=shutdown.target
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/assh agent --ca /etc/assh/os-ca.json --close-pcr 15
+ExecStart=/usr/bin/assh agent --config /etc/assh/assh.conf
 # A restart gets no certificate: the window is closed until the next boot.
 Restart=no
 

@@ -228,7 +228,7 @@ func TestPINCommand(t *testing.T) {
 
 	// Combination Y boots: PCR 15 moves on. The agent finds no slot
 	// approved, serves a temporary key and records the state; the move is
-	// approved with the PIN, in both slots.
+	// approved with the PIN, once for both slots.
 	sw.Reboot(t)
 	extend(t, sw, 15, "combination Y")
 	runDir := filepath.Join(dir, "run")
@@ -236,11 +236,10 @@ func TestPINCommand(t *testing.T) {
 		t.Fatalf("agent in Y before the move:\n%s", out)
 	}
 	values := filepath.Join(runDir, "agent.pcrs.json")
-	out = s.must([][]byte{pin}, "ca", "approve", tpm, "--ca", ca, "--values", values, "--next-generation", "--pin-fd", "3")
-	if !strings.Contains(out, "generation 2: every approval before it is revoked") || !strings.Contains(out, "Approved in slot 0 at generation 2") {
+	out = s.must([][]byte{pin}, "ca", "approve", tpm, "--ca", ca, "--slot", "0,1", "--values", values, "--next-generation", "--pin-fd", "3")
+	if !strings.Contains(out, "generation 2: every approval before it is revoked") || !strings.Contains(out, "Approved in slots 0 and 1 at generation 2") {
 		t.Fatalf("the move:\n%s", out)
 	}
-	s.must([][]byte{pin}, "ca", "approve", tpm, "--ca", ca, "--slot", "1", "--values", values, "--pin-fd", "3")
 	out = s.must(nil, "ca", "show", tpm, "--ca", ca)
 	if !strings.Contains(out, "generation 1 (revoked)") || !strings.Contains(out, "counter is at generation 2") || !strings.Contains(out, "slot 1, PCR 7 and 15:") {
 		t.Fatalf("show:\n%s", out)
