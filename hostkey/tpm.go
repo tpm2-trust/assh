@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 
 	"github.com/google/go-tpm/tpm2"
@@ -123,20 +122,53 @@ func createKey(t transport.TPM, p *primary, tmpl tpm2.TPMTPublic, auth []byte) (
 	}.Execute(t)
 }
 
-// CreateCA makes a new CA in the TPM, bound to pcrs in bank: it signs while
-// they hold values authority - a key elsewhere - approved. policyRef ties
-// the authority's signatures to this CA's use ("assh boot", say): an
-// approval made for a CA with another reference does not let this one
-// sign. The CA has no approval yet: Approve adds them. Its approvals are
-// never revoked; CreatePINCA makes a CA whose are.
-func CreateCA(t transport.TPM, typ Type, bank Bank, pcrs []int, authority crypto.PublicKey, policyRef []byte) (*CA, error) {
-	if len(pcrs) == 0 {
-		return nil, errors.New("the CA is bound to no PCR")
+// CAOptions shape a new CA.
+type CAOptions struct {
+	Type Type
+	Bank Bank
+	// PCRs are slot 0's; AddSlot gives the CA more.
+	PCRs []int
+	// Window is the PCR whose extension closes the CA for the rest of the
+	// boot (Close): every slot must read it. 0: none.
+	Window int
+	// PolicyRef ties the authority's signatures to this CA's use ("assh
+	// boot", say): an approval made for a CA with another reference does
+	// not let this one sign. At most 32 bytes.
+	PolicyRef []byte
+}
+
+// newCA is the CA file of o, without its key.
+func newCA(o CAOptions) (*CA, error) {
+	if o.Type != P256 && o.Type != RSA2048 {
+		return nil, fmt.Errorf("unknown key type %q", o.Type)
 	}
-	pcrs = append([]int(nil), pcrs...)
-	sort.Ints(pcrs)
-	if len(policyRef) > 32 {
+	if o.Bank != SHA256 && o.Bank != SHA1 {
+		return nil, fmt.Errorf("unknown PCR bank %q", o.Bank)
+	}
+	if o.Window != 0 {
+		if err := checkWindow(o.Window); err != nil {
+			return nil, err
+		}
+	}
+	if len(o.PolicyRef) > 32 {
 		return nil, errors.New("a policy reference of more than 32 bytes")
+	}
+	s, err := newSlot(0, o.PCRs, o.Window)
+	if err != nil {
+		return nil, err
+	}
+	return &CA{Version: fileVersion, Type: o.Type, Bank: o.Bank, Slots: []Slot{s}, Window: o.Window,
+		PolicyRef: append([]byte(nil), o.PolicyRef...)}, nil
+}
+
+// CreateCA makes a new CA in the TPM, with slot 0: it signs while a
+// slot's PCRs hold values authority - a key elsewhere - approved. The CA
+// has no approval yet: Approve adds them. Its approvals are never revoked;
+// CreatePINCA makes a CA whose are.
+func CreateCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, error) {
+	ca, err := newCA(o)
+	if err != nil {
+		return nil, err
 	}
 	at, err := authorityTemplate(authority)
 	if err != nil {
@@ -146,7 +178,7 @@ func CreateCA(t transport.TPM, typ Type, bank Bank, pcrs []int, authority crypto
 	if err != nil {
 		return nil, err
 	}
-	tmpl, err := keyTemplate(typ, caPolicyFor(*name, policyRef))
+	tmpl, err := keyTemplate(o.Type, caPolicyFor(*name, o.PolicyRef))
 	if err != nil {
 		return nil, err
 	}
@@ -168,22 +200,19 @@ func CreateCA(t transport.TPM, typ Type, bank Bank, pcrs []int, authority crypto
 	defer flush(t, p.handle)
 	key, err := createKey(t, p, tmpl, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating the %s CA in the TPM: %w", typ, err)
+		return nil, fmt.Errorf("creating the %s CA in the TPM: %w", o.Type, err)
 	}
 	pub, err := key.OutPublic.Contents()
 	if err != nil {
 		return nil, err
 	}
-	return &CA{
-		Version: fileVersion, Type: typ, Bank: bank, PCRs: pcrs,
-		Public: tpm2.Marshal(pub), Private: key.OutPrivate.Buffer,
-		Authority: authorityDER, PolicyRef: append([]byte(nil), policyRef...),
-	}, nil
+	ca.Public, ca.Private, ca.Authority = tpm2.Marshal(pub), key.OutPrivate.Buffer, authorityDER
+	return ca, nil
 }
 
-// ReadPCRs reads the CA's PCRs as the TPM holds them now.
+// ReadPCRs reads the PCRs any slot reads as the TPM holds them now.
 func (f *CA) ReadPCRs(t transport.TPM) (map[int][]byte, error) {
-	return ReadPCRs(t, f.Bank, f.PCRs)
+	return ReadPCRs(t, f.Bank, f.PCRs())
 }
 
 // ReadPCRs reads PCRs of a bank, one at a time (a TPM answers only so
@@ -205,47 +234,71 @@ func ReadPCRs(t transport.TPM, bank Bank, pcrs []int) (map[int][]byte, error) {
 	return out, nil
 }
 
-// MismatchError is a CA that may not sign: no approval for what the PCRs
-// hold, at the counter's generation.
+// MismatchError is a CA that may not sign: no slot has an approval for
+// what the PCRs hold, at the counter's generation.
 type MismatchError struct {
-	Changed []int // the PCRs that differ from the closest approval; all of them without one
-	None    bool  // there is no approval at all (at this generation)
-	// Revoked: the PCRs hold a state approved for an older generation
-	// (Generation); the counter is at Counter.
-	Revoked             bool
-	Generation, Counter uint64
+	Slots   []SlotMismatch // every slot, in the order scanned
+	Counter uint64         // the counter's generation; 0 without one
+}
+
+// SlotMismatch is why a slot's approvals do not fit.
+type SlotMismatch struct {
+	Slot    int
+	Changed []int // the PCRs that differ from the slot's closest approval; all of them without one
+	None    bool  // the slot has no approval at all (at this generation)
+	// Revoked: the PCRs hold a state the slot had approved for an older
+	// generation, Generation.
+	Revoked    bool
+	Generation uint64
 }
 
 func (e *MismatchError) Error() string {
-	switch {
-	case e.Revoked:
-		return fmt.Sprintf("the PCR state was approved for generation %d, the counter is at %d: revoked", e.Generation, e.Counter)
-	case e.None:
-		return "the CA has no approved PCR state"
+	parts := make([]string, len(e.Slots))
+	for i, s := range e.Slots {
+		var why string
+		switch {
+		case s.Revoked:
+			why = fmt.Sprintf("the PCR state was approved for generation %d, the counter is at %d: revoked", s.Generation, e.Counter)
+		case s.None:
+			why = "no approved PCR state"
+		default:
+			why = PCRList(s.Changed) + " not as approved"
+		}
+		parts[i] = fmt.Sprintf("slot %d: %s", s.Slot, why)
 	}
-	return PCRList(e.Changed) + " not as approved"
+	return strings.Join(parts, "; ")
 }
 
-// mismatch names the PCRs that differ from the closest approval at gen.
+// mismatch names, for each slot, the PCRs that differ from its closest
+// approval at gen.
 func (f *CA) mismatch(now map[int][]byte, gen uint64) error {
+	e := &MismatchError{Counter: gen}
+	for _, s := range f.Slots {
+		e.Slots = append(e.Slots, f.slotMismatch(s, now, gen))
+	}
+	return e
+}
+
+func (f *CA) slotMismatch(s Slot, now map[int][]byte, gen uint64) SlotMismatch {
 	var current []Approval
 	for _, a := range f.Approvals {
+		if a.Slot != s.Number {
+			continue
+		}
+		if a.Generation < gen && sameValues(s.PCRs, a.PCRs, now) {
+			return SlotMismatch{Slot: s.Number, Revoked: true, Generation: a.Generation, Changed: s.PCRs}
+		}
 		if a.Generation == gen {
 			current = append(current, a)
 		}
 	}
-	for _, a := range f.Approvals {
-		if a.Generation < gen && sameValues(f.PCRs, a.PCRs, now) {
-			return &MismatchError{Revoked: true, Generation: a.Generation, Counter: gen, Changed: f.PCRs}
-		}
-	}
 	if len(current) == 0 {
-		return &MismatchError{None: true, Changed: f.PCRs}
+		return SlotMismatch{Slot: s.Number, None: true, Changed: s.PCRs}
 	}
 	var best []int
 	for _, a := range current {
-		var changed []int
-		for _, i := range f.PCRs {
+		changed := []int{}
+		for _, i := range s.PCRs {
 			if !bytes.Equal(a.PCRs[i], now[i]) {
 				changed = append(changed, i)
 			}
@@ -254,7 +307,7 @@ func (f *CA) mismatch(now map[int][]byte, gen uint64) error {
 			best = changed
 		}
 	}
-	return &MismatchError{Changed: best}
+	return SlotMismatch{Slot: s.Number, Changed: best}
 }
 
 // caSigner signs with the CA through the approval of the PCR values the
@@ -274,11 +327,12 @@ func (s *caSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]b
 	if err != nil {
 		return nil, fmt.Errorf("the approval's signature: %w", err)
 	}
-	approved, err := f.approvedPolicy(a.PCRs, a.Generation)
+	slot := f.Slot(a.Slot)
+	approved, err := f.approvedPolicy(slot, a.PCRs, a.Generation)
 	if err != nil {
 		return nil, err
 	}
-	adigest, err := f.approvalDigestAt(a.PCRs, a.Generation)
+	adigest, err := f.approvalDigestAt(slot, a.PCRs, a.Generation)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +366,7 @@ func (s *caSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]b
 	defer done()
 	h := session.Handle()
 	err = func() error {
-		if _, err := (tpm2.PolicyPCR{PolicySession: h, Pcrs: f.pcrSelection()}).Execute(t); err != nil {
+		if _, err := (tpm2.PolicyPCR{PolicySession: h, Pcrs: f.pcrSelection(slot)}).Execute(t); err != nil {
 			return err
 		}
 		if f.Counter != nil {
@@ -418,25 +472,40 @@ type IssueOptions struct {
 	Open func() (transport.TPMCloser, error)
 }
 
-// HostKey is a host key of this boot and its certificate.
+// HostKey is a host key of this boot: certified by the CA, or temporary.
 type HostKey struct {
 	Signer *Signer          // the key in the TPM
-	Cert   *ssh.Certificate // the CA's certificate for it
-	ssh    ssh.Signer       // both, as the server presents them
+	Cert   *ssh.Certificate // the CA's certificate for it; nil for a temporary key
+	// Slot is the slot whose approval let the CA certify the key; -1 for
+	// a temporary key.
+	Slot int
+	// Temporary is why the CA did not certify the key; nil when it did.
+	Temporary error
+	key       ssh.PublicKey // the key itself
+	ssh       ssh.Signer    // the key, with its certificate, as the server presents it
 }
 
-// SSH is the host key as an SSH server presents it: the certificate, and
-// the key that signs the key exchange.
+// SSH is the host key as an SSH server presents it: the certificate (none
+// for a temporary key), and the key that signs the key exchange.
 func (h *HostKey) SSH() ssh.Signer { return h.ssh }
 
-// Fingerprint is the host key's own fingerprint.
-func (h *HostKey) Fingerprint() string { return ssh.FingerprintSHA256(h.Cert.Key) }
+// PublicKey is the host key's own public key, without its certificate.
+func (h *HostKey) PublicKey() ssh.PublicKey { return h.key }
 
-// Issue makes this boot's host key in the TPM and has the CA certify it:
-// only while the PCRs hold an approved state - with a counter, approved
-// for the generation it is at - (else a *MismatchError). It needs no PIN. The
-// key lives under the TPM's NULL hierarchy: it works until the next
-// reboot, from any PCR state, and never after.
+// Fingerprint is the host key's own fingerprint: what whoever is offered
+// a temporary key compares.
+func (h *HostKey) Fingerprint() string { return ssh.FingerprintSHA256(h.key) }
+
+// Issue makes this boot's host key in the TPM and has the CA certify it.
+// It scans the slots from the lowest number up, and the first with an
+// approval for what the PCRs hold - with a counter, approved for the
+// generation it is at - lets the CA certify (HostKey.Slot). It needs no
+// PIN. When no slot does, or the CA cannot sign in this TPM (another or a
+// cleared one, the counter gone), the key is temporary: uncertified, with
+// why in HostKey.Temporary (a *MismatchError, say). A client that trusts
+// only the CA does not take a temporary key without asking. The key lives
+// under the TPM's NULL hierarchy: it works until the next reboot, from any
+// PCR state, and never after. An error is a key the TPM did not make.
 func Issue(t transport.TPM, ca *CA, o IssueOptions) (*HostKey, error) {
 	if o.Type == "" {
 		o.Type = P256
@@ -451,23 +520,40 @@ func Issue(t transport.TPM, ca *CA, o IssueOptions) (*HostKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	gen, err := ca.tpmGeneration(t)
+	hk, err := newHostKey(t, o)
 	if err != nil {
 		return nil, err
 	}
-	a := ca.approvedAt(now, gen)
-	if a == nil {
-		return nil, ca.mismatch(now, gen)
+	if err := hk.certify(t, ca, now, o); err != nil {
+		hk.Temporary = err
 	}
-	caPub, err := ca.PublicKey()
-	if err != nil {
-		return nil, err
-	}
-	caSSH, err := SSHSigner(&caSigner{t: t, ca: ca, approval: a, pub: caPub})
-	if err != nil {
-		return nil, err
-	}
+	return hk, nil
+}
 
+// TemporaryKey makes this boot's host key in the TPM without a CA: for a
+// server that has none, which says why. A client that trusts only a CA
+// does not take it without asking.
+func TemporaryKey(t transport.TPM, why error, o IssueOptions) (*HostKey, error) {
+	if o.Type == "" {
+		o.Type = P256
+	}
+	if o.Open == nil {
+		return nil, errors.New("no way to open the TPM for the host key")
+	}
+	if why == nil {
+		why = errors.New("no CA")
+	}
+	hk, err := newHostKey(t, o)
+	if err != nil {
+		return nil, err
+	}
+	hk.Temporary = why
+	return hk, nil
+}
+
+// newHostKey makes a key under the NULL hierarchy, with a random
+// authorization value that stays in this process.
+func newHostKey(t transport.TPM, o IssueOptions) (*HostKey, error) {
 	tmpl, err := keyTemplate(o.Type, nil)
 	if err != nil {
 		return nil, err
@@ -497,10 +583,32 @@ func Issue(t transport.TPM, ca *CA, o IssueOptions) (*HostKey, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &HostKey{Signer: signer, Slot: -1, key: hostSSH.PublicKey(), ssh: hostSSH}, nil
+}
+
+// certify has the CA certify the key through the first slot approved for
+// now, or says why it does not.
+func (h *HostKey) certify(t transport.TPM, ca *CA, now map[int][]byte, o IssueOptions) error {
+	gen, err := ca.tpmGeneration(t)
+	if err != nil {
+		return err
+	}
+	a := ca.approvedAt(now, gen)
+	if a == nil {
+		return ca.mismatch(now, gen)
+	}
+	caPub, err := ca.PublicKey()
+	if err != nil {
+		return err
+	}
+	caSSH, err := SSHSigner(&caSigner{t: t, ca: ca, approval: a, pub: caPub})
+	if err != nil {
+		return err
+	}
 	serial := make([]byte, 8)
 	rand.Read(serial)
 	cert := &ssh.Certificate{
-		Key:             hostSSH.PublicKey(),
+		Key:             h.key,
 		Serial:          binary.BigEndian.Uint64(serial),
 		CertType:        ssh.HostCert,
 		KeyId:           o.KeyID,
@@ -513,15 +621,16 @@ func Issue(t transport.TPM, ca *CA, o IssueOptions) (*HostKey, error) {
 	if err := cert.SignCert(rand.Reader, caSSH); err != nil {
 		var m *MismatchError
 		if errors.As(err, &m) {
-			return nil, m
+			return m
 		}
-		return nil, err
+		return err
 	}
-	certSigner, err := ssh.NewCertSigner(cert, hostSSH)
+	certSigner, err := ssh.NewCertSigner(cert, h.ssh)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &HostKey{Signer: signer, Cert: cert, ssh: certSigner}, nil
+	h.Cert, h.Slot, h.ssh = cert, a.Slot, certSigner
+	return nil
 }
 
 // Close extends pcr with event in every bank (TPM2_PCR_Event): what is
@@ -549,7 +658,18 @@ func Close(t transport.TPM, pcr int, event string) error {
 func (f *CA) Describe() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s CA held in the TPM, %s\n", f.Type, f.Fingerprint())
-	fmt.Fprintf(&b, "signs while %s (%s) hold an approved state; %d approved\n", PCRList(f.PCRs), f.Bank, len(f.Approvals))
+	for _, s := range f.Slots {
+		n := 0
+		for _, a := range f.Approvals {
+			if a.Slot == s.Number {
+				n++
+			}
+		}
+		fmt.Fprintf(&b, "slot %d: signs while %s (%s) hold an approved state; %d approved\n", s.Number, PCRList(s.PCRs), f.Bank, n)
+	}
+	if f.Window != 0 {
+		fmt.Fprintf(&b, "window: PCR %d, which every slot reads; extending it closes the CA until the next boot\n", f.Window)
+	}
 	if f.AuthorityTPM != nil {
 		pPub, _, _ := f.pinIndex()
 		gPub, _ := f.counter()

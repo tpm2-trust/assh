@@ -29,7 +29,7 @@ func pinCA(t *testing.T) (*swtpmtest.SWTPM, transport.TPM, *CA) {
 	sw := swtpmtest.Start(t)
 	sw.SetLockout(t, 3, 1800, 1800)
 	tpm := sw.Open(t)
-	ca, err := CreatePINCA(tpm, PINCAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 15}, PolicyRef: []byte("assh test"), PIN: pinOf(testPIN)})
+	ca, err := CreatePINCA(tpm, PINCAOptions{CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 15}, PolicyRef: []byte("assh test")}, PIN: pinOf(testPIN)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func approveNow(t *testing.T, tpm transport.TPM, ca *CA, pin []byte) error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = ca.Approve(a, now)
+	err = ca.Approve(a, 0, now)
 	swtpmtest.NoneLeft(t, tpm, "Approve")
 	return err
 }
@@ -56,6 +56,9 @@ func issue(t *testing.T, sw *swtpmtest.SWTPM, tpm transport.TPM, ca *CA) (*HostK
 	t.Helper()
 	hk, err := Issue(tpm, ca, IssueOptions{Principals: []string{"host.example"}, Open: sw.Opener()})
 	swtpmtest.NoneLeft(t, tpm, "Issue")
+	if err == nil && hk.Temporary != nil {
+		return hk, hk.Temporary // not certified
+	}
 	return hk, err
 }
 
@@ -64,7 +67,7 @@ func issue(t *testing.T, sw *swtpmtest.SWTPM, tpm transport.TPM, ca *CA) (*HostK
 // nothing.
 func TestPINAuthority(t *testing.T) {
 	bare := swtpmtest.Start(t).Open(t)
-	o := PINCAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 15}, PIN: pinOf(testPIN)}
+	o := PINCAOptions{CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 15}}, PIN: pinOf(testPIN)}
 	if _, err := CreatePINCA(bare, o); err == nil || !strings.Contains(err.Error(), "no lockout authorization") {
 		t.Fatalf("created without a lockout authorization: %v", err)
 	}
@@ -132,41 +135,47 @@ func TestPINAuthority(t *testing.T) {
 }
 
 // The digest the TPM reaches before PolicyAuthorize is the approved policy
-// the authority signs.
+// the authority signs, for every slot.
 func TestApprovedPolicyDigest(t *testing.T) {
 	_, tpm, ca := pinCA(t)
+	if err := ca.AddSlot(1, []int{15}); err != nil {
+		t.Fatal(err)
+	}
 	now, err := ca.ReadPCRs(tpm)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := ca.approvedPolicy(now, ca.FileGeneration())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, done, err := policySession(tpm)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer done()
-	if _, err := (tpm2.PolicyPCR{PolicySession: s.Handle(), Pcrs: ca.pcrSelection()}).Execute(tpm); err != nil {
-		t.Fatal(err)
-	}
-	g, _ := ca.counter()
-	if _, err := (tpm2.PolicyNV{
-		AuthHandle:    tpm2.AuthHandle{Handle: g.NVIndex, Name: nvName(g), Auth: tpm2.PasswordAuth(nil)},
-		NVIndex:       tpm2.NamedHandle{Handle: g.NVIndex, Name: nvName(g)},
-		PolicySession: s.Handle(),
-		OperandB:      tpm2.TPM2BOperand{Buffer: binary.BigEndian.AppendUint64(nil, ca.FileGeneration())},
-		Operation:     tpm2.TPMEOEq,
-	}).Execute(tpm); err != nil {
-		t.Fatal(err)
-	}
-	got, err := tpm2.PolicyGetDigest{PolicySession: s.Handle()}.Execute(tpm)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got.PolicyDigest.Buffer, want) {
-		t.Fatalf("the TPM's digest %x, the calculator's %x", got.PolicyDigest.Buffer, want)
+	for i := range ca.Slots {
+		slot := &ca.Slots[i]
+		want, err := ca.approvedPolicy(slot, now, ca.FileGeneration())
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, done, err := policySession(tpm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := (tpm2.PolicyPCR{PolicySession: s.Handle(), Pcrs: ca.pcrSelection(slot)}).Execute(tpm); err != nil {
+			t.Fatal(err)
+		}
+		g, _ := ca.counter()
+		if _, err := (tpm2.PolicyNV{
+			AuthHandle:    tpm2.AuthHandle{Handle: g.NVIndex, Name: nvName(g), Auth: tpm2.PasswordAuth(nil)},
+			NVIndex:       tpm2.NamedHandle{Handle: g.NVIndex, Name: nvName(g)},
+			PolicySession: s.Handle(),
+			OperandB:      tpm2.TPM2BOperand{Buffer: binary.BigEndian.AppendUint64(nil, ca.FileGeneration())},
+			Operation:     tpm2.TPMEOEq,
+		}).Execute(tpm); err != nil {
+			t.Fatal(err)
+		}
+		got, err := tpm2.PolicyGetDigest{PolicySession: s.Handle()}.Execute(tpm)
+		done()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.PolicyDigest.Buffer, want) {
+			t.Fatalf("slot %d: the TPM's digest %x, the calculator's %x", slot.Number, got.PolicyDigest.Buffer, want)
+		}
 	}
 }
 
@@ -232,7 +241,7 @@ func TestMove(t *testing.T) {
 		t.Fatalf("generation %d", ca.FileGeneration())
 	}
 	var m *MismatchError
-	if _, err := issue(t, sw, tpm, ca); !errors.As(err, &m) || !m.Revoked || m.Generation != 1 || m.Counter != 2 {
+	if _, err := issue(t, sw, tpm, ca); !errors.As(err, &m) || !m.Slots[0].Revoked || m.Slots[0].Generation != 1 || m.Counter != 2 {
 		t.Fatalf("issue with a revoked approval: %v", err)
 	}
 	// Past the software's check: the TPM refuses the old approval.
@@ -347,7 +356,7 @@ func TestCounterClone(t *testing.T) {
 
 func isRevoked(err error) bool {
 	var m *MismatchError
-	return errors.As(err, &m) && m.Revoked
+	return errors.As(err, &m) && m.Slots[0].Revoked
 }
 
 // Root undefines the PIN index and defines it again alike with a PIN of its
@@ -412,7 +421,7 @@ func TestPINs(t *testing.T) {
 		append(make([]byte, 7), 1),
 	} {
 		ca, err := CreatePINCA(tpm, PINCAOptions{
-			Type: P256, Bank: SHA256, PCRs: []int{7}, PIN: pinOf(pin),
+			CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7}}, PIN: pinOf(pin),
 			PINHandle: tpm2.TPMHandle(0x01802a00 + 2*i), CounterHandle: tpm2.TPMHandle(0x01802a01 + 2*i),
 		})
 		if err != nil {
@@ -428,7 +437,7 @@ func TestPINs(t *testing.T) {
 			t.Errorf("%q: issue: %v", pin, err)
 		}
 	}
-	if _, err := CreatePINCA(tpm, PINCAOptions{Type: P256, Bank: SHA256, PCRs: []int{7}, PIN: pinOf([]byte("12345"))}); err == nil {
+	if _, err := CreatePINCA(tpm, PINCAOptions{CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7}}, PIN: pinOf([]byte("12345"))}); err == nil {
 		t.Error("created with a PIN of 5 bytes")
 	}
 }
@@ -439,7 +448,7 @@ func TestPINNotOnTheBus(t *testing.T) {
 	sw := swtpmtest.Start(t)
 	sw.SetLockout(t, 3, 1800, 1800)
 	rec := &swtpmtest.Recorder{TPM: sw.Open(t)}
-	ca, err := CreatePINCA(rec, PINCAOptions{Type: P256, Bank: SHA256, PCRs: []int{7}, PIN: pinOf(testPIN)})
+	ca, err := CreatePINCA(rec, PINCAOptions{CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7}}, PIN: pinOf(testPIN)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,15 +504,35 @@ func TestPINCAFileChecked(t *testing.T) {
 		"approval of generation 0": func(c *CA) {
 			c.Approvals[0].Generation = 0
 		},
-		"another authority": func(c *CA) { c.Authority = append([]byte(nil), c.Authority[:len(c.Authority)-1]...) },
+		"another authority":                    func(c *CA) { c.Authority = append([]byte(nil), c.Authority[:len(c.Authority)-1]...) },
+		"no slot":                              func(c *CA) { c.Slots = nil },
+		"approval of a slot it does not have":  func(c *CA) { c.Approvals[0].Slot = 9 },
+		"slot of other PCRs than its approval": func(c *CA) { c.Slots[0].PCRs = []int{7} },
+		"window no slot reads":                 func(c *CA) { c.Window = 14 },
+		"slot 16":                              func(c *CA) { c.Slots[0].Number = 16 },
 	} {
 		if err := edit(change); err == nil {
 			t.Errorf("%s: taken", name)
 		}
 	}
 	b, _ := ca.Marshal()
-	b = bytes.Replace(b, []byte(`"version": 2`), []byte(`"version": 1`), 1)
+	b = bytes.Replace(b, []byte(`"version": 3`), []byte(`"version": 2`), 1)
 	if _, err := ParseCA(b); err == nil || !strings.Contains(err.Error(), "create the CA again") {
-		t.Fatalf("version 1: %v", err)
+		t.Fatalf("version 2: %v", err)
 	}
+}
+
+// isMismatch is whether err is a CA with no slot approved, every slot
+// without any approval (none) or not.
+func isMismatch(err error, none bool) bool {
+	var m *MismatchError
+	if !errors.As(err, &m) {
+		return false
+	}
+	for _, s := range m.Slots {
+		if s.None != none {
+			return false
+		}
+	}
+	return true
 }

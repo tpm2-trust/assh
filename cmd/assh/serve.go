@@ -47,12 +47,16 @@ type Header struct {
 
 func serveCommand(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	cfg, err := commandConfig(fs, args)
+	if err != nil {
+		return err
+	}
 	var h hostKeyFlags
-	h.add(fs, "/run/assh/serve.pcrs.json")
-	listen := fs.String("listen", ":22", "the address to listen on")
-	authPath := fs.String("authorized-keys", "", "the keys that may log in (authorized_keys; lines with options are left out)")
-	socket := fs.String("socket", "", "hand each session to the program listening on this Unix socket")
-	userName := fs.String("user", "", "run the command as this user (default: as assh runs)")
+	h.add(fs, cfg, "/run/assh/serve.pcrs.json")
+	listen := fs.String("listen", cfg.Listen, "the address to listen on")
+	authPath := fs.String("authorized-keys", cfg.AuthorizedKeys, "the keys that may log in (authorized_keys; lines with options are left out)")
+	socket := fs.String("socket", cfg.Socket, "hand each session to the program listening on this Unix socket")
+	userName := fs.String("user", cfg.User, "run the command as this user (default: as assh runs)")
 	fs.Parse(args)
 	command := fs.Args()
 	if (*socket == "") == (len(command) == 0) {
@@ -153,10 +157,14 @@ func forward(s *server.Session, path string) {
 
 func agentCommand(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
+	cfg, err := commandConfig(fs, args)
+	if err != nil {
+		return err
+	}
 	var h hostKeyFlags
-	h.add(fs, "")
-	dir := fs.String("dir", "/run/assh", "where the socket, the public key and the certificate go")
-	uid := fs.Int("uid", 0, "the only user answered (sshd: root)")
+	h.add(fs, cfg, "")
+	dir := fs.String("dir", cfg.AgentDir, "where the socket, the public key and the certificate go")
+	uid := fs.Int("uid", cfg.AgentUID, "the only user answered (sshd: root)")
 	fs.Parse(args)
 	if h.state == "" {
 		h.state = filepath.Join(*dir, "agent.pcrs.json")
@@ -169,10 +177,16 @@ func agentCommand(args []string) error {
 		return err
 	}
 	pub := filepath.Join(*dir, "host.pub")
-	if err := os.WriteFile(pub, sshAuthorizedKey(hk.Cert.Key), 0o644); err != nil {
+	if err := os.WriteFile(pub, sshAuthorizedKey(hk.PublicKey()), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(*dir, "host-cert.pub"), sshAuthorizedKey(hk.Cert), 0o644); err != nil {
+	certPath := filepath.Join(*dir, "host-cert.pub")
+	if hk.Cert != nil {
+		if err := os.WriteFile(certPath, sshAuthorizedKey(hk.Cert), 0o644); err != nil {
+			return err
+		}
+	} else if err := os.Remove(certPath); err != nil && !os.IsNotExist(err) {
+		// A temporary key has no certificate: none of another boot stays.
 		return err
 	}
 	signer, err := plainSigner(hk)
@@ -184,7 +198,11 @@ func agentCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	logger(fmt.Sprintf("agent at %s: HostKey %s, HostCertificate %s/host-cert.pub, HostKeyAgent %s", sock, pub, *dir, sock))
+	if hk.Cert != nil {
+		logger(fmt.Sprintf("agent at %s: HostKey %s, HostCertificate %s, HostKeyAgent %s", sock, pub, certPath, sock))
+	} else {
+		logger(fmt.Sprintf("agent at %s: HostKey %s (temporary, no certificate), HostKeyAgent %s", sock, pub, sock))
+	}
 	go agent.New(signer, hk.Cert, logger).Serve(ln, *uid)
 	notifyReady()
 	<-signalled()
