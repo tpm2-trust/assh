@@ -11,7 +11,7 @@ unencrypted boot image. It is a Go library and a command:
 | `server` | an SSH server split in two: the side that speaks SSH runs as nobody, in namespaces of its own, under Landlock, and holds neither the key nor what a login leads to |
 | `agent` | an ssh-agent socket that lends the host key to OpenSSH's sshd (`HostKeyAgent`) |
 | `tpmadmin` | what the TPM itself holds for an authority with a PIN: the PIN, the dictionary attack parameters, the lockout authorization |
-| `cmd/assh` | the command: `ca create`, `ca show`, `ca approve`, `ca pin`, `tpm da`, `serve`, `agent` |
+| `cmd/assh` | the command: `ca create`, `ca show`, `ca approve`, `ca pin`, `ca remove`, `tpm da`, `tpm sha1`, `serve`, `agent` |
 
 [tpm2-kira](https://github.com/mrwiora/tpm2-kira) uses it, as a git
 submodule, for the SSH server of its boot image.
@@ -261,7 +261,12 @@ assh ca approve --ca /etc/assh/os-ca.json --slot 0,1                      # this
 # after the PCRs changed, booted in the new state: approve what the agent
 # recorded, and revoke every approval before it - of every slot
 assh ca approve --ca /etc/assh/os-ca.json --slot 0,1 --values /run/assh/agent.pcrs.json --next-generation
+# a move ahead: approve a state before it is booted - PCR 15 as another
+# combination's boot leaves it, from zero - with the next generation
+assh ca approve --ca /etc/assh/os-ca.json --values /run/assh/agent.pcrs.json \
+    --events 15:combination:b --events 15:sealed --next-generation
 assh ca pin --ca /etc/assh/os-ca.json                                     # change the PIN
+assh ca remove --ca /etc/assh/os-ca.json   # the CA, its PIN index and counter (owner, no PIN)
 assh tpm da --ask-lockout-auth --reset                                    # end a lockout
 ```
 
@@ -301,6 +306,27 @@ from working.
 without one any process may reset the lockout and try PINs without end.
 `ca create --authority-tpm` refuses a TPM without one (`assh tpm da
 --new-lockout-auth`). It is also what clears the TPM.
+
+## The SHA-1 bank
+
+A CA reads one PCR bank. `sha256` and `sha1` name it; `auto` takes SHA-256
+where the TPM has that bank active, and SHA-1 only on a TPM whose firmware
+activates nothing else (an old ThinkPad's) and only while the TPM allows it:
+
+```bash
+assh tpm sha1            # the active banks, whether sha1 is allowed, what auto is
+assh tpm sha1 --allow    # NV index 0x01802914, defined by the owner
+assh tpm sha1 --forbid
+```
+
+With `auto`, the agent and `serve` on such a TPM, without the index, serve a
+temporary key and record nothing, `ca create` refuses, and a CA that reads
+SHA-1 certifies nothing after `--forbid`. The index holds nothing and is not
+signed: where SHA-256 is active it changes nothing, and which banks are
+active only the firmware decides (TPM2_PCR_Allocate needs the platform
+hierarchy). SHA-1 is the weaker hash: a collision helps an attacker who
+chose both inputs, and the values a slot reads come from firmware, signed
+images and Secure Boot variables, not from them.
 
 ## The CA in an EFI variable
 
@@ -404,7 +430,7 @@ ASSH_PRINCIPALS=host.example,192.0.2.10
 |---|---|---|
 | `ASSH_TPM` | `--tpm` | `/dev/tpmrm0` |
 | `ASSH_CA` | `--ca`, `ca create --out` | - (a file, or `efi:NAME`) |
-| `ASSH_CA_TYPE`, `ASSH_CA_BANK` | `ca create --type`, `--bank` | `p256`, `sha256` |
+| `ASSH_CA_TYPE`, `ASSH_CA_BANK` | `ca create --type`, `--bank` (`sha256`, `sha1`, `auto`) | `p256`, `sha256` |
 | `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0), `ca slot --add N --pcrs` | slot 0 `0,7` |
 | `ASSH_CA_WINDOW`, `ASSH_CA_REF` | `ca create --window`, `--ref` | none, `assh` |
 | `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM` | `ca create --authority`, `--authority-tpm` (`yes`/`no`) | - |
@@ -481,17 +507,18 @@ assh agent --config /etc/assh/assh.conf   # systemd/assh-agent.service; closes t
 
 ```
 # /etc/ssh/sshd_config.d/assh.conf
-HostKey         /run/assh/host.pub
-HostCertificate /run/assh/host-cert.pub
-HostKeyAgent    /run/assh/agent.sock
+Include /run/assh/sshd.conf
 ```
 
-The agent answers root alone (sshd) and offers rsa-sha2-256 and -512 for
-an RSA key (never SHA-1's ssh-rsa; SHA-512 where the TPM has it). It
-cannot be restarted within a boot (the window is closed); sshd can. With
-a temporary key it writes `host.pub` and no `host-cert.pub`: sshd logs
-"Could not load host certificate" and serves the key without one, so the
-configuration above stays as it is.
+The agent writes `sshd.conf` beside its socket: `HostKey`,
+`HostCertificate` (only when the CA certified the key), `HostKeyAgent`
+and `HostKeyAlgorithms` - what the TPM signs in, the certificate's first.
+For an RSA key that is rsa-sha2-256, and rsa-sha2-512 only where the TPM
+has SHA-512 (never SHA-1's ssh-rsa): sshd asks the agent for the
+algorithm a client picks, and a signature the TPM cannot make (an old
+TPM: `TPM_RC_SIZE`) drops the connection. The agent answers root alone
+(sshd). It cannot be restarted within a boot (the window is closed);
+sshd can.
 
 ## The library
 
@@ -573,6 +600,6 @@ efivarfs itself is used (tpm2-kira's and safearch's VM runs).
   it; a program that uses `hostkey` without `tpmadmin` (tpm2-kira) builds
   with go-tpm as released. Drop the replace once upstream has them.
 - **RSA-2048 host keys** sign rsa-sha2-256 in `serve` (many TPMs lack
-  SHA-512); the agent offers rsa-sha2-512 too and fails it on such a TPM -
-  set sshd's `HostKeyAlgorithms` then, or use P-256.
+  SHA-512); the agent's `sshd.conf` offers rsa-sha2-512 only where the TPM
+  has it.
 - **A cleared TPM loses the CA** (above): there is no backup of it.

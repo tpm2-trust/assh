@@ -29,15 +29,18 @@ import (
 const usage = `assh - an SSH host key in the TPM
 
   assh ca create   --out FILE (--authority PUB.pem | --authority-tpm)
-                   [--type p256|rsa2048] [--pcrs 0,7] [--window N] [--bank sha256] [--ref TEXT]
+                   [--type p256|rsa2048] [--pcrs 0,7] [--window N] [--bank sha256|sha1|auto] [--ref TEXT]
                    [--pin-handle 0x01802913] [--counter-handle 0x01802912] [--pin-fd N]
   assh ca slot     --ca FILE (--add N --pcrs 0,7 | --remove N)
   assh ca sync     --ca FILE
   assh ca show     --ca FILE
   assh ca approve  --ca FILE [--slot N[,N...]] [--values FILE]
                    authority in the TPM: [--next-generation] [--redefine-counter] [--pin-fd N]
+                   [--events PCR:EVENT ...]: that PCR as from zero with these events
                    key elsewhere: (--authority-key KEY.pem | --signature FILE | --digest FILE)
   assh ca pin      --ca FILE [--pin-fd N] [--new-pin-fd N]
+  assh ca remove   --ca FILE    the CA and its PIN index and counter in the TPM
+  assh tpm sha1    [--allow | --forbid]
   assh tpm da      [--max-tries 3 --recovery 1800 --lockout-recovery 1800] [--reset]
                    [--lockout-auth-fd N | --ask-lockout-auth]
                    [--new-lockout-auth | --new-lockout-auth-fd N]
@@ -74,7 +77,9 @@ and 'agent' make a host key in the TPM at their start - gone at the next
 reboot - and have the CA certify it; then they close the CA's window (or
 --close-pcr), so the CA signs nothing more until the next boot. When no
 slot is approved for the boot, the key is temporary: not certified, its
-fingerprint logged to compare. Clients trust the CA:
+fingerprint logged to compare. A CA of bank auto reads SHA-256 where the
+TPM has that bank active, else SHA-1, but only while the TPM allows it
+('tpm sha1 --allow', an NV index the owner defines). Clients trust the CA:
 
   @cert-authority <hosts> <the contents of the CA's .pub file>
 `
@@ -151,7 +156,7 @@ func commandConfig(fs *flag.FlagSet, args []string) (config.Config, error) {
 
 func caCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("ca needs create, slot, sync, show, approve or pin")
+		return errors.New("ca needs create, slot, sync, show, approve, pin or remove")
 	}
 	fs := flag.NewFlagSet("ca "+args[0], flag.ExitOnError)
 	cfg, err := commandConfig(fs, args[1:])
@@ -174,7 +179,7 @@ func caCommand(args []string) error {
 		}
 		pcrs := fs.String("pcrs", slot0, "slot 0's PCRs (the other slots of assh.conf are made too; 'ca slot' adds more)")
 		window := fs.Int("window", cfg.Window, "the PCR whose extension closes the CA for the rest of the boot; every slot reads it (0: none)")
-		bank := fs.String("bank", string(cfg.Bank), "their bank: sha256 or sha1")
+		bank := fs.String("bank", string(cfg.Bank), "their bank: sha256, sha1, or auto (sha256 where the TPM has it, else sha1 where 'tpm sha1 --allow' allows it)")
 		ref := fs.String("ref", cfg.PolicyRef, "what the authority's approvals are bound to (at most 32 bytes)")
 		fs.Parse(args[1:])
 		if *out == "" || (*authPath == "") == !*authTPM {
@@ -351,6 +356,8 @@ func caCommand(args []string) error {
 		sigPath := fs.String("signature", "", "the authority's signature over the digest, made elsewhere (PKCS #1 v1.5 or ECDSA DER, as openssl pkeyutl -sign makes it)")
 		digestPath := fs.String("digest", "", "write the digest to sign to this file, and approve nothing")
 		valuesPath := fs.String("values", "", "the PCR values to approve, as 'serve' or 'agent' recorded them (--state); default: what the TPM holds now")
+		var events eventList
+		fs.Var(&events, "events", "PCR:EVENT - that PCR's value is approved as from zero, extended with each such EVENT in order (TPM2_PCR_Event): a state known before it is booted; repeatable")
 		next := fs.Bool("next-generation", false, "increment the counter first: every approval made before stops working (authority in the TPM)")
 		redefine := fs.Bool("redefine-counter", false, "define the counter again first, in place of what is at its handle: after it was deleted or replaced (authority in the TPM)")
 		pinFd := fs.Int("pin-fd", -1, "read the PIN from this file descriptor (every byte); default: ask the terminal")
@@ -365,6 +372,9 @@ func caCommand(args []string) error {
 		}
 		values, err := approveValues(ca, *valuesPath, *tpmPath)
 		if err != nil {
+			return err
+		}
+		if err := events.apply(ca, values); err != nil {
 			return err
 		}
 		if ca.AuthorityTPM != nil {
@@ -421,6 +431,35 @@ func caCommand(args []string) error {
 			return err
 		}
 		fmt.Printf("Approved in %s: %d state(s) in %s\n", slotsText(slots), len(ca.Approvals), *caPath)
+		return nil
+	case "remove":
+		caPath := fs.String("ca", cfg.CA, "the CA file, or efi:NAME")
+		pinHandle := fs.String("pin-handle", fmt.Sprintf("0x%08X", cfg.PINHandle), "with no CA file: the PIN index to remove, if it has the shape of aSSH's")
+		counterHandle := fs.String("counter-handle", fmt.Sprintf("0x%08X", cfg.CounterHdl), "with no CA file: the counter to remove, if it has the shape of aSSH's")
+		fs.Parse(args[1:])
+		var handles []tpm2.TPMHandle
+		for _, s := range []string{*pinHandle, *counterHandle} {
+			h, err := parseHandle(s)
+			if err != nil {
+				return err
+			}
+			handles = append(handles, h)
+		}
+		tpm, err := openTPM(*tpmPath)()
+		if err != nil {
+			return err
+		}
+		defer tpm.Close()
+		removed, err := hostkey.RemoveCA(tpm, *caPath, handles)
+		for _, r := range removed {
+			fmt.Println("removed", r)
+		}
+		if err != nil {
+			return err
+		}
+		if len(removed) == 0 {
+			fmt.Println("nothing to remove: no CA at", *caPath)
+		}
 		return nil
 	case "pin":
 		caPath := fs.String("ca", cfg.CA, "the CA file")
@@ -604,8 +643,11 @@ func printDA(tpm transport.TPM) {
 }
 
 func tpmCommand(args []string) error {
+	if len(args) > 0 && args[0] == "sha1" {
+		return sha1Command(args[1:])
+	}
 	if len(args) == 0 || args[0] != "da" {
-		return errors.New("tpm needs da")
+		return errors.New("tpm needs sha1 or da")
 	}
 	fs := flag.NewFlagSet("tpm da", flag.ExitOnError)
 	cfg, err := commandConfig(fs, args[1:])
@@ -672,6 +714,52 @@ func tpmCommand(args []string) error {
 	return nil
 }
 
+// sha1Command allows or forbids SHA-1 on the TPM and says what it is.
+func sha1Command(args []string) error {
+	fs := flag.NewFlagSet("tpm sha1", flag.ExitOnError)
+	cfg, err := commandConfig(fs, args)
+	if err != nil {
+		return err
+	}
+	tpmPath := fs.String("tpm", cfg.TPM, "the TPM")
+	allow := fs.Bool("allow", false, "allow SHA-1 where the TPM has no active SHA-256 bank")
+	forbid := fs.Bool("forbid", false, "forbid it again")
+	fs.Parse(args)
+	if *allow && *forbid {
+		return errors.New("tpm sha1 takes --allow or --forbid")
+	}
+	tpm, err := openTPM(*tpmPath)()
+	if err != nil {
+		return err
+	}
+	defer tpm.Close()
+	if *allow || *forbid {
+		if err := hostkey.AllowSHA1(tpm, *allow); err != nil {
+			return err
+		}
+	}
+	active, err := hostkey.ActiveBanks(tpm)
+	if err != nil {
+		return err
+	}
+	ok, err := hostkey.SHA1Allowed(tpm)
+	if err != nil {
+		return err
+	}
+	names := make([]string, len(active))
+	for i, b := range active {
+		names[i] = string(b)
+	}
+	fmt.Printf("active PCR banks: %s\n", strings.Join(names, ", "))
+	fmt.Printf("sha1 allowed: %v (NV index 0x%08X)\n", map[bool]string{true: "yes", false: "no"}[ok], uint32(hostkey.SHA1Handle))
+	if b, err := hostkey.ResolveBank(tpm, hostkey.Auto); err != nil {
+		fmt.Printf("bank auto: none (%v)\n", err)
+	} else {
+		fmt.Printf("bank auto: %s\n", b)
+	}
+	return nil
+}
+
 // stateFile is what 'serve' and 'agent' record of the PCRs before they
 // close the window: the state to approve, which the TPM no longer holds.
 type stateFile struct {
@@ -706,6 +794,41 @@ func writeState(path string, bank hostkey.Bank, values map[int][]byte) error {
 		return err
 	}
 	return os.WriteFile(path, append(b, '\n'), 0o644)
+}
+
+// eventList is --events: PCR:EVENT, in order.
+type eventList []string
+
+func (e *eventList) String() string     { return strings.Join(*e, " ") }
+func (e *eventList) Set(v string) error { *e = append(*e, v); return nil }
+
+// apply puts the value each named PCR has after its events, from zero,
+// into values; every PCR named must be one the CA's slots read.
+func (e eventList) apply(ca *hostkey.CA, values map[int][]byte) error {
+	byPCR := map[int][]string{}
+	var order []int
+	for _, v := range e {
+		k, ev, ok := strings.Cut(v, ":")
+		i, err := strconv.Atoi(k)
+		if !ok || err != nil || ev == "" {
+			return fmt.Errorf("--events %q: PCR:EVENT", v)
+		}
+		if !slices.Contains(ca.PCRs(), i) {
+			return fmt.Errorf("--events %q: no slot of the CA reads PCR %d", v, i)
+		}
+		if _, seen := byPCR[i]; !seen {
+			order = append(order, i)
+		}
+		byPCR[i] = append(byPCR[i], ev)
+	}
+	for _, i := range order {
+		v, err := hostkey.EventChain(ca.Bank, byPCR[i])
+		if err != nil {
+			return err
+		}
+		values[i] = v
+	}
+	return nil
 }
 
 func approveValues(ca *hostkey.CA, path, tpmPath string) (map[int][]byte, error) {
@@ -852,6 +975,14 @@ func (h *hostKeyFlags) issue(log func(string)) (*hostkey.HostKey, error) {
 		return nil, err
 	}
 	defer tpm.Close()
+	if h.conf.Bank == hostkey.Auto && ca.Bank == hostkey.SHA1 {
+		// auto reads SHA-1 only while the TPM allows it.
+		if ok, err := hostkey.SHA1Allowed(tpm); err != nil {
+			return nil, err
+		} else if !ok {
+			return h.temporary(tpm, open, typ, closePCR, fmt.Errorf("the CA reads sha1, and sha1 is no longer allowed on this TPM ('assh tpm sha1 --allow')"), log)
+		}
+	}
 	if values, err := ca.ReadPCRs(tpm); err != nil {
 		return nil, err
 	} else {
@@ -905,11 +1036,16 @@ func (h *hostKeyFlags) noCA(typ hostkey.Type, log func(string)) (*hostkey.HostKe
 		return nil, err
 	}
 	defer tpm.Close()
-	values, err := hostkey.ReadPCRs(tpm, h.conf.Bank, pcrs)
+	bank, err := hostkey.ResolveBank(tpm, h.conf.Bank)
+	if err != nil {
+		// No CA can be made on this TPM as assh.conf says: nothing to record.
+		return h.temporary(tpm, open, typ, closePCR, fmt.Errorf("no CA at %s, and none can be made: %w", h.ca, err), log)
+	}
+	values, err := hostkey.ReadPCRs(tpm, bank, pcrs)
 	if err != nil {
 		return nil, err
 	}
-	recordState(h.state, h.conf.Bank, values, log)
+	recordState(h.state, bank, values, log)
 	hk, err := hostkey.TemporaryKey(tpm, fmt.Errorf("no CA at %s yet", h.ca), hostkey.IssueOptions{Type: typ, Open: open})
 	if closePCR > 0 {
 		if cerr := hostkey.Close(tpm, closePCR, "assh: closed"); cerr != nil {
@@ -921,6 +1057,23 @@ func (h *hostKeyFlags) noCA(typ hostkey.Type, log func(string)) (*hostkey.HostKe
 		return nil, err
 	}
 	log(fmt.Sprintf("host key %s is TEMPORARY: there is no CA at %s yet. The PCR state of its slots is recorded in %s: create the CA and approve it there (assh ca create, then assh ca approve --values %s); the next boot certifies", hk.Fingerprint(), h.ca, h.state, h.state))
+	return hk, nil
+}
+
+// temporary is the host key of a boot whose CA cannot sign, for why: made
+// in the TPM, not certified; the window is closed all the same.
+func (h *hostKeyFlags) temporary(tpm transport.TPM, open func() (transport.TPMCloser, error), typ hostkey.Type, closePCR int, why error, log func(string)) (*hostkey.HostKey, error) {
+	hk, err := hostkey.TemporaryKey(tpm, why, hostkey.IssueOptions{Type: typ, Open: open})
+	if closePCR > 0 {
+		if cerr := hostkey.Close(tpm, closePCR, "assh: closed"); cerr != nil {
+			return nil, cerr
+		}
+		log(fmt.Sprintf("PCR %d is extended: the CA signs nothing more until the next boot", closePCR))
+	}
+	if err != nil {
+		return nil, err
+	}
+	log(fmt.Sprintf("host key %s is TEMPORARY: %v", hk.Fingerprint(), why))
 	return hk, nil
 }
 

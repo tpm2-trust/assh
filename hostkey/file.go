@@ -80,6 +80,9 @@ type Bank string
 const (
 	SHA256 Bank = "sha256"
 	SHA1   Bank = "sha1"
+	// Auto is SHA-256 where the TPM has it active, else SHA-1 where the TPM
+	// allows it (ResolveBank); a CA is made with the bank it resolves to.
+	Auto Bank = "auto"
 )
 
 // ParseBank reads a bank name.
@@ -89,8 +92,10 @@ func ParseBank(s string) (Bank, error) {
 		return SHA256, nil
 	case "sha1":
 		return SHA1, nil
+	case "auto":
+		return Auto, nil
 	}
-	return "", fmt.Errorf("unknown PCR bank %q (sha256 or sha1)", s)
+	return "", fmt.Errorf("unknown PCR bank %q (sha256, sha1 or auto)", s)
 }
 
 func (b Bank) alg() tpm2.TPMAlgID {

@@ -137,10 +137,14 @@ type CAOptions struct {
 	PolicyRef []byte
 }
 
-// newCA is the CA file of o, without its key.
-func newCA(o CAOptions) (*CA, error) {
+// newCA is the CA file of o, without its key; bank Auto is resolved on t.
+func newCA(t transport.TPM, o CAOptions) (*CA, error) {
 	if o.Type != P256 && o.Type != RSA2048 {
 		return nil, fmt.Errorf("unknown key type %q", o.Type)
+	}
+	var err error
+	if o.Bank, err = ResolveBank(t, o.Bank); err != nil {
+		return nil, err
 	}
 	if o.Bank != SHA256 && o.Bank != SHA1 {
 		return nil, fmt.Errorf("unknown PCR bank %q", o.Bank)
@@ -166,7 +170,7 @@ func newCA(o CAOptions) (*CA, error) {
 // has no approval yet: Approve adds them. Its approvals are never revoked;
 // CreatePINCA makes a CA whose are.
 func CreateCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, error) {
-	ca, err := newCA(o)
+	ca, err := newCA(t, o)
 	if err != nil {
 		return nil, err
 	}
@@ -215,9 +219,13 @@ func (f *CA) ReadPCRs(t transport.TPM) (map[int][]byte, error) {
 	return ReadPCRs(t, f.Bank, f.PCRs())
 }
 
-// ReadPCRs reads PCRs of a bank, one at a time (a TPM answers only so
-// many in one read).
+// ReadPCRs reads PCRs of a bank (Auto: ResolveBank's), one at a time (a
+// TPM answers only so many in one read).
 func ReadPCRs(t transport.TPM, bank Bank, pcrs []int) (map[int][]byte, error) {
+	bank, err := ResolveBank(t, bank)
+	if err != nil {
+		return nil, err
+	}
 	out := map[int][]byte{}
 	for _, i := range pcrs {
 		rsp, err := tpm2.PCRRead{PCRSelectionIn: tpm2.TPMLPCRSelection{PCRSelections: []tpm2.TPMSPCRSelection{{

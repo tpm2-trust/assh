@@ -27,6 +27,10 @@ exported name is a change to them: build and test tpm2-kira after one.
   (assh.conf naming its slots: their PCRs recorded, the window closed all
   the same); an unreadable CA file or a TPM that does not open stays an
   error.
+- **SHA-1 only where the TPM allows it.** `auto` reads SHA-1 only on a
+  TPM without an active SHA-256 bank and while `hostkey.SHA1Handle` is
+  there; others (safearch's initrd) read that index at its handle, so it
+  stays where it is.
 - **A CA file may be an EFI variable** (`efi:NAME`, assh's GUID): plain,
   not authenticated, because the TPM checks everything in it. Keep it so:
   nothing that the TPM does not check goes into a CA file.

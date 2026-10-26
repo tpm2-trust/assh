@@ -275,7 +275,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	if o.PINHandle == o.CounterHandle {
 		return nil, errors.New("the PIN index and the counter need two handles")
 	}
-	ca, err = newCA(o.CAOptions)
+	ca, err = newCA(t, o.CAOptions)
 	if err != nil {
 		return nil, err
 	}

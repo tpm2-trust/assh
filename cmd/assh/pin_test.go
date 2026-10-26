@@ -325,6 +325,9 @@ ASSH_AGENT_UID=%d
 	if _, err := os.Stat(filepath.Join(runDir, "host-cert.pub")); err == nil {
 		t.Fatal("a certificate without a CA")
 	}
+	if b, _ := os.ReadFile(filepath.Join(runDir, "sshd.conf")); string(b) != fmt.Sprintf("HostKey %s/host.pub\nHostKeyAgent %s/agent.sock\nHostKeyAlgorithms ecdsa-sha2-nistp256\n", runDir, runDir) {
+		t.Fatalf("sshd.conf of a temporary key:\n%s", b)
+	}
 	b, err := os.ReadFile(state)
 	if err != nil || !strings.Contains(string(b), `"0"`) || !strings.Contains(string(b), `"7"`) || !strings.Contains(string(b), `"15"`) {
 		t.Fatalf("the state recorded: %v\n%s", err, b)
@@ -362,7 +365,178 @@ ASSH_AGENT_UID=%d
 	if _, err := os.Stat(filepath.Join(runDir, "host-cert.pub")); err != nil {
 		t.Fatal(err)
 	}
+	if b, _ := os.ReadFile(filepath.Join(runDir, "sshd.conf")); !strings.Contains(string(b), "HostCertificate "+runDir+"/host-cert.pub\n") ||
+		!strings.HasSuffix(string(b), "HostKeyAlgorithms ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp256\n") {
+		t.Fatalf("sshd.conf of a certified key:\n%s", b)
+	}
 	if bytes.Contains(s.out.Bytes(), pin) || bytes.Contains(s.out.Bytes(), lockout) {
 		t.Fatal("a secret in the output")
+	}
+}
+
+// A TPM whose only active bank is SHA-1 (an old ThinkPad's): with
+// ASSH_CA_BANK=auto nothing reads it until 'tpm sha1 --allow' - the agent
+// serves a temporary key and records nothing, 'ca create' refuses; once
+// allowed, the CA reads SHA-1 and the next boot certifies; forbidden again,
+// the agent is back to a temporary key.
+func TestSHA1(t *testing.T) {
+	sw := swtpmtest.StartBanks(t, "sha1")
+	dir := t.TempDir()
+	s := &secrets{t: t}
+	ca, state, runDir := filepath.Join(dir, "ca.json"), filepath.Join(dir, "agent.pcrs.json"), filepath.Join(dir, "run")
+	pin, lockout := []byte("pin-sha1-4Jq9"), []byte("lockout-sha1-Pz73")
+	conf := filepath.Join(dir, "assh.conf")
+	os.WriteFile(conf, []byte(fmt.Sprintf(`ASSH_TPM=%s
+ASSH_CA=%s
+ASSH_CA_BANK=auto
+ASSH_AUTHORITY_TPM=yes
+ASSH_CA_SLOT_0=0,7,15
+ASSH_CA_WINDOW=15
+ASSH_STATE=%s
+ASSH_AGENT_DIR=%s
+ASSH_AGENT_UID=%d
+`, sw.Sock, ca, state, runDir, os.Getuid())), 0o644)
+	agent := func() string {
+		t.Helper()
+		ag := start(t, "agent", "--config", conf)
+		ag.wait(t, "agent at")
+		ag.stop()
+		return ag.String()
+	}
+
+	s.must([][]byte{lockout}, "tpm", "da", "--config", conf, "--new-lockout-auth-fd", "3", "--max-tries", "3", "--recovery", "1800", "--lockout-recovery", "1800")
+	if out := agent(); !strings.Contains(out, "is TEMPORARY: no CA at "+ca+", and none can be made") || !strings.Contains(out, "sha1 is not allowed") || !strings.Contains(out, "PCR 15 is extended") {
+		t.Fatalf("the agent, sha1 not allowed:\n%s", out)
+	}
+	if _, err := os.Stat(state); !os.IsNotExist(err) {
+		t.Fatalf("a state recorded: %v", err)
+	}
+	if out, err := s.run([][]byte{pin}, "ca", "create", "--config", conf, "--pin-fd", "3"); err == nil || !strings.Contains(out, "sha1 is not allowed") {
+		t.Fatalf("ca create, sha1 not allowed: %v\n%s", err, out)
+	}
+	if out := run(t, "tpm", "sha1", "--config", conf, "--allow"); !strings.Contains(out, "active PCR banks: sha1\n") || !strings.Contains(out, "sha1 allowed: yes") || !strings.Contains(out, "bank auto: sha1") {
+		t.Fatalf("tpm sha1 --allow:\n%s", out)
+	}
+
+	sw.Reboot(t)
+	if out := agent(); !strings.Contains(out, "there is no CA at "+ca+" yet") {
+		t.Fatalf("the agent, sha1 allowed:\n%s", out)
+	}
+	if b, err := os.ReadFile(state); err != nil || !strings.Contains(string(b), `"bank": "sha1"`) {
+		t.Fatalf("the state: %v\n%s", err, b)
+	}
+	s.must([][]byte{pin}, "ca", "create", "--config", conf, "--pin-fd", "3")
+	s.must([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state, "--pin-fd", "3")
+	if out := run(t, "ca", "show", "--config", conf); !strings.Contains(out, "(sha1)") {
+		t.Fatalf("ca show:\n%s", out)
+	}
+	os.Remove(state)
+
+	sw.Reboot(t)
+	if out := agent(); !strings.Contains(out, "through slot 0") {
+		t.Fatalf("the next boot:\n%s", out)
+	}
+	os.Remove(state)
+
+	if out := run(t, "tpm", "sha1", "--config", conf, "--forbid"); !strings.Contains(out, "sha1 allowed: no") {
+		t.Fatalf("tpm sha1 --forbid:\n%s", out)
+	}
+	sw.Reboot(t)
+	if out := agent(); !strings.Contains(out, "is TEMPORARY: the CA reads sha1, and sha1 is no longer allowed") {
+		t.Fatalf("the agent, sha1 forbidden again:\n%s", out)
+	}
+	if bytes.Contains(s.out.Bytes(), pin) || bytes.Contains(s.out.Bytes(), lockout) {
+		t.Fatal("a secret in the output")
+	}
+}
+
+// A move ahead: in a boot of combination a, the state of combination b is
+// approved with the next generation (--events: PCR 15 as b's initrd leaves
+// it), so b's next boot certifies at once and a's no longer. Then 'ca
+// remove' takes the CA, its PIN index and counter; a new CA is created at
+// the same handles.
+func TestMoveAhead(t *testing.T) {
+	sw := swtpmtest.Start(t)
+	dir := t.TempDir()
+	s := &secrets{t: t}
+	ca, state, runDir := filepath.Join(dir, "ca.json"), filepath.Join(dir, "agent.pcrs.json"), filepath.Join(dir, "run")
+	pin, lockout := []byte("pin-ahead-3Fv8"), []byte("lockout-ahead-Qe25")
+	conf := filepath.Join(dir, "assh.conf")
+	os.WriteFile(conf, []byte(fmt.Sprintf(`ASSH_TPM=%s
+ASSH_CA=%s
+ASSH_AUTHORITY_TPM=yes
+ASSH_CA_SLOT_0=0,7,15
+ASSH_CA_WINDOW=15
+ASSH_STATE=%s
+ASSH_AGENT_DIR=%s
+ASSH_AGENT_UID=%d
+`, sw.Sock, ca, state, runDir, os.Getuid())), 0o644)
+	boot := func(name string) string {
+		t.Helper()
+		sw.Reboot(t)
+		os.Remove(state)
+		extend(t, sw, 15, "combination:"+name)
+		extend(t, sw, 15, "sealed")
+		ag := start(t, "agent", "--config", conf)
+		ag.wait(t, "agent at")
+		ag.stop()
+		return ag.String()
+	}
+
+	boot("a")
+	s.must([][]byte{lockout}, "tpm", "da", "--config", conf, "--new-lockout-auth-fd", "3", "--max-tries", "3", "--recovery", "1800", "--lockout-recovery", "1800")
+	s.must([][]byte{pin}, "ca", "create", "--config", conf, "--pin-fd", "3")
+	s.must([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state, "--pin-fd", "3")
+	if out := boot("a"); !strings.Contains(out, "through slot 0") {
+		t.Fatalf("a, approved:\n%s", out)
+	}
+	if out, err := s.run([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state, "--events", "14:x", "--pin-fd", "3"); err == nil || !strings.Contains(out, "no slot of the CA reads PCR 14") {
+		t.Fatalf("--events for a PCR no slot reads: %v\n%s", err, out)
+	}
+	s.must([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state,
+		"--events", "15:combination:b", "--events", "15:sealed", "--next-generation", "--pin-fd", "3")
+	if out := boot("b"); !strings.Contains(out, "through slot 0") {
+		t.Fatalf("b, approved ahead:\n%s", out)
+	}
+	if out := boot("a"); !strings.Contains(out, "TEMPORARY") {
+		t.Fatalf("a after the move:\n%s", out)
+	}
+
+	out := run(t, "ca", "remove", "--config", conf)
+	for _, want := range []string{"removed NV index 0x01802913", "removed NV index 0x01802912", "removed " + ca + "\n"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("ca remove:\n%s", out)
+		}
+	}
+	if out := run(t, "ca", "remove", "--config", conf); !strings.Contains(out, "nothing to remove") {
+		t.Fatalf("ca remove again:\n%s", out)
+	}
+	boot("a")
+	s.must([][]byte{pin}, "ca", "create", "--config", conf, "--pin-fd", "3")
+	if bytes.Contains(s.out.Bytes(), pin) || bytes.Contains(s.out.Bytes(), lockout) {
+		t.Fatal("a secret in the output")
+	}
+}
+
+// An RSA host key: sshd.conf offers rsa-sha2-512 only where the TPM has
+// SHA-512 (swtpm has), rsa-sha2-256 always, never ssh-rsa.
+func TestAgentRSA(t *testing.T) {
+	sw := swtpmtest.Start(t)
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	conf := filepath.Join(dir, "assh.conf")
+	os.WriteFile(conf, []byte(fmt.Sprintf(`ASSH_TPM=%s
+ASSH_CA=%s
+ASSH_HOSTKEY_TYPE=rsa2048
+ASSH_CA_SLOT_0=7,15
+ASSH_CA_WINDOW=15
+ASSH_AGENT_DIR=%s
+ASSH_AGENT_UID=%d
+`, sw.Sock, filepath.Join(dir, "ca.json"), runDir, os.Getuid())), 0o644)
+	ag := start(t, "agent", "--config", conf)
+	ag.wait(t, "agent at")
+	ag.stop()
+	if b, _ := os.ReadFile(filepath.Join(runDir, "sshd.conf")); !strings.HasSuffix(string(b), "HostKeyAlgorithms rsa-sha2-512,rsa-sha2-256\n") {
+		t.Fatalf("sshd.conf:\n%s\n%s", b, ag.String())
 	}
 }
