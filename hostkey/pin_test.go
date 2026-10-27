@@ -151,11 +151,11 @@ func TestApprovedPolicyDigest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		s, done, err := policySession(tpm)
+		s, done, err := tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := (tpm2.PolicyPCR{PolicySession: s.Handle(), Pcrs: ca.pcrSelection(slot)}).Execute(tpm); err != nil {
+		if _, err := (tpm2.PolicyPCR{PolicySession: s.Handle(), Pcrs: selection(ca.Bank, slot.PCRs)}).Execute(tpm); err != nil {
 			t.Fatal(err)
 		}
 		g, _ := ca.counter()
@@ -298,7 +298,7 @@ func TestCounterClone(t *testing.T) {
 		t.Fatalf("issue with a clone of the counter: %v", err)
 	}
 	// Without the PIN the clone cannot be incremented.
-	s, done, _ := policySession(tpm)
+	s, done, _ := tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16)
 	tpm2.PolicyCommandCode{PolicySession: s.Handle(), Code: tpm2.TPMCCNVIncrement}.Execute(tpm)
 	if _, err := (tpm2.NVIncrement{
 		AuthHandle: tpm2.AuthHandle{Handle: clone.NVIndex, Name: nvName(clone), Auth: s},

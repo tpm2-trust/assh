@@ -35,20 +35,27 @@ type Signed struct {
 
 // NewSigned is the PCRs signed by the RSA key in PEM or DER.
 func NewSigned(pcrs []int, key crypto.PublicKey) (*Signed, error) {
-	rk, ok := key.(*rsa.PublicKey)
-	if !ok || rk.N.BitLen() != 2048 {
-		return nil, errors.New("the signing key of PCRs must be RSA with 2048 bits: what every TPM checks")
+	if _, err := rsa2048(key); err != nil {
+		return nil, err
 	}
-	der, err := x509.MarshalPKIXPublicKey(rk)
+	der, err := x509.MarshalPKIXPublicKey(key)
 	if err != nil {
 		return nil, err
 	}
 	pcrs = slices.Clone(pcrs)
 	slices.Sort(pcrs)
-	if len(pcrs) == 0 || slices.ContainsFunc(pcrs, func(p int) bool { return p < 0 || p > 23 }) || len(slices.Compact(slices.Clone(pcrs))) != len(pcrs) {
-		return nil, fmt.Errorf("not a PCR selection: %v", pcrs)
+	if err := checkSelection(pcrs); err != nil {
+		return nil, err
 	}
 	return &Signed{PCRs: pcrs, Key: der}, nil
+}
+
+func rsa2048(k crypto.PublicKey) (*rsa.PublicKey, error) {
+	rk, ok := k.(*rsa.PublicKey)
+	if !ok || rk.N.BitLen() != 2048 {
+		return nil, errors.New("the key of signed PCRs must be RSA with 2048 bits: what every TPM checks")
+	}
+	return rk, nil
 }
 
 func (s *Signed) key() (*rsa.PublicKey, error) {
@@ -56,11 +63,7 @@ func (s *Signed) key() (*rsa.PublicKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the key of the signed PCRs: %w", err)
 	}
-	rk, ok := k.(*rsa.PublicKey)
-	if !ok || rk.N.BitLen() != 2048 {
-		return nil, errors.New("the key of the signed PCRs is not RSA with 2048 bits")
-	}
-	return rk, nil
+	return rsa2048(k)
 }
 
 // name is the key's Name as the TPM loads it to check its signatures.
@@ -69,15 +72,7 @@ func (s *Signed) name() (tpm2.TPM2BName, tpm2.TPMTPublic, error) {
 	if err != nil {
 		return tpm2.TPM2BName{}, tpm2.TPMTPublic{}, err
 	}
-	tmpl, err := authorityTemplate(k)
-	if err != nil {
-		return tpm2.TPM2BName{}, tpm2.TPMTPublic{}, err
-	}
-	n, err := tpm2.ObjectName(&tmpl)
-	if err != nil {
-		return tpm2.TPM2BName{}, tpm2.TPMTPublic{}, err
-	}
-	return *n, tmpl, nil
+	return templateName(k)
 }
 
 // PCRPolicy is the digest of PolicyPCR over values of pcrs in bank, from a
@@ -93,9 +88,7 @@ func PCRPolicy(bank Bank, pcrs []int, values map[int][]byte) ([]byte, error) {
 	}
 	return policyDigest(tpm2.PolicyPCR{
 		PcrDigest: tpm2.TPM2BDigest{Buffer: h.Sum(nil)},
-		Pcrs: tpm2.TPMLPCRSelection{PCRSelections: []tpm2.TPMSPCRSelection{{
-			Hash: bank.alg(), PCRSelect: pcrBitmap(pcrs),
-		}}},
+		Pcrs:      selection(bank, pcrs),
 	}.Update), nil
 }
 
@@ -165,22 +158,21 @@ func (f *CA) signedTicket(t transport.TPM, s *Signed, now map[int][]byte, sigs P
 	if err != nil {
 		return nil, name, ticket, err
 	}
+	k, _ := s.key()
+	digest := sha256.Sum256(pol)
+	tsig, err := tpmSignature(k, digest[:], sig)
+	if err != nil {
+		return nil, name, ticket, err
+	}
 	ext, err := tpm2.LoadExternal{InPublic: tpm2.New2B(tmpl), Hierarchy: tpm2.TPMRHOwner}.Execute(t)
 	if err != nil {
 		return nil, name, ticket, fmt.Errorf("loading the key of the signed PCRs: %w", err)
 	}
 	defer flush(t, ext.ObjectHandle)
-	digest := sha256.Sum256(pol)
 	rsp, err := tpm2.VerifySignature{
 		KeyHandle: ext.ObjectHandle,
 		Digest:    tpm2.TPM2BDigest{Buffer: digest[:]},
-		Signature: tpm2.TPMTSignature{
-			SigAlg: tpm2.TPMAlgRSASSA,
-			Signature: tpm2.NewTPMUSignature(tpm2.TPMAlgRSASSA, &tpm2.TPMSSignatureRSA{
-				Hash: tpm2.TPMAlgSHA256,
-				Sig:  tpm2.TPM2BPublicKeyRSA{Buffer: sig},
-			}),
-		},
+		Signature: tsig,
 	}.Execute(t)
 	if err != nil {
 		return nil, name, ticket, fmt.Errorf("the TPM does not accept the signature of PCR %s: %w", PCRList(s.PCRs), err)

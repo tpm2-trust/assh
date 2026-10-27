@@ -179,19 +179,19 @@ func agentCommand(args []string) error {
 		return err
 	}
 	pub := filepath.Join(*dir, "host.pub")
-	if err := os.WriteFile(pub, sshAuthorizedKey(hk.PublicKey()), 0o644); err != nil {
+	if err := os.WriteFile(pub, ssh.MarshalAuthorizedKey(hk.PublicKey()), 0o644); err != nil {
 		return err
 	}
 	certPath := filepath.Join(*dir, "host-cert.pub")
 	if hk.Cert != nil {
-		if err := os.WriteFile(certPath, sshAuthorizedKey(hk.Cert), 0o644); err != nil {
+		if err := os.WriteFile(certPath, ssh.MarshalAuthorizedKey(hk.Cert), 0o644); err != nil {
 			return err
 		}
 	} else if err := os.Remove(certPath); err != nil && !os.IsNotExist(err) {
 		// A temporary key has no certificate: none of another boot stays.
 		return err
 	}
-	signer, err := plainSigner(hk)
+	signer, err := ssh.NewSignerFromSigner(hk.Signer)
 	if err != nil {
 		return err
 	}
@@ -226,8 +226,6 @@ func agentCommand(args []string) error {
 	ln.Close()
 	return nil
 }
-
-func sshAuthorizedKey(k ssh.PublicKey) []byte { return ssh.MarshalAuthorizedKey(k) }
 
 // statusOf is what this boot's host key is, for anyone to read (a login
 // message, a prompt): KEY=VALUE lines, nothing secret.
@@ -295,12 +293,6 @@ func certAlgorithm(a string) string {
 		return ssh.CertAlgoECDSA256v01
 	}
 	return a + "-cert-v01@openssh.com"
-}
-
-// plainSigner is the host key for sshd: every algorithm the TPM signs in,
-// rsa-sha2-512 too where it has SHA-512 (the agent refuses SHA-1).
-func plainSigner(hk *hostkey.HostKey) (ssh.Signer, error) {
-	return ssh.NewSignerFromSigner(hk.Signer)
 }
 
 // notifyReady tells systemd the agent is up (Type=notify), so sshd starts

@@ -18,7 +18,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 	"golang.org/x/crypto/ssh"
 	sshagent "golang.org/x/crypto/ssh/agent"
@@ -74,10 +73,7 @@ func extend(t *testing.T, sw *swtpmtest.SWTPM, pcr int, event string) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if _, err := (tpm2.PCREvent{
-		PCRHandle: tpm2.AuthHandle{Handle: tpm2.TPMHandle(pcr), Auth: tpm2.PasswordAuth(nil)},
-		EventData: tpm2.TPM2BEvent{Buffer: []byte(event)},
-	}).Execute(c); err != nil {
+	if err := hostkey.Close(c, pcr, event); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -178,11 +174,14 @@ func TestPINCommand(t *testing.T) {
 	if !strings.Contains(out, "0 of 3 failures") || strings.Contains(out, "WARNING") {
 		t.Fatalf("tpm da:\n%s", out)
 	}
-	out = s.must([][]byte{pin}, "ca", "create", tpm, "--out", ca, "--authority-tpm", "--pin-fd", "3", "--pcrs", "7,14,15", "--window", "15")
+	conf := filepath.Join(dir, "assh.conf")
+	if err := os.WriteFile(conf, []byte("ASSH_CA_SLOT_1=7,15\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = s.must([][]byte{pin}, "ca", "create", tpm, "--config", conf, "--out", ca, "--authority-tpm", "--pin-fd", "3", "--pcrs", "7,14,15", "--window", "15")
 	if !strings.Contains(out, "opened by a PIN") || !strings.Contains(out, "@cert-authority * ecdsa-sha2-nistp256 ") {
 		t.Fatalf("create:\n%s", out)
 	}
-	s.must(nil, "ca", "slot", "--ca", ca, "--add", "1", "--pcrs", "7,15")
 	if out, err := s.run(nil, "ca", "approve", tpm, "--ca", ca, "--pin", string(pin)); err == nil || !strings.Contains(out, "flag provided but not defined: -pin") {
 		t.Fatalf("--pin: %v\n%s", err, out)
 	}
@@ -327,7 +326,7 @@ ASSH_AGENT_UID=%d
 	ag := start(t, "agent", "--config", conf)
 	ag.wait(t, "agent at")
 	ag.stop()
-	if !strings.Contains(ag.String(), "is TEMPORARY: there is no CA at "+ca+" yet") || !strings.Contains(ag.String(), "PCR 15 is extended") {
+	if !strings.Contains(ag.String(), "is TEMPORARY: no CA at "+ca+" yet") || !strings.Contains(ag.String(), "PCR 15 is extended") {
 		t.Fatalf("the agent before the CA:\n%s", ag.String())
 	}
 	if _, err := os.Stat(filepath.Join(runDir, "host-cert.pub")); err == nil {
@@ -433,7 +432,7 @@ ASSH_AGENT_UID=%d
 	}
 
 	sw.Reboot(t)
-	if out := agent(); !strings.Contains(out, "there is no CA at "+ca+" yet") {
+	if out := agent(); !strings.Contains(out, "no CA at "+ca+" yet") {
 		t.Fatalf("the agent, sha1 allowed:\n%s", out)
 	}
 	if b, err := os.ReadFile(state); err != nil || !strings.Contains(string(b), `"bank": "sha1"`) {

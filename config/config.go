@@ -351,12 +351,16 @@ func (c Config) Lines() [][2]string {
 	return out
 }
 
-func pcrs(p []int) string {
-	s := make([]string, len(p))
-	for i, v := range p {
-		s[i] = strconv.Itoa(v)
+func pcrs(p []int) string { return hostkey.Numbers(p) }
+
+// PCRs are the PCRs any slot reads (not the signed ones), in order.
+func (c Config) PCRs() []int {
+	var out []int
+	for _, p := range c.Slots {
+		out = append(out, p...)
 	}
-	return strings.Join(s, ",")
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // Format is the file for c alone, with header (comment lines) above the

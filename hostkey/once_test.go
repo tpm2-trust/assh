@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 
 	"github.com/tpm2-trust/assh/internal/swtpmtest"
@@ -40,8 +39,7 @@ func signPCRs(t *testing.T, key *rsa.PrivateKey, bank Bank, pcrs []int, values m
 
 func event(t *testing.T, tpm transport.TPM, pcr int, e string) {
 	t.Helper()
-	if _, err := (tpm2.PCREvent{PCRHandle: tpm2.AuthHandle{Handle: tpm2.TPMHandle(pcr), Auth: tpm2.PasswordAuth(nil)},
-		EventData: tpm2.TPM2BEvent{Buffer: []byte(e)}}).Execute(tpm); err != nil {
+	if err := Close(tpm, pcr, e); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -75,8 +73,8 @@ func TestCreateOnceCA(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ca, err := CreateOnceCA(tpm, CAOptions{Type: P256, Bank: bank, Window: 15},
-				[]SlotSpec{{Number: 0, PCRs: []int{0, 7, 15}, Signed: signed}, {Number: 1, PCRs: []int{7, 15}}}, values)
+			ca, err := CreateOnceCA(tpm, CAOptions{Type: P256, Bank: bank, Window: 15,
+				Slots: []SlotSpec{{Number: 0, PCRs: []int{0, 7, 15}, Signed: signed}, {Number: 1, PCRs: []int{7, 15}}}}, values)
 			swtpmtest.NoneLeft(t, tpm, "CreateOnceCA")
 			if err != nil {
 				t.Fatal(err)
@@ -134,8 +132,8 @@ func TestCreateOnceCA(t *testing.T) {
 			// signature nothing, and the reason says so.
 			tpm = boot("uki B", "a")
 			values, _ = ReadPCRs(tpm, bank, []int{0, 7, 15})
-			only, err := CreateOnceCA(tpm, CAOptions{Type: P256, Bank: bank, Window: 15},
-				[]SlotSpec{{Number: 0, PCRs: []int{0, 7, 15}, Signed: signed}}, values)
+			only, err := CreateOnceCA(tpm, CAOptions{Type: P256, Bank: bank, Window: 15,
+				Slots: []SlotSpec{{Number: 0, PCRs: []int{0, 7, 15}, Signed: signed}}}, values)
 			if err != nil {
 				t.Fatal(err)
 			}

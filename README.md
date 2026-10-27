@@ -71,8 +71,8 @@ do not cross over. No PCR - not even which PCRs - is in the policy, so the
 CA, and the clients' `known_hosts` line, stay the same through every
 change of the PCRs, and the CA can have slots.
 
-**Slots.** A CA has up to 16 slots, 0 to 15, each a PCR selection: `ca
-create --pcrs` makes slot 0, `ca slot --add N --pcrs` another. A slot
+**Slots.** A CA has up to 16 slots, 0 to 15, each a PCR selection:
+`ASSH_CA_SLOT_<N>` in assh.conf (`ca create --pcrs` for slot 0). A slot
 needs no key and no authority to be added: it lets the CA sign nothing
 until the authority approves a state in it. Which PCRs a slot reads is
 yours to choose - PCR 11 (a unified kernel image) or 14 (what an OS
@@ -127,8 +127,8 @@ that session its new state is approved for slot 0.
 `--close-pcr N` / `hostkey.Close` extends a PCR right after the host key
 is made, and the CA signs nothing more until the next boot - in the slots
 that read that PCR. So the window is the CA's: `ca create --window 15`
-records it, every slot must read PCR 15 (`ca slot --add` refuses one that
-does not), and `serve` and `agent` close it by default. 16 and 23 can be
+records it, every slot must read PCR 15 (a slot that does not is
+refused), and `serve` and `agent` close it by default. 16 and 23 can be
 reset by any process and are refused. A CA without a window is closed by
 the boot itself (tpm2-kira's: the OS separator extends PCR 0 and 7).
 
@@ -164,8 +164,8 @@ the NULL hierarchy like every host key, gone at the next reboot, and not
 certified. They log its fingerprint and, for each slot, what differs:
 
 ```
-assh: host key SHA256:… is TEMPORARY: the CA did not certify one (slot 0: PCR 7 not as approved;
-      slot 1: PCR 7 not as approved). ssh will report an unknown host key: compare its fingerprint with this one
+assh: host key SHA256:… is TEMPORARY: slot 0: PCR 7 not as approved; slot 1: PCR 7 not as
+      approved. ssh reports an unknown host key: compare its fingerprint with this one
 ```
 
 A client that trusts only the CA refuses the key (`StrictHostKeyChecking
@@ -204,8 +204,8 @@ openssl ec -in authority.key -pubout -out authority.pub
 
 # 2. On the machine: the CA. Slot 0 reads the firmware, the Secure Boot state, the
 #    kernel image (PCR 11) and the window (PCR 15); slot 1 the same but PCR 11: any OS
+echo ASSH_CA_SLOT_1=0,7,15 >>/etc/assh/assh.conf
 assh ca create --out /etc/assh/os-ca.json --authority authority.pub --pcrs 0,7,11,15 --window 15
-assh ca slot --ca /etc/assh/os-ca.json --add 1 --pcrs 0,7,15
 # -> /etc/assh/os-ca.json.pub, and the known_hosts line
 
 # 3. Approve a state of a slot: the TPM's now (no --values), or one a server recorded
@@ -255,8 +255,8 @@ device itself, after a firmware update, with nobody else involved.
 
 ```bash
 assh tpm da --new-lockout-auth --max-tries 3 --recovery 1800 --lockout-recovery 1800
+echo ASSH_CA_SLOT_1=7,15 >>/etc/assh/assh.conf                                      # any OS
 assh ca create --out /etc/assh/os-ca.json --authority-tpm --pcrs 7,14,15 --window 15   # asks for the PIN twice
-assh ca slot --ca /etc/assh/os-ca.json --add 1 --pcrs 7,15                             # any OS
 assh ca approve --ca /etc/assh/os-ca.json --slot 0,1                      # this state, both slots; asks for the PIN once
 # after the PCRs changed, booted in the new state: approve what the agent
 # recorded, and revoke every approval before it - of every slot
@@ -459,7 +459,7 @@ ASSH_PRINCIPALS=host.example,192.0.2.10
 | `ASSH_TPM` | `--tpm` | `/dev/tpmrm0` |
 | `ASSH_CA` | `--ca`, `ca create --out` | - (a file, or `efi:NAME`) |
 | `ASSH_CA_TYPE`, `ASSH_CA_BANK` | `ca create --type` (`p256`, `rsa2048`, or a list in order of preference, `rsa2048,p256`: the first the TPM takes), `--bank` (`sha256`, `sha1`, `auto`) | `p256`, `sha256` |
-| `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0), `ca slot --add N --pcrs` | slot 0 `0,7` |
+| `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0) | slot 0 `0,7` |
 | `ASSH_CA_WINDOW`, `ASSH_CA_REF` | `ca create --window`, `--ref` | none, `assh` |
 | `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM`, `ASSH_AUTHORITY_ONCE` | `ca create --authority`, `--authority-tpm`, `--authority-once` (`yes`/`no`) | - |
 | `ASSH_CA_SLOT_<N>_SIGNED`, `ASSH_PCR_KEY`, `ASSH_PCR_SIGNATURE` | PCRs of slot N a key signs, the key (PEM), its signatures (systemd's JSON) | - |
@@ -470,19 +470,22 @@ ASSH_PRINCIPALS=host.example,192.0.2.10
 | `ASSH_AGENT_DIR`, `ASSH_AGENT_UID` | `agent --dir`, `--uid` | `/run/assh`, `0` |
 
 - **The slots follow the file.** `ca create` makes every slot the file
-  names; `ca sync` makes an existing CA's slots the file's: a slot added
-  is added (it signs nothing until approved), one taken away goes with its
-  approvals, one whose PCRs changed is replaced and loses its approvals.
-  The CA stays - a slot is a PCR selection, not a key - and so does its
+  names; after an edit every command takes the file's slots as they are -
+  `agent` and `serve` at their next start, nothing to run: a slot added
+  signs nothing until approved, one taken away or whose PCRs changed
+  loses its approvals. The CA file keeps what it has until a command saves
+  the CA (`ca approve`), so an edit undone brings the approvals back. The
+  CA stays - a slot is a PCR selection, not a key - and so does its
   `known_hosts` line. `ca approve` without `--slot` approves every slot
   of the file.
 - **What only a new CA changes:** the window, the key type, the bank and
-  the ref are the CA's for good; `ca sync` refuses a file that differs.
+  the ref are the CA's for good; a file that differs in them is not
+  applied (the CA's own slots, and a warning).
 - **Nothing in it is secret or trusted.** It says what the CA should look
   like; the TPM checks the CA and its approvals. No PIN goes into it (the
   PIN comes from a terminal or `--pin-fd`).
 - **For other programs:** `config.Load`, `config.Write` (keeps comments
-  and unknown lines), `Config.Match` (`ca sync`). tpm2-kira keeps its
+  and unknown lines), `Config.Match` (what every command applies). tpm2-kira keeps its
   SSH server's settings in such a file.
 
 ## Serving: `assh serve` and `assh agent`

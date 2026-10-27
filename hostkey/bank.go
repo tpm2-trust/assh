@@ -132,3 +132,26 @@ func ResolveBank(t transport.TPM, b Bank) (Bank, error) {
 	}
 	return SHA1, nil
 }
+
+// EventChain is the value a PCR of bank b holds after a reset (zero) and
+// TPM2_PCR_Event with each event in turn: the value to approve for a state
+// that is known before it is booted. Auto is not a bank here.
+func EventChain(b Bank, events []string) ([]byte, error) {
+	if b != SHA256 && b != SHA1 {
+		return nil, fmt.Errorf("unknown PCR bank %q", b)
+	}
+	h, err := b.alg().Hash()
+	if err != nil {
+		return nil, err
+	}
+	pcr := make([]byte, b.size())
+	for _, e := range events {
+		d := h.New()
+		d.Write([]byte(e))
+		x := h.New()
+		x.Write(pcr)
+		x.Write(d.Sum(nil))
+		pcr = x.Sum(nil)
+	}
+	return pcr, nil
+}

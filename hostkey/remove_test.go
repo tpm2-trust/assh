@@ -1,45 +1,13 @@
 package hostkey
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
 
 	"github.com/google/go-tpm/tpm2"
-
-	"github.com/tpm2-trust/assh/internal/swtpmtest"
 )
-
-// EventChain is what the TPM holds after TPM2_PCR_Event from a reset, in
-// either bank.
-func TestEventChain(t *testing.T) {
-	events := []string{"safespace-combination:b", "safespace-identity:sealed"}
-	for _, banks := range [][]string{{"sha1", "sha256"}, {"sha1"}} {
-		sw := swtpmtest.StartBanks(t, banks...)
-		tpm := sw.Open(t)
-		for _, e := range events {
-			if _, err := (tpm2.PCREvent{PCRHandle: tpm2.AuthHandle{Handle: 15, Auth: tpm2.PasswordAuth(nil)},
-				EventData: tpm2.TPM2BEvent{Buffer: []byte(e)}}).Execute(tpm); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for _, b := range banks {
-			now, err := ReadPCRs(tpm, Bank(b), []int{15})
-			if err != nil {
-				t.Fatal(err)
-			}
-			want, err := EventChain(Bank(b), events)
-			if err != nil || !bytes.Equal(now[15], want) {
-				t.Errorf("%s: the TPM %x, EventChain %x %v", b, now[15], want, err)
-			}
-		}
-	}
-	if _, err := EventChain(Auto, events); err == nil {
-		t.Error("EventChain of auto")
-	}
-}
 
 // RemoveCA removes the CA's file and the indices it names; without a file
 // the indices of aSSH's shape at the handles given, and nothing else. A

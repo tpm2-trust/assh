@@ -10,29 +10,6 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 )
 
-// EventChain is the value a PCR of bank b holds after a reset (zero) and
-// TPM2_PCR_Event with each event in turn: the value to approve for a state
-// that is known before it is booted. Auto is not a bank here.
-func EventChain(b Bank, events []string) ([]byte, error) {
-	if b != SHA256 && b != SHA1 {
-		return nil, fmt.Errorf("unknown PCR bank %q", b)
-	}
-	h, err := b.alg().Hash()
-	if err != nil {
-		return nil, err
-	}
-	pcr := make([]byte, b.size())
-	for _, e := range events {
-		d := h.New()
-		d.Write([]byte(e))
-		x := h.New()
-		x.Write(pcr)
-		x.Write(d.Sum(nil))
-		pcr = x.Sum(nil)
-	}
-	return pcr, nil
-}
-
 // RemoveCA removes the CA at path and its PIN index and counter: those the
 // file names, each only where the TPM holds that very index (the same
 // name); with no file at path, those at handles that have the shape of
