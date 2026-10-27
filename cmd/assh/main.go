@@ -28,9 +28,9 @@ import (
 
 const usage = `assh - an SSH host key in the TPM
 
-  assh ca create   --out FILE (--authority PUB.pem | --authority-tpm)
+  assh ca create   --out FILE (--authority PUB.pem | --authority-tpm | --authority-once [--values FILE] [--events PCR:EVENT ...])
                    [--type p256|rsa2048] [--pcrs 0,7] [--window N] [--bank sha256|sha1|auto] [--ref TEXT]
-                   [--pin-handle 0x01802913] [--counter-handle 0x01802912] [--pin-fd N]
+                   [--pin-handle 0x01802913] [--counter-handle 0x01802912] [--pin-fd N] [--pcr-key PEM]
   assh ca slot     --ca FILE (--add N --pcrs 0,7 | --remove N)
   assh ca sync     --ca FILE
   assh ca show     --ca FILE
@@ -181,9 +181,19 @@ func caCommand(args []string) error {
 		window := fs.Int("window", cfg.Window, "the PCR whose extension closes the CA for the rest of the boot; every slot reads it (0: none)")
 		bank := fs.String("bank", string(cfg.Bank), "their bank: sha256, sha1, or auto (sha256 where the TPM has it, else sha1 where 'tpm sha1 --allow' allows it)")
 		ref := fs.String("ref", cfg.PolicyRef, "what the authority's approvals are bound to (at most 32 bytes)")
+		authOnce := fs.Bool("authority-once", cfg.AuthOnce, "an authority for the creation alone: it approves every slot now and is gone - no approval ever after")
+		valuesPath := fs.String("values", "", "--authority-once: the PCR values to approve, as 'agent' recorded them; default: what the TPM holds now")
+		var events eventList
+		fs.Var(&events, "events", "--authority-once: PCR:EVENT - that PCR approved as from zero with these events in order (a state known before it is booted); repeatable")
+		pcrKey := fs.String("pcr-key", cfg.PCRKey, "the public key (PEM) whose signatures the slots of ASSH_CA_SLOT_<N>_SIGNED take")
 		fs.Parse(args[1:])
-		if *out == "" || (*authPath == "") == !*authTPM {
-			return errors.New("ca create needs --out, and --authority or --authority-tpm")
+		cfg.PCRKey = *pcrKey
+		if *out == "" || btoi(*authPath != "")+btoi(*authTPM)+btoi(*authOnce) != 1 {
+			return errors.New("ca create needs --out, and one of --authority, --authority-tpm and --authority-once")
+		}
+		signed, err := signedSlots(cfg)
+		if err != nil {
+			return err
 		}
 		t, err := hostkey.ParseType(*typ)
 		if err != nil {
@@ -204,7 +214,39 @@ func caCommand(args []string) error {
 		defer tpm.Close()
 		opts := hostkey.CAOptions{Type: t, Bank: b, PCRs: p, Window: *window, PolicyRef: []byte(*ref)}
 		var ca *hostkey.CA
-		if *authTPM {
+		if *authOnce {
+			// The values every slot is approved for, as the slots will hold
+			// them: from a recorded state or the TPM, PCRs named in --events
+			// calculated.
+			if b, err = hostkey.ResolveBank(tpm, b); err != nil {
+				return err
+			}
+			specs := []hostkey.SlotSpec{{Number: 0, PCRs: p, Signed: signed[0]}}
+			all := slices.Clone(p)
+			for _, n := range cfg.SlotNumbers() {
+				if n != 0 {
+					specs = append(specs, hostkey.SlotSpec{Number: n, PCRs: cfg.Slots[n], Signed: signed[n]})
+					all = append(all, cfg.Slots[n]...)
+				}
+			}
+			slices.Sort(all)
+			all = slices.Compact(all)
+			var values map[int][]byte
+			if *valuesPath != "" {
+				if values, err = readState(*valuesPath, b); err != nil {
+					return err
+				}
+			} else if values, err = hostkey.ReadPCRs(tpm, b, all); err != nil {
+				return err
+			}
+			if err := events.applyBank(b, all, values); err != nil {
+				return err
+			}
+			opts.Bank = b
+			if ca, err = hostkey.CreateOnceCA(tpm, opts, specs, values); err != nil {
+				return err
+			}
+		} else if *authTPM {
 			ph, err := parseHandle(*pinHandle)
 			if err != nil {
 				return err
@@ -231,11 +273,18 @@ func caCommand(args []string) error {
 			}
 		}
 		for _, n := range cfg.SlotNumbers() {
-			if n == 0 {
+			if *authOnce || n == 0 {
 				continue
 			}
 			if err := ca.AddSlot(n, cfg.Slots[n]); err != nil {
 				return fmt.Errorf("assh.conf's slot %d: %w", n, err)
+			}
+		}
+		if !*authOnce {
+			for n, sg := range signed {
+				if err := ca.SetSigned(n, sg); err != nil {
+					return fmt.Errorf("assh.conf's slot %d: %w", n, err)
+				}
 			}
 		}
 		if err := ca.Save(*out); err != nil {
@@ -250,7 +299,9 @@ func caCommand(args []string) error {
 		fmt.Print(ca.Describe())
 		line, _ := ca.KnownHosts("*")
 		fmt.Printf("Clients trust it with this known_hosts line (narrow the * to the host's names):\n  %s\n", line)
-		fmt.Printf("Approve the PCR state it may sign in: assh ca approve --ca %s ...\n", *out)
+		if !*authOnce {
+			fmt.Printf("Approve the PCR state it may sign in: assh ca approve --ca %s ...\n", *out)
+		}
 		return nil
 	case "slot":
 		caPath := fs.String("ca", cfg.CA, "the CA file")
@@ -796,6 +847,50 @@ func writeState(path string, bank hostkey.Bank, values map[int][]byte) error {
 	return os.WriteFile(path, append(b, '\n'), 0o644)
 }
 
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// signedSlots are assh.conf's ASSH_CA_SLOT_<N>_SIGNED, with ASSH_PCR_KEY.
+func signedSlots(cfg config.Config) (map[int]*hostkey.Signed, error) {
+	out := map[int]*hostkey.Signed{}
+	if len(cfg.Signed) == 0 {
+		return out, nil
+	}
+	key, err := readPublicKey(cfg.PCRKey)
+	if err != nil {
+		return nil, fmt.Errorf("ASSH_PCR_KEY: %w", err)
+	}
+	for n, p := range cfg.Signed {
+		if out[n], err = hostkey.NewSigned(p, key); err != nil {
+			return nil, fmt.Errorf("ASSH_CA_SLOT_%d_SIGNED: %w", n, err)
+		}
+	}
+	return out, nil
+}
+
+// pcrSignatures are ASSH_PCR_SIGNATURE's signatures; none where the file is
+// not there (a slot with signed PCRs then is not met).
+func pcrSignatures(path string, log func(string)) hostkey.PCRSignatures {
+	if path == "" {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		log(fmt.Sprintf("no signatures of PCRs (%v): a slot with signed PCRs is not met", err))
+		return nil
+	}
+	p, err := hostkey.ParsePCRSignatures(b)
+	if err != nil {
+		log(fmt.Sprintf("%s: %v", path, err))
+		return nil
+	}
+	return p
+}
+
 // eventList is --events: PCR:EVENT, in order.
 type eventList []string
 
@@ -805,6 +900,11 @@ func (e *eventList) Set(v string) error { *e = append(*e, v); return nil }
 // apply puts the value each named PCR has after its events, from zero,
 // into values; every PCR named must be one the CA's slots read.
 func (e eventList) apply(ca *hostkey.CA, values map[int][]byte) error {
+	return e.applyBank(ca.Bank, ca.PCRs(), values)
+}
+
+// applyBank is apply for PCRs of bank, every one named among pcrs.
+func (e eventList) applyBank(bank hostkey.Bank, pcrs []int, values map[int][]byte) error {
 	byPCR := map[int][]string{}
 	var order []int
 	for _, v := range e {
@@ -813,7 +913,7 @@ func (e eventList) apply(ca *hostkey.CA, values map[int][]byte) error {
 		if !ok || err != nil || ev == "" {
 			return fmt.Errorf("--events %q: PCR:EVENT", v)
 		}
-		if !slices.Contains(ca.PCRs(), i) {
+		if !slices.Contains(pcrs, i) {
 			return fmt.Errorf("--events %q: no slot of the CA reads PCR %d", v, i)
 		}
 		if _, seen := byPCR[i]; !seen {
@@ -822,7 +922,7 @@ func (e eventList) apply(ca *hostkey.CA, values map[int][]byte) error {
 		byPCR[i] = append(byPCR[i], ev)
 	}
 	for _, i := range order {
-		v, err := hostkey.EventChain(ca.Bank, byPCR[i])
+		v, err := hostkey.EventChain(bank, byPCR[i])
 		if err != nil {
 			return err
 		}
@@ -840,6 +940,11 @@ func approveValues(ca *hostkey.CA, path, tpmPath string) (map[int][]byte, error)
 		defer tpm.Close()
 		return ca.ReadPCRs(tpm)
 	}
+	return readState(path, ca.Bank)
+}
+
+// readState is a state file's values, which must be of bank.
+func readState(path string, bank hostkey.Bank) (map[int][]byte, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -848,8 +953,8 @@ func approveValues(ca *hostkey.CA, path, tpmPath string) (map[int][]byte, error)
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if s.Bank != ca.Bank {
-		return nil, fmt.Errorf("%s holds %s values, the CA reads %s", path, s.Bank, ca.Bank)
+	if s.Bank != bank {
+		return nil, fmt.Errorf("%s holds %s values, the CA reads %s", path, s.Bank, bank)
 	}
 	out := map[int][]byte{}
 	for k, v := range s.PCRs {
@@ -989,7 +1094,8 @@ func (h *hostKeyFlags) issue(log func(string)) (*hostkey.HostKey, error) {
 		recordState(h.state, ca.Bank, values, log)
 	}
 	principals := config.SplitList(h.principals)
-	hk, ierr := hostkey.Issue(tpm, ca, hostkey.IssueOptions{Type: typ, Principals: principals, KeyID: h.keyID, Open: open})
+	hk, ierr := hostkey.Issue(tpm, ca, hostkey.IssueOptions{Type: typ, Principals: principals, KeyID: h.keyID, Open: open,
+		PCRSignatures: pcrSignatures(h.conf.PCRSigs, log)})
 	if closePCR >= 0 {
 		if err := hostkey.Close(tpm, closePCR, "assh: closed"); err != nil {
 			return nil, err

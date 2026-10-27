@@ -307,6 +307,34 @@ without one any process may reset the lockout and try PINs without end.
 `ca create --authority-tpm` refuses a TPM without one (`assh tpm da
 --new-lockout-auth`). It is also what clears the TPM.
 
+## PCRs a build signs: updates without an approval
+
+A slot can take PCRs from a key elsewhere instead of from an approval: the signature of
+systemd's build for PCR 11 of a unified kernel image, one per boot phase (`systemd-measure
+sign`; the UKI's `.pcrsig`, on the running system `/run/systemd/tpm2-pcr-signature.json`). The
+slot's approval then holds the other PCRs and the key; the key vouches for PCR 11:
+
+```
+PolicyPCR(11) ; PolicyAuthorize(the build's key)        the TPM checks the build's signature
+; PolicyPCR(the slot's PCRs) ; PolicyNV(counter)         the approval, as any other
+```
+
+A new build carries its own signature, so the slot stays met after an update: nobody
+approves anything. Settings: `ASSH_CA_SLOT_<N>_SIGNED=11`, `ASSH_PCR_KEY` (the key, PEM; RSA
+with 2048 bits, which every TPM checks), `ASSH_PCR_SIGNATURE` (where `agent` and `serve` read
+the signatures). The certificate's key ID names them (`slot=0 pcrs=0,2,7,15 signed=11`).
+Every image the key signed meets the slot, an old one too.
+
+## An authority for the creation alone
+
+`ca create --authority-once` (`ASSH_AUTHORITY_ONCE=yes`) makes the authority in the TPM under
+the NULL hierarchy, has it approve every slot - for the values the TPM holds, a recorded state
+(`--values`), PCRs calculated from their events (`--events PCR:EVENT`, as `ca approve`) - and
+flushes it; the NULL hierarchy's seed is new at the next boot anyway. Nobody can approve
+another state after: no PIN to guess, no key to steal, nothing root can do. What the
+approvals do not cover - another combination, firmware changed in a slot without signed PCRs
+- gets a temporary key until the CA is made again. With signed PCRs, updates need nothing.
+
 ## The SHA-1 bank
 
 A CA reads one PCR bank. `sha256` and `sha1` name it; `auto` takes SHA-256
@@ -433,7 +461,8 @@ ASSH_PRINCIPALS=host.example,192.0.2.10
 | `ASSH_CA_TYPE`, `ASSH_CA_BANK` | `ca create --type` (`p256`, `rsa2048`, or a list in order of preference, `rsa2048,p256`: the first the TPM takes), `--bank` (`sha256`, `sha1`, `auto`) | `p256`, `sha256` |
 | `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0), `ca slot --add N --pcrs` | slot 0 `0,7` |
 | `ASSH_CA_WINDOW`, `ASSH_CA_REF` | `ca create --window`, `--ref` | none, `assh` |
-| `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM` | `ca create --authority`, `--authority-tpm` (`yes`/`no`) | - |
+| `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM`, `ASSH_AUTHORITY_ONCE` | `ca create --authority`, `--authority-tpm`, `--authority-once` (`yes`/`no`) | - |
+| `ASSH_CA_SLOT_<N>_SIGNED`, `ASSH_PCR_KEY`, `ASSH_PCR_SIGNATURE` | PCRs of slot N a key signs, the key (PEM), its signatures (systemd's JSON) | - |
 | `ASSH_PIN_HANDLE`, `ASSH_COUNTER_HANDLE` | `--pin-handle`, `--counter-handle` | `0x01802913`, `0x01802912` |
 | `ASSH_HOSTKEY_TYPE`, `ASSH_PRINCIPALS`, `ASSH_KEY_ID` | `--key-type` (as `ASSH_CA_TYPE`, a list too), `--principals`, `--key-id` | `p256`, `*`, `assh` |
 | `ASSH_CLOSE_PCR`, `ASSH_STATE` | `--close-pcr`, `--state` | the CA's window, the command's own |

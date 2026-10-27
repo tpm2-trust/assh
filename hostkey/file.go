@@ -174,8 +174,9 @@ type CA struct {
 // policy names no PCR, so a slot needs no key of its own: it is worth
 // nothing until the authority approves a state in it.
 type Slot struct {
-	Number int   `json:"slot"`
-	PCRs   []int `json:"pcrs"`
+	Number int     `json:"slot"`
+	PCRs   []int   `json:"pcrs"`
+	Signed *Signed `json:"signed,omitempty"` // PCRs a key elsewhere signs, besides the approved ones
 }
 
 // Approval is a PCR state of a slot the authority signed: the CA signs
@@ -413,7 +414,11 @@ func (f *CA) PCRs() []int {
 	seen := map[int]bool{}
 	var out []int
 	for _, s := range f.Slots {
-		for _, p := range s.PCRs {
+		pcrs := s.PCRs
+		if s.Signed != nil {
+			pcrs = append(slices.Clone(pcrs), s.Signed.PCRs...)
+		}
+		for _, p := range pcrs {
 			if !seen[p] {
 				seen[p] = true
 				out = append(out, p)
@@ -422,6 +427,21 @@ func (f *CA) PCRs() []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+// SetSigned gives slot n PCRs a key elsewhere signs (nil: none). Its
+// approvals go: they named the key.
+func (f *CA) SetSigned(n int, s *Signed) error {
+	i := slices.IndexFunc(f.Slots, func(x Slot) bool { return x.Number == n })
+	if i < 0 {
+		return fmt.Errorf("no slot %d", n)
+	}
+	if s != nil && slices.ContainsFunc(s.PCRs, func(p int) bool { return slices.Contains(f.Slots[i].PCRs, p) }) {
+		return fmt.Errorf("slot %d reads %s itself: a PCR is approved or signed, not both", n, PCRList(f.Slots[i].PCRs))
+	}
+	f.Slots[i].Signed = s
+	f.Approvals = slices.DeleteFunc(f.Approvals, func(a Approval) bool { return a.Slot == n })
+	return nil
 }
 
 // AddSlot gives the CA slot n, reading pcrs. It needs no authority: the
@@ -508,6 +528,14 @@ func (f *CA) checkSlots() error {
 		if !slices.IsSorted(s.PCRs) {
 			return fmt.Errorf("slot %d: its PCRs are not in order", s.Number)
 		}
+		if s.Signed != nil {
+			if _, err := s.Signed.key(); err != nil {
+				return fmt.Errorf("slot %d: %w", s.Number, err)
+			}
+			if !slices.IsSorted(s.Signed.PCRs) || slices.ContainsFunc(s.Signed.PCRs, func(p int) bool { return slices.Contains(s.PCRs, p) || p < 0 || p > 23 }) {
+				return fmt.Errorf("slot %d: its signed PCRs are no selection apart from its approved ones", s.Number)
+			}
+		}
 	}
 	for _, a := range f.Approvals {
 		s := f.Slot(a.Slot)
@@ -542,7 +570,10 @@ func PCRList(pcrs []int) string {
 	for i, p := range pcrs {
 		s[i] = fmt.Sprint(p)
 	}
-	if len(s) == 1 {
+	switch len(s) {
+	case 0:
+		return "no PCR"
+	case 1:
 		return "PCR " + s[0]
 	}
 	return "PCR " + strings.Join(s[:len(s)-1], ", ") + " and " + s[len(s)-1]

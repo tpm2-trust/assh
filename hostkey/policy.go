@@ -189,6 +189,17 @@ func (f *CA) approvedPolicy(s *Slot, values map[int][]byte, gen uint64) ([]byte,
 	if err != nil {
 		return nil, err
 	}
+	if s.Signed != nil {
+		// PolicyAuthorize resets the session's digest: the signed PCRs'
+		// part is the key's Name alone, whatever value it signed.
+		name, _, err := s.Signed.name()
+		if err != nil {
+			return nil, err
+		}
+		if err := (tpm2.PolicyAuthorize{KeySign: name}).Update(calc); err != nil {
+			return nil, err
+		}
+	}
 	if err := (tpm2.PolicyPCR{
 		PcrDigest: tpm2.TPM2BDigest{Buffer: h.Sum(nil)},
 		Pcrs:      f.pcrSelection(s),

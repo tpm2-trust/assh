@@ -2,6 +2,13 @@ package main
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"io/fs"
 	"net"
@@ -16,6 +23,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	sshagent "golang.org/x/crypto/ssh/agent"
 
+	"github.com/tpm2-trust/assh/hostkey"
 	"github.com/tpm2-trust/assh/internal/swtpmtest"
 )
 
@@ -544,5 +552,105 @@ ASSH_AGENT_UID=%d
 	ag.stop()
 	if b, _ := os.ReadFile(filepath.Join(runDir, "sshd.conf")); !strings.HasSuffix(string(b), "HostKeyAlgorithms rsa-sha2-512,rsa-sha2-256\n") {
 		t.Fatalf("sshd.conf:\n%s\n%s", b, ag.String())
+	}
+}
+
+// writeSignatures writes, as systemd does for a UKI, the build key's
+// signature of PCR 11 as the TPM holds it now.
+func writeSignatures(t *testing.T, sw *swtpmtest.SWTPM, key *rsa.PrivateKey, path string) {
+	t.Helper()
+	c, err := transport.OpenTPM(sw.Sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	now, err := hostkey.ReadPCRs(c, hostkey.SHA256, []int{11})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol, err := hostkey.PCRPolicy(hostkey.SHA256, []int{11}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := sha256.Sum256(pol)
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, d[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(path, []byte(fmt.Sprintf(`{"sha256":[{"pcrs":[11],"pkfp":"x","pol":"%x","sig":"%s"}]}`, pol, base64.StdEncoding.EncodeToString(sig))), 0o644)
+}
+
+// The identity made once, as safearch's initrd makes it: in the initrd's
+// state (PCR 15 the combination alone) 'ca create --authority-once' approves
+// the agent's state ahead (--events: the combination, then "sealed"); slot 0
+// takes PCR 11 from the build's signature. The agent of that boot certifies
+// through slot 0; an update (another PCR 11, signed) too, with no step;
+// without the signature slot 1; and nothing can approve another state.
+func TestAuthorityOnce(t *testing.T) {
+	sw := swtpmtest.Start(t)
+	dir := t.TempDir()
+	ca, runDir, sigs := filepath.Join(dir, "ca.json"), filepath.Join(dir, "run"), filepath.Join(dir, "pcrsig.json")
+	build, _ := rsa.GenerateKey(rand.Reader, 2048)
+	der, _ := x509.MarshalPKIXPublicKey(&build.PublicKey)
+	keyPath := filepath.Join(dir, "pcr.pem")
+	os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), 0o644)
+	conf := filepath.Join(dir, "assh.conf")
+	os.WriteFile(conf, []byte(fmt.Sprintf(`ASSH_TPM=%s
+ASSH_CA=%s
+ASSH_AUTHORITY_ONCE=yes
+ASSH_CA_SLOT_0=0,7,15
+ASSH_CA_SLOT_0_SIGNED=11
+ASSH_CA_SLOT_1=7,15
+ASSH_CA_WINDOW=15
+ASSH_PCR_KEY=%s
+ASSH_PCR_SIGNATURE=%s
+ASSH_KEY_ID=safespace
+ASSH_AGENT_DIR=%s
+ASSH_AGENT_UID=%d
+`, sw.Sock, ca, keyPath, sigs, runDir, os.Getuid())), 0o644)
+	// What a boot of combination a measures: the UKI into PCR 11, the
+	// initrd's combination into 15; then "sealed" before the root.
+	initrd := func(uki string) {
+		t.Helper()
+		sw.Reboot(t)
+		extend(t, sw, 11, uki)
+		extend(t, sw, 15, "combination:a")
+	}
+	root := func() { extend(t, sw, 11, "leave-initrd"); extend(t, sw, 15, "sealed") }
+	agent := func() string {
+		t.Helper()
+		ag := start(t, "agent", "--config", conf)
+		ag.wait(t, "agent at")
+		ag.stop()
+		return ag.String()
+	}
+
+	initrd("uki A")
+	out := run(t, "ca", "create", "--config", conf, "--events", "15:combination:a", "--events", "15:sealed")
+	if !strings.Contains(out, "@cert-authority * ecdsa-sha2-nistp256 ") || strings.Contains(out, "Approve the PCR state") {
+		t.Fatalf("ca create:\n%s", out)
+	}
+	root()
+	writeSignatures(t, sw, build, sigs)
+	if out := agent(); !strings.Contains(out, "through slot 0") {
+		t.Fatalf("the creation's boot:\n%s", out)
+	}
+	if b, _ := os.ReadFile(filepath.Join(runDir, "status")); !strings.Contains(string(b), "key_id=safespace slot=0 pcrs=0,7,15 signed=11\n") {
+		t.Fatalf("status:\n%s", b)
+	}
+	initrd("uki B")
+	root()
+	writeSignatures(t, sw, build, sigs)
+	if out := agent(); !strings.Contains(out, "through slot 0") {
+		t.Fatalf("an update:\n%s", out)
+	}
+	os.Remove(sigs)
+	initrd("uki C")
+	root()
+	if out := agent(); !strings.Contains(out, "through slot 1") || !strings.Contains(out, "no signatures of PCRs") {
+		t.Fatalf("no signature:\n%s", out)
+	}
+	if out, err := assh("ca", "approve", "--config", conf).CombinedOutput(); err == nil {
+		t.Fatalf("an approval after the creation:\n%s", out)
 	}
 }

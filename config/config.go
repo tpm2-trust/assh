@@ -35,10 +35,14 @@ type Config struct {
 	CAType     hostkey.Type  // ASSH_CA_TYPE
 	Bank       hostkey.Bank  // ASSH_CA_BANK
 	Slots      map[int][]int // ASSH_CA_SLOT_<N>: each slot's PCRs
+	Signed     map[int][]int // ASSH_CA_SLOT_<N>_SIGNED: PCRs of slot N that ASSH_PCR_KEY signs
+	PCRKey     string        // ASSH_PCR_KEY: the public key (PEM) whose signatures of PCRs a slot takes
+	PCRSigs    string        // ASSH_PCR_SIGNATURE: its signatures as systemd writes them (JSON)
 	Window     int           // ASSH_CA_WINDOW: 0 none
 	PolicyRef  string        // ASSH_CA_REF
 	Authority  string        // ASSH_AUTHORITY: the authority's public key (PEM), a key elsewhere
 	AuthTPM    bool          // ASSH_AUTHORITY_TPM: the authority in the TPM, opened by a PIN
+	AuthOnce   bool          // ASSH_AUTHORITY_ONCE: an authority for the creation alone
 	PINHandle  uint32        // ASSH_PIN_HANDLE
 	CounterHdl uint32        // ASSH_COUNTER_HANDLE
 
@@ -68,6 +72,7 @@ func Default() Config {
 		CAType:      hostkey.P256,
 		Bank:        hostkey.SHA256,
 		Slots:       map[int][]int{},
+		Signed:      map[int][]int{},
 		PolicyRef:   "assh",
 		PINHandle:   uint32(hostkey.DefaultPINHandle),
 		CounterHdl:  uint32(hostkey.DefaultCounterHandle),
@@ -137,6 +142,7 @@ func slotKey(n int) string { return "ASSH_CA_SLOT_" + strconv.Itoa(n) }
 func (c *Config) set(key, val string) error {
 	var err error
 	if s, ok := strings.CutPrefix(key, "ASSH_CA_SLOT_"); ok {
+		s, signed := strings.CutSuffix(s, "_SIGNED")
 		n, aerr := strconv.Atoi(s)
 		if aerr != nil || n < 0 || n >= hostkey.MaxSlots || strconv.Itoa(n) != s {
 			return fmt.Errorf("the slots are ASSH_CA_SLOT_0 to ASSH_CA_SLOT_%d", hostkey.MaxSlots-1)
@@ -145,7 +151,11 @@ func (c *Config) set(key, val string) error {
 		if perr != nil {
 			return perr
 		}
-		c.Slots[n] = p
+		if signed {
+			c.Signed[n] = p
+		} else {
+			c.Slots[n] = p
+		}
 		return nil
 	}
 	switch key {
@@ -168,6 +178,12 @@ func (c *Config) set(key, val string) error {
 		c.Authority, err = nonEmpty(val)
 	case "ASSH_AUTHORITY_TPM":
 		c.AuthTPM, err = yesNo(val)
+	case "ASSH_AUTHORITY_ONCE":
+		c.AuthOnce, err = yesNo(val)
+	case "ASSH_PCR_KEY":
+		c.PCRKey, err = nonEmpty(val)
+	case "ASSH_PCR_SIGNATURE":
+		c.PCRSigs, err = nonEmpty(val)
 	case "ASSH_PIN_HANDLE":
 		c.PINHandle, err = handle(val)
 	case "ASSH_COUNTER_HANDLE":
@@ -215,10 +231,29 @@ func (c *Config) check() error {
 			}
 		}
 	}
-	if c.Authority != "" && c.AuthTPM {
-		return errors.New("ASSH_AUTHORITY and ASSH_AUTHORITY_TPM=yes: the authority is one of them")
+	if n := btoi(c.Authority != "") + btoi(c.AuthTPM) + btoi(c.AuthOnce); n > 1 {
+		return errors.New("ASSH_AUTHORITY, ASSH_AUTHORITY_TPM=yes and ASSH_AUTHORITY_ONCE=yes: the authority is one of them")
+	}
+	for n, p := range c.Signed {
+		base, ok := c.Slots[n]
+		if !ok {
+			return fmt.Errorf("%s_SIGNED without %s", slotKey(n), slotKey(n))
+		}
+		if slices.ContainsFunc(p, func(x int) bool { return slices.Contains(base, x) }) {
+			return fmt.Errorf("%s_SIGNED names a PCR %s reads: a PCR is approved or signed, not both", slotKey(n), slotKey(n))
+		}
+		if c.PCRKey == "" {
+			return fmt.Errorf("%s_SIGNED without ASSH_PCR_KEY: whose signatures?", slotKey(n))
+		}
 	}
 	return nil
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func nonEmpty(v string) (string, error) {
@@ -291,11 +326,15 @@ func (c Config) Lines() [][2]string {
 	add("ASSH_CA_BANK", string(c.Bank), string(d.Bank), false)
 	for _, n := range c.SlotNumbers() {
 		add(slotKey(n), pcrs(c.Slots[n]), "", true)
+		add(slotKey(n)+"_SIGNED", pcrs(c.Signed[n]), "", false)
 	}
+	add("ASSH_PCR_KEY", c.PCRKey, "", false)
+	add("ASSH_PCR_SIGNATURE", c.PCRSigs, "", false)
 	add("ASSH_CA_WINDOW", strconv.Itoa(c.Window), "0", false)
 	add("ASSH_CA_REF", c.PolicyRef, d.PolicyRef, false)
 	add("ASSH_AUTHORITY", c.Authority, "", false)
 	add("ASSH_AUTHORITY_TPM", map[bool]string{true: "yes", false: "no"}[c.AuthTPM], "no", false)
+	add("ASSH_AUTHORITY_ONCE", map[bool]string{true: "yes", false: "no"}[c.AuthOnce], "no", false)
 	add("ASSH_PIN_HANDLE", fmt.Sprintf("0x%08X", c.PINHandle), fmt.Sprintf("0x%08X", d.PINHandle), false)
 	add("ASSH_COUNTER_HANDLE", fmt.Sprintf("0x%08X", c.CounterHdl), fmt.Sprintf("0x%08X", d.CounterHdl), false)
 	add("ASSH_HOSTKEY_TYPE", string(c.HostKeyType), string(d.HostKeyType), false)
@@ -410,12 +449,34 @@ func (c Config) Match(ca *hostkey.CA) (changed bool, err error) {
 	if len(c.Slots) == 0 {
 		return false, nil
 	}
+	// Signed PCRs and their key are in a slot's approvals: the file names
+	// them as the CA has them, or the CA is made again.
+	for _, s := range ca.Slots {
+		if _, ok := c.Slots[s.Number]; !ok {
+			continue
+		}
+		var have []int
+		if s.Signed != nil {
+			have = s.Signed.PCRs
+		}
+		if !slices.Equal(have, c.Signed[s.Number]) {
+			return false, fmt.Errorf("%s_SIGNED is %q, the CA's slot %d signs %q: create the CA again", slotKey(s.Number), pcrs(c.Signed[s.Number]), s.Number, pcrs(have))
+		}
+	}
+	for n := range c.Signed {
+		if ca.Slot(n) == nil {
+			return false, fmt.Errorf("%s_SIGNED for a slot the CA does not have: create the CA again", slotKey(n))
+		}
+	}
 	old, oldApprovals := ca.Slots, ca.Approvals
 	ca.Slots = nil
 	for _, n := range c.SlotNumbers() {
 		if err := ca.AddSlot(n, c.Slots[n]); err != nil {
 			ca.Slots = old
 			return false, err
+		}
+		if i := slices.IndexFunc(old, func(s hostkey.Slot) bool { return s.Number == n }); i >= 0 {
+			ca.Slot(n).Signed = old[i].Signed
 		}
 	}
 	ca.Approvals = slices.DeleteFunc(slices.Clone(oldApprovals), func(a hostkey.Approval) bool {
