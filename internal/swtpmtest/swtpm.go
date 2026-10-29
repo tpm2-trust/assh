@@ -4,6 +4,7 @@ package swtpmtest
 import (
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -23,11 +24,28 @@ type SWTPM struct {
 // Start runs swtpm for the duration of the test; the test is skipped where
 // swtpm is not installed.
 func Start(t *testing.T) *SWTPM {
+	return StartBanks(t)
+}
+
+// StartBanks is Start with only the PCR banks named active ("sha1", say),
+// as a TPM's firmware may leave it (swtpm_setup --pcr-banks); none: swtpm's
+// default.
+func StartBanks(t *testing.T, banks ...string) *SWTPM {
 	t.Helper()
 	if _, err := exec.LookPath("swtpm"); err != nil {
 		t.Skip("swtpm not installed")
 	}
 	dir := t.TempDir()
+	if len(banks) > 0 {
+		if _, err := exec.LookPath("swtpm_setup"); err != nil {
+			t.Skip("swtpm_setup not installed")
+		}
+		out, err := exec.Command("swtpm_setup", "--tpm2", "--tpmstate", dir, "--config", "/dev/null",
+			"--pcr-banks", strings.Join(banks, ",")).CombinedOutput()
+		if err != nil {
+			t.Fatalf("swtpm_setup: %v\n%s", err, out)
+		}
+	}
 	s := &SWTPM{Sock: filepath.Join(dir, "swtpm.sock"), dir: dir}
 	s.start(t)
 	t.Cleanup(s.stop)

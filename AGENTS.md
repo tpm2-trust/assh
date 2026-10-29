@@ -1,8 +1,11 @@
 # Notes for agents working on aSSH
 
 aSSH is used by other projects (tpm2-kira includes it as the git
-submodule `assh/`, through a `replace` in its go.mod). A change to an
-exported name is a change to them: build and test tpm2-kira after one.
+submodule `assh/`, through a `replace` in its go.mod; safearch as a
+submodule too). In the tpm2-trust workspace this checkout is the one that
+is edited: `go.work` builds tpm2-kira and the vault against it, and
+`../pin assh` moves the submodules to its HEAD. A change to an exported
+name is a change to them: build and test tpm2-kira after one.
 
 - **No host key and no secret of one is stored.** The CA lives in the TPM;
   host keys are made in the TPM under the NULL hierarchy, one per boot;
@@ -27,6 +30,14 @@ exported name is a change to them: build and test tpm2-kira after one.
   (assh.conf naming its slots: their PCRs recorded, the window closed all
   the same); an unreadable CA file or a TPM that does not open stays an
   error.
+- **SHA-1 only where the TPM allows it.** `auto` reads SHA-1 only on a
+  TPM without an active SHA-256 bank and while `hostkey.SHA1Handle` is
+  there; others (safearch's initrd) read that index at its handle, so it
+  stays where it is.
+- **An authority made once approves once.** `--authority-once` makes it
+  in the TPM under the NULL hierarchy, approves every slot, flushes it;
+  never store it, never make it again for the same CA. Signed PCRs
+  (`Slot.Signed`) are what keeps such a CA useful across updates.
 - **A CA file may be an EFI variable** (`efi:NAME`, assh's GUID): plain,
   not authenticated, because the TPM checks everything in it. Keep it so:
   nothing that the TPM does not check goes into a CA file.
@@ -38,9 +49,22 @@ exported name is a change to them: build and test tpm2-kira after one.
   (`hostkey.fileVersion`); another version is an error that says to
   create the CA again. No migrations.
 - **The side that speaks SSH holds nothing.** `server`'s unprivileged half
-  runs as nobody, in namespaces of its own, under Landlock, and asks for
+  runs as nobody, in namespaces of its own, confined by `sandbox`, and asks for
   every signature; it never gets the key or a session's other end before
   a login. Keep it that way.
+- **NV indices and EFI variables go through `persist`.** Nothing calls
+  NVUndefineSpace or writes efivarfs by itself: an index is removed only
+  when it is provably ours (`persist.Shaped`, `persist.Named`) - the one
+  exception, `RedefineCounter`, replaces what is at the CA's own handle
+  after the PIN is proven - absent is not an error, and a variable is
+  written in place, never removed first. Programs built on aSSH use the
+  same package (tpm2-kira) or the `assh efivar` command (safearch's
+  scripts).
+- **A confinement step covers every thread.** prctl, Landlock and
+  seccomp act on the thread that asks, and a Go program has several from
+  its start: `sandbox` takes each step on all of them
+  (`syscall.AllThreadsSyscall`, seccomp's TSYNC). Never confine with a
+  plain `unix.Prctl` or `unix.Syscall`.
 - **Tests run with `-count=1` and wait for a state, never for a time.**
   TPM tests use swtpm (`internal/swtpmtest`) and are skipped without it.
 - **Comments and docs say what it is**, not what it was.

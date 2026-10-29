@@ -12,8 +12,10 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
+	"github.com/google/go-tpm/tpm2"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/tpm2-trust/assh/agent"
@@ -177,19 +179,19 @@ func agentCommand(args []string) error {
 		return err
 	}
 	pub := filepath.Join(*dir, "host.pub")
-	if err := os.WriteFile(pub, sshAuthorizedKey(hk.PublicKey()), 0o644); err != nil {
+	if err := os.WriteFile(pub, ssh.MarshalAuthorizedKey(hk.PublicKey()), 0o644); err != nil {
 		return err
 	}
 	certPath := filepath.Join(*dir, "host-cert.pub")
 	if hk.Cert != nil {
-		if err := os.WriteFile(certPath, sshAuthorizedKey(hk.Cert), 0o644); err != nil {
+		if err := os.WriteFile(certPath, ssh.MarshalAuthorizedKey(hk.Cert), 0o644); err != nil {
 			return err
 		}
 	} else if err := os.Remove(certPath); err != nil && !os.IsNotExist(err) {
 		// A temporary key has no certificate: none of another boot stays.
 		return err
 	}
-	signer, err := plainSigner(hk)
+	signer, err := ssh.NewSignerFromSigner(hk.Signer)
 	if err != nil {
 		return err
 	}
@@ -198,10 +200,25 @@ func agentCommand(args []string) error {
 	if err != nil {
 		return err
 	}
+	algs, err := hostKeyAlgorithms(hk, h.tpm)
+	if err != nil {
+		return err
+	}
+	conf := fmt.Sprintf("HostKey %s\n", pub)
 	if hk.Cert != nil {
-		logger(fmt.Sprintf("agent at %s: HostKey %s, HostCertificate %s, HostKeyAgent %s", sock, pub, certPath, sock))
+		conf += fmt.Sprintf("HostCertificate %s\n", certPath)
+	}
+	conf += fmt.Sprintf("HostKeyAgent %s\nHostKeyAlgorithms %s\n", sock, strings.Join(algs, ","))
+	if err := os.WriteFile(filepath.Join(*dir, "sshd.conf"), []byte(conf), 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(*dir, "status"), statusOf(hk), 0o644); err != nil {
+		return err
+	}
+	if hk.Cert != nil {
+		logger(fmt.Sprintf("agent at %s: HostKey %s, HostCertificate %s, HostKeyAgent %s (sshd: %s)", sock, pub, certPath, sock, filepath.Join(*dir, "sshd.conf")))
 	} else {
-		logger(fmt.Sprintf("agent at %s: HostKey %s (temporary, no certificate), HostKeyAgent %s", sock, pub, sock))
+		logger(fmt.Sprintf("agent at %s: HostKey %s (temporary, no certificate), HostKeyAgent %s (sshd: %s)", sock, pub, sock, filepath.Join(*dir, "sshd.conf")))
 	}
 	go agent.New(signer, hk.Cert, logger).Serve(ln, *uid)
 	notifyReady()
@@ -210,12 +227,72 @@ func agentCommand(args []string) error {
 	return nil
 }
 
-func sshAuthorizedKey(k ssh.PublicKey) []byte { return ssh.MarshalAuthorizedKey(k) }
+// statusOf is what this boot's host key is, for anyone to read (a login
+// message, a prompt): KEY=VALUE lines, nothing secret.
+//
+//	key=SHA256:...                  the host key's fingerprint
+//	certified=yes|no
+//	slot=N, key_id=..., ca=SHA256:...   when certified
+//	why=...                         when not: why the key is temporary
+func statusOf(hk *hostkey.HostKey) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "key=%s\n", hk.Fingerprint())
+	if hk.Cert != nil {
+		fmt.Fprintf(&b, "certified=yes\nslot=%d\nkey_id=%s\nca=%s\n", hk.Slot, hk.Cert.KeyId, ssh.FingerprintSHA256(hk.Cert.SignatureKey))
+	} else {
+		fmt.Fprintf(&b, "certified=no\nwhy=%s\n", strings.ReplaceAll(fmt.Sprint(hk.Temporary), "\n", " "))
+	}
+	return []byte(b.String())
+}
 
-// plainSigner is the host key for sshd: every algorithm the TPM signs in,
-// rsa-sha2-512 too where it has SHA-512 (the agent refuses SHA-1).
-func plainSigner(hk *hostkey.HostKey) (ssh.Signer, error) {
-	return ssh.NewSignerFromSigner(hk.Signer)
+// hostKeyAlgorithms are the algorithms sshd may offer for hk: what the
+// TPM signs in (RSA: rsa-sha2-512 only where it has SHA-512, never SHA-1's
+// ssh-rsa), the certificate's first when there is one. sshd asks the agent
+// for the one a client picks: one the TPM cannot make drops the connection.
+func hostKeyAlgorithms(hk *hostkey.HostKey, tpmPath string) ([]string, error) {
+	var plain []string
+	switch hk.PublicKey().Type() {
+	case ssh.KeyAlgoRSA:
+		tpm, err := openTPM(tpmPath)()
+		if err != nil {
+			return nil, err
+		}
+		defer tpm.Close()
+		rsp, err := tpm2.GetCapability{Capability: tpm2.TPMCapAlgs, Property: uint32(tpm2.TPMAlgSHA512), PropertyCount: 1}.Execute(tpm)
+		if err != nil {
+			return nil, fmt.Errorf("asking the TPM for SHA-512: %w", err)
+		}
+		algs, err := rsp.CapabilityData.Data.Algorithms()
+		if err != nil {
+			return nil, err
+		}
+		if len(algs.AlgProperties) > 0 && algs.AlgProperties[0].Alg == tpm2.TPMAlgSHA512 {
+			plain = append(plain, ssh.KeyAlgoRSASHA512)
+		}
+		plain = append(plain, ssh.KeyAlgoRSASHA256)
+	default:
+		plain = []string{hk.PublicKey().Type()}
+	}
+	var out []string
+	if hk.Cert != nil {
+		for _, a := range plain {
+			out = append(out, certAlgorithm(a))
+		}
+	}
+	return append(out, plain...), nil
+}
+
+// certAlgorithm is the certificate algorithm of a key algorithm.
+func certAlgorithm(a string) string {
+	switch a {
+	case ssh.KeyAlgoRSASHA512:
+		return ssh.CertAlgoRSASHA512v01
+	case ssh.KeyAlgoRSASHA256:
+		return ssh.CertAlgoRSASHA256v01
+	case ssh.KeyAlgoECDSA256:
+		return ssh.CertAlgoECDSA256v01
+	}
+	return a + "-cert-v01@openssh.com"
 }
 
 // notifyReady tells systemd the agent is up (Type=notify), so sshd starts

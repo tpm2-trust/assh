@@ -64,7 +64,7 @@ func TestCertifiedHostKey(t *testing.T) {
 				t.Fatal(err)
 			}
 			hk := certified(t, tpm, ca, opts, 0)
-			if hk.Cert.KeyId != "test boot" || hk.Cert.CertType != ssh.HostCert {
+			if hk.Cert.KeyId != "test boot slot=0 pcrs=0,7,15" || hk.Cert.CertType != ssh.HostCert {
 				t.Fatalf("cert %+v", hk.Cert)
 			}
 			checkTrusted(t, ca, hk)
@@ -188,7 +188,7 @@ func TestSlots(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if a := ca.Approved(now); a == nil || a.Slot != 0 || len(a.PCRs) != 3 {
+	if a := ca.Approved(now, nil); a == nil || a.Slot != 0 || len(a.PCRs) != 3 {
 		t.Fatalf("approved %+v", a)
 	}
 	if a := ca.Approvals[0]; a.Slot != 1 || len(a.PCRs) != 2 {
@@ -225,22 +225,9 @@ func TestSlots(t *testing.T) {
 		t.Fatal(m)
 	}
 
-	if err := ca.RemoveSlot(0); err != nil {
-		t.Fatal(err)
-	}
-	if len(ca.Slots) != 1 || len(ca.Approvals) != 1 || ca.Approvals[0].Slot != 1 {
-		t.Fatalf("after removing slot 0: %v %v", ca.Slots, ca.Approvals)
-	}
-	if err := ca.RemoveSlot(1); err == nil {
-		t.Fatal("removed the last slot")
-	}
-	if err := ca.RemoveSlot(5); err == nil {
-		t.Fatal("removed a slot the CA does not have")
-	}
-
 	// Room for 16, no more; each its own selection, each with the window.
-	others := []int{0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 17, 18}
-	for i, n := range []int{0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15} {
+	others := []int{0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 17}
+	for i, n := range []int{2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15} {
 		if err := ca.AddSlot(n, []int{others[i], 15}); err != nil {
 			t.Fatal(err)
 		}
@@ -365,7 +352,7 @@ func TestApprovalChecked(t *testing.T) {
 	if err := ca.AddApproval(0, values, sig); err != nil {
 		t.Fatal(err)
 	}
-	if ca.Approved(values) == nil || ca.Approved(values2) != nil || len(ca.Approvals) != 1 {
+	if ca.Approved(values, nil) == nil || ca.Approved(values2, nil) != nil || len(ca.Approvals) != 1 {
 		t.Fatalf("approvals %+v", ca.Approvals)
 	}
 	if err := ca.AddApproval(0, map[int][]byte{0: make([]byte, 32)}, sig); err == nil {

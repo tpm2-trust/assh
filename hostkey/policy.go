@@ -127,22 +127,33 @@ func (f *CA) AuthorityKey() crypto.PublicKey {
 // authorityName is the Name of the authority's key as the TPM checks its
 // signatures: the key in the TPM itself, or the template of one elsewhere.
 func (f *CA) authorityName() (tpm2.TPM2BName, error) {
-	var pub tpm2.TPMTPublic
 	if f.AuthorityTPM != nil {
 		p, err := tpm2.Unmarshal[tpm2.TPMTPublic](f.AuthorityTPM.Public)
 		if err != nil {
 			return tpm2.TPM2BName{}, err
 		}
-		pub = *p
-	} else {
-		k, err := f.authorityKey()
-		if err != nil {
-			return tpm2.TPM2BName{}, err
-		}
-		if pub, err = authorityTemplate(k); err != nil {
-			return tpm2.TPM2BName{}, err
-		}
+		return objectName(*p)
 	}
+	k, err := f.authorityKey()
+	if err != nil {
+		return tpm2.TPM2BName{}, err
+	}
+	name, _, err := templateName(k)
+	return name, err
+}
+
+// templateName is a public key elsewhere as the TPM loads it to check its
+// signatures (authorityTemplate), and its Name.
+func templateName(k crypto.PublicKey) (tpm2.TPM2BName, tpm2.TPMTPublic, error) {
+	tmpl, err := authorityTemplate(k)
+	if err != nil {
+		return tpm2.TPM2BName{}, tmpl, err
+	}
+	name, err := objectName(tmpl)
+	return name, tmpl, err
+}
+
+func objectName(pub tpm2.TPMTPublic) (tpm2.TPM2BName, error) {
 	name, err := tpm2.ObjectName(&pub)
 	if err != nil {
 		return tpm2.TPM2BName{}, err
@@ -159,11 +170,11 @@ func caPolicyFor(authority tpm2.TPM2BName, policyRef []byte) []byte {
 	}.Update)
 }
 
-// pcrSelection is a slot's PCRs in the CA's bank.
-func (f *CA) pcrSelection(s *Slot) tpm2.TPMLPCRSelection {
+// selection is pcrs of bank as the TPM takes them.
+func selection(bank Bank, pcrs []int) tpm2.TPMLPCRSelection {
 	return tpm2.TPMLPCRSelection{PCRSelections: []tpm2.TPMSPCRSelection{{
-		Hash:      f.Bank.alg(),
-		PCRSelect: pcrBitmap(s.PCRs),
+		Hash:      bank.alg(),
+		PCRSelect: pcrBitmap(pcrs),
 	}}}
 }
 
@@ -189,9 +200,20 @@ func (f *CA) approvedPolicy(s *Slot, values map[int][]byte, gen uint64) ([]byte,
 	if err != nil {
 		return nil, err
 	}
+	if s.Signed != nil {
+		// PolicyAuthorize resets the session's digest: the signed PCRs'
+		// part is the key's Name alone, whatever value it signed.
+		name, _, err := s.Signed.name()
+		if err != nil {
+			return nil, err
+		}
+		if err := (tpm2.PolicyAuthorize{KeySign: name}).Update(calc); err != nil {
+			return nil, err
+		}
+	}
 	if err := (tpm2.PolicyPCR{
 		PcrDigest: tpm2.TPM2BDigest{Buffer: h.Sum(nil)},
-		Pcrs:      f.pcrSelection(s),
+		Pcrs:      selection(f.Bank, s.PCRs),
 	}).Update(calc); err != nil {
 		return nil, err
 	}

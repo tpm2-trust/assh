@@ -18,13 +18,14 @@ ASSH_CA_SLOT_0=0,2,7,15
 ASSH_CA_SLOT_1="7,15"
 ASSH_CA_WINDOW=15
 ASSH_CA_REF='my ref'
+ASSH_CA_BANK=auto
 ASSH_LISTEN=:2222
 ASSH_PRINCIPALS=host.example, 192.0.2.1
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.CA != "efi:AsshCA" || c.Window != 15 || c.PolicyRef != "my ref" || c.Listen != ":2222" || c.TPM != "/dev/tpmrm0" || c.KeyID != "assh" {
+	if c.CA != "efi:AsshCA" || c.Window != 15 || c.PolicyRef != "my ref" || c.Listen != ":2222" || c.TPM != "/dev/tpmrm0" || c.KeyID != "assh" || c.Bank != hostkey.Auto {
 		t.Fatalf("%+v", c)
 	}
 	if !slices.Equal(c.Slots[0], []int{0, 2, 7, 15}) || !slices.Equal(c.Slots[1], []int{7, 15}) || !slices.Equal(c.SlotNumbers(), []int{0, 1}) {
@@ -115,6 +116,18 @@ func TestMatch(t *testing.T) {
 	c.Slots = map[int][]int{0: {0, 2, 7, 15}, 1: {7, 15}}
 	if changed, err := c.Match(ca); err != nil || changed || len(ca.Approvals) != 2 {
 		t.Fatalf("the same: %v %v", changed, err)
+	}
+	if d := c; true {
+		d.CAType = "rsa2048,p256"
+		if changed, err := d.Match(ca); err != nil || changed {
+			t.Fatalf("a list that names the CA's type: %v %v", changed, err)
+		}
+	}
+	if d := c; true {
+		d.Bank = hostkey.Auto
+		if changed, err := d.Match(ca); err != nil || changed {
+			t.Fatalf("auto, a CA of any bank: %v %v", changed, err)
+		}
 	}
 	c.Slots = map[int][]int{0: {0, 2, 7, 11, 15}, 1: {7, 15}, 2: {0, 7, 15}}
 	if changed, err := c.Match(ca); err != nil || !changed {

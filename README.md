@@ -8,10 +8,12 @@ unencrypted boot image. It is a Go library and a command:
 | | |
 |---|---|
 | `hostkey` | the CA in the TPM, its slots and the approvals of the PCR states it signs in, the per-boot host key and its certificate - or a temporary key when no slot is approved |
-| `server` | an SSH server split in two: the side that speaks SSH runs as nobody, in namespaces of its own, under Landlock, and holds neither the key nor what a login leads to |
+| `server` | an SSH server split in two: the side that speaks SSH runs as nobody, in namespaces of its own, confined by `sandbox`, and holds neither the key nor what a login leads to |
+| `persist` | what is kept across reboots outside a file, written and removed one way for every program built on aSSH: an NV index removed only when it is provably the caller's, by its shape or name; an EFI variable (aSSH's or another vendor's) written in place and removed with its immutable mark lifted; absent is never an error |
+| `sandbox` | what a process that parses outside input takes from itself, on every thread: new privileges, executable memory, files (Landlock), the system calls that administer the machine (seccomp) |
 | `agent` | an ssh-agent socket that lends the host key to OpenSSH's sshd (`HostKeyAgent`) |
 | `tpmadmin` | what the TPM itself holds for an authority with a PIN: the PIN, the dictionary attack parameters, the lockout authorization |
-| `cmd/assh` | the command: `ca create`, `ca show`, `ca approve`, `ca pin`, `tpm da`, `serve`, `agent` |
+| `cmd/assh` | the command: `ca create`, `ca show`, `ca approve`, `ca pin`, `ca remove`, `tpm da`, `tpm sha1`, `efivar get/set/rm`, `serve`, `agent` |
 
 [tpm2-kira](https://github.com/mrwiora/tpm2-kira) uses it, as a git
 submodule, for the SSH server of its boot image.
@@ -71,8 +73,8 @@ do not cross over. No PCR - not even which PCRs - is in the policy, so the
 CA, and the clients' `known_hosts` line, stay the same through every
 change of the PCRs, and the CA can have slots.
 
-**Slots.** A CA has up to 16 slots, 0 to 15, each a PCR selection: `ca
-create --pcrs` makes slot 0, `ca slot --add N --pcrs` another. A slot
+**Slots.** A CA has up to 16 slots, 0 to 15, each a PCR selection:
+`ASSH_CA_SLOT_<N>` in assh.conf (`ca create --pcrs` for slot 0). A slot
 needs no key and no authority to be added: it lets the CA sign nothing
 until the authority approves a state in it. Which PCRs a slot reads is
 yours to choose - PCR 11 (a unified kernel image) or 14 (what an OS
@@ -127,8 +129,8 @@ that session its new state is approved for slot 0.
 `--close-pcr N` / `hostkey.Close` extends a PCR right after the host key
 is made, and the CA signs nothing more until the next boot - in the slots
 that read that PCR. So the window is the CA's: `ca create --window 15`
-records it, every slot must read PCR 15 (`ca slot --add` refuses one that
-does not), and `serve` and `agent` close it by default. 16 and 23 can be
+records it, every slot must read PCR 15 (a slot that does not is
+refused), and `serve` and `agent` close it by default. 16 and 23 can be
 reset by any process and are refused. A CA without a window is closed by
 the boot itself (tpm2-kira's: the OS separator extends PCR 0 and 7).
 
@@ -164,8 +166,8 @@ the NULL hierarchy like every host key, gone at the next reboot, and not
 certified. They log its fingerprint and, for each slot, what differs:
 
 ```
-assh: host key SHA256:… is TEMPORARY: the CA did not certify one (slot 0: PCR 7 not as approved;
-      slot 1: PCR 7 not as approved). ssh will report an unknown host key: compare its fingerprint with this one
+assh: host key SHA256:… is TEMPORARY: slot 0: PCR 7 not as approved; slot 1: PCR 7 not as
+      approved. ssh reports an unknown host key: compare its fingerprint with this one
 ```
 
 A client that trusts only the CA refuses the key (`StrictHostKeyChecking
@@ -204,8 +206,8 @@ openssl ec -in authority.key -pubout -out authority.pub
 
 # 2. On the machine: the CA. Slot 0 reads the firmware, the Secure Boot state, the
 #    kernel image (PCR 11) and the window (PCR 15); slot 1 the same but PCR 11: any OS
+echo ASSH_CA_SLOT_1=0,7,15 >>/etc/assh/assh.conf
 assh ca create --out /etc/assh/os-ca.json --authority authority.pub --pcrs 0,7,11,15 --window 15
-assh ca slot --ca /etc/assh/os-ca.json --add 1 --pcrs 0,7,15
 # -> /etc/assh/os-ca.json.pub, and the known_hosts line
 
 # 3. Approve a state of a slot: the TPM's now (no --values), or one a server recorded
@@ -255,13 +257,18 @@ device itself, after a firmware update, with nobody else involved.
 
 ```bash
 assh tpm da --new-lockout-auth --max-tries 3 --recovery 1800 --lockout-recovery 1800
+echo ASSH_CA_SLOT_1=7,15 >>/etc/assh/assh.conf                                      # any OS
 assh ca create --out /etc/assh/os-ca.json --authority-tpm --pcrs 7,14,15 --window 15   # asks for the PIN twice
-assh ca slot --ca /etc/assh/os-ca.json --add 1 --pcrs 7,15                             # any OS
 assh ca approve --ca /etc/assh/os-ca.json --slot 0,1                      # this state, both slots; asks for the PIN once
 # after the PCRs changed, booted in the new state: approve what the agent
 # recorded, and revoke every approval before it - of every slot
 assh ca approve --ca /etc/assh/os-ca.json --slot 0,1 --values /run/assh/agent.pcrs.json --next-generation
+# a move ahead: approve a state before it is booted - PCR 15 as another
+# combination's boot leaves it, from zero - with the next generation
+assh ca approve --ca /etc/assh/os-ca.json --values /run/assh/agent.pcrs.json \
+    --events 15:combination:b --events 15:sealed --next-generation
 assh ca pin --ca /etc/assh/os-ca.json                                     # change the PIN
+assh ca remove --ca /etc/assh/os-ca.json   # the CA, its PIN index and counter (owner, no PIN)
 assh tpm da --ask-lockout-auth --reset                                    # end a lockout
 ```
 
@@ -301,6 +308,55 @@ from working.
 without one any process may reset the lockout and try PINs without end.
 `ca create --authority-tpm` refuses a TPM without one (`assh tpm da
 --new-lockout-auth`). It is also what clears the TPM.
+
+## PCRs a build signs: updates without an approval
+
+A slot can take PCRs from a key elsewhere instead of from an approval: the signature of
+systemd's build for PCR 11 of a unified kernel image, one per boot phase (`systemd-measure
+sign`; the UKI's `.pcrsig`, on the running system `/run/systemd/tpm2-pcr-signature.json`). The
+slot's approval then holds the other PCRs and the key; the key vouches for PCR 11:
+
+```
+PolicyPCR(11) ; PolicyAuthorize(the build's key)        the TPM checks the build's signature
+; PolicyPCR(the slot's PCRs) ; PolicyNV(counter)         the approval, as any other
+```
+
+A new build carries its own signature, so the slot stays met after an update: nobody
+approves anything. Settings: `ASSH_CA_SLOT_<N>_SIGNED=11`, `ASSH_PCR_KEY` (the key, PEM; RSA
+with 2048 bits, which every TPM checks), `ASSH_PCR_SIGNATURE` (where `agent` and `serve` read
+the signatures). The certificate's key ID names them (`slot=0 pcrs=0,2,7,15 signed=11`).
+Every image the key signed meets the slot, an old one too.
+
+## An authority for the creation alone
+
+`ca create --authority-once` (`ASSH_AUTHORITY_ONCE=yes`) makes the authority in the TPM under
+the NULL hierarchy, has it approve every slot - for the values the TPM holds, a recorded state
+(`--values`), PCRs calculated from their events (`--events PCR:EVENT`, as `ca approve`) - and
+flushes it; the NULL hierarchy's seed is new at the next boot anyway. Nobody can approve
+another state after: no PIN to guess, no key to steal, nothing root can do. What the
+approvals do not cover - another combination, firmware changed in a slot without signed PCRs
+- gets a temporary key until the CA is made again. With signed PCRs, updates need nothing.
+
+## The SHA-1 bank
+
+A CA reads one PCR bank. `sha256` and `sha1` name it; `auto` takes SHA-256
+where the TPM has that bank active, and SHA-1 only on a TPM whose firmware
+activates nothing else (an old ThinkPad's) and only while the TPM allows it:
+
+```bash
+assh tpm sha1            # the active banks, whether sha1 is allowed, what auto is
+assh tpm sha1 --allow    # NV index 0x01802914, defined by the owner
+assh tpm sha1 --forbid
+```
+
+With `auto`, the agent and `serve` on such a TPM, without the index, serve a
+temporary key and record nothing, `ca create` refuses, and a CA that reads
+SHA-1 certifies nothing after `--forbid`. The index holds nothing and is not
+signed: where SHA-256 is active it changes nothing, and which banks are
+active only the firmware decides (TPM2_PCR_Allocate needs the platform
+hierarchy). SHA-1 is the weaker hash: a collision helps an attacker who
+chose both inputs, and the values a slot reads come from firmware, signed
+images and Secure Boot variables, not from them.
 
 ## The CA in an EFI variable
 
@@ -404,30 +460,34 @@ ASSH_PRINCIPALS=host.example,192.0.2.10
 |---|---|---|
 | `ASSH_TPM` | `--tpm` | `/dev/tpmrm0` |
 | `ASSH_CA` | `--ca`, `ca create --out` | - (a file, or `efi:NAME`) |
-| `ASSH_CA_TYPE`, `ASSH_CA_BANK` | `ca create --type`, `--bank` | `p256`, `sha256` |
-| `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0), `ca slot --add N --pcrs` | slot 0 `0,7` |
+| `ASSH_CA_TYPE`, `ASSH_CA_BANK` | `ca create --type` (`p256`, `rsa2048`, or a list in order of preference, `rsa2048,p256`: the first the TPM takes), `--bank` (`sha256`, `sha1`, `auto`) | `p256`, `sha256` |
+| `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0) | slot 0 `0,7` |
 | `ASSH_CA_WINDOW`, `ASSH_CA_REF` | `ca create --window`, `--ref` | none, `assh` |
-| `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM` | `ca create --authority`, `--authority-tpm` (`yes`/`no`) | - |
+| `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM`, `ASSH_AUTHORITY_ONCE` | `ca create --authority`, `--authority-tpm`, `--authority-once` (`yes`/`no`) | - |
+| `ASSH_CA_SLOT_<N>_SIGNED`, `ASSH_PCR_KEY`, `ASSH_PCR_SIGNATURE` | PCRs of slot N a key signs, the key (PEM), its signatures (systemd's JSON) | - |
 | `ASSH_PIN_HANDLE`, `ASSH_COUNTER_HANDLE` | `--pin-handle`, `--counter-handle` | `0x01802913`, `0x01802912` |
-| `ASSH_HOSTKEY_TYPE`, `ASSH_PRINCIPALS`, `ASSH_KEY_ID` | `--key-type`, `--principals`, `--key-id` | `p256`, `*`, `assh` |
+| `ASSH_HOSTKEY_TYPE`, `ASSH_PRINCIPALS`, `ASSH_KEY_ID` | `--key-type` (as `ASSH_CA_TYPE`, a list too), `--principals`, `--key-id` | `p256`, `*`, `assh` |
 | `ASSH_CLOSE_PCR`, `ASSH_STATE` | `--close-pcr`, `--state` | the CA's window, the command's own |
 | `ASSH_LISTEN`, `ASSH_AUTHORIZED_KEYS`, `ASSH_USER`, `ASSH_SOCKET` | `serve --listen`, `--authorized-keys`, `--user`, `--socket` | `:22` |
 | `ASSH_AGENT_DIR`, `ASSH_AGENT_UID` | `agent --dir`, `--uid` | `/run/assh`, `0` |
 
 - **The slots follow the file.** `ca create` makes every slot the file
-  names; `ca sync` makes an existing CA's slots the file's: a slot added
-  is added (it signs nothing until approved), one taken away goes with its
-  approvals, one whose PCRs changed is replaced and loses its approvals.
-  The CA stays - a slot is a PCR selection, not a key - and so does its
+  names; after an edit every command takes the file's slots as they are -
+  `agent` and `serve` at their next start, nothing to run: a slot added
+  signs nothing until approved, one taken away or whose PCRs changed
+  loses its approvals. The CA file keeps what it has until a command saves
+  the CA (`ca approve`), so an edit undone brings the approvals back. The
+  CA stays - a slot is a PCR selection, not a key - and so does its
   `known_hosts` line. `ca approve` without `--slot` approves every slot
   of the file.
 - **What only a new CA changes:** the window, the key type, the bank and
-  the ref are the CA's for good; `ca sync` refuses a file that differs.
+  the ref are the CA's for good; a file that differs in them is not
+  applied (the CA's own slots, and a warning).
 - **Nothing in it is secret or trusted.** It says what the CA should look
   like; the TPM checks the CA and its approvals. No PIN goes into it (the
   PIN comes from a terminal or `--pin-fd`).
 - **For other programs:** `config.Load`, `config.Write` (keeps comments
-  and unknown lines), `Config.Match` (`ca sync`). tpm2-kira keeps its
+  and unknown lines), `Config.Match` (what every command applies). tpm2-kira keeps its
   SSH server's settings in such a file.
 
 ## Serving: `assh serve` and `assh agent`
@@ -481,17 +541,26 @@ assh agent --config /etc/assh/assh.conf   # systemd/assh-agent.service; closes t
 
 ```
 # /etc/ssh/sshd_config.d/assh.conf
-HostKey         /run/assh/host.pub
-HostCertificate /run/assh/host-cert.pub
-HostKeyAgent    /run/assh/agent.sock
+Include /run/assh/sshd.conf
 ```
 
-The agent answers root alone (sshd) and offers rsa-sha2-256 and -512 for
-an RSA key (never SHA-1's ssh-rsa; SHA-512 where the TPM has it). It
-cannot be restarted within a boot (the window is closed); sshd can. With
-a temporary key it writes `host.pub` and no `host-cert.pub`: sshd logs
-"Could not load host certificate" and serves the key without one, so the
-configuration above stays as it is.
+A certificate's key ID names the slot it was certified through and that slot's PCRs
+(`assh slot=1 pcrs=7,15`): a person sees in `ssh -v` ("Server host certificate") whether the
+boot was approved exactly or through a looser slot. It is information, signed with the rest:
+whoever must rely on the state checks it himself (a quote, an unlock that the TPM binds).
+
+The agent writes `status` beside its socket, for anyone to read (a login message, a
+prompt): `key=`, `certified=yes|no`, and `slot=`, `key_id=`, `ca=` or `why=`.
+
+The agent writes `sshd.conf` beside its socket: `HostKey`,
+`HostCertificate` (only when the CA certified the key), `HostKeyAgent`
+and `HostKeyAlgorithms` - what the TPM signs in, the certificate's first.
+For an RSA key that is rsa-sha2-256, and rsa-sha2-512 only where the TPM
+has SHA-512 (never SHA-1's ssh-rsa): sshd asks the agent for the
+algorithm a client picks, and a signature the TPM cannot make (an old
+TPM: `TPM_RC_SIZE`) drops the connection. The agent answers root alone
+(sshd). It cannot be restarted within a boot (the window is closed);
+sshd can.
 
 ## The library
 
@@ -567,12 +636,13 @@ efivarfs itself is used (tpm2-kira's and safearch's VM runs).
   then fails about one time in eight. Move to the first release with the
   fix.
 - **assh builds with a fork of go-tpm** (`replace` in go.mod,
-  github.com/mrwiora/go-tpm): it adds TPM2_NV_ChangeAuth and
-  TPM2_DictionaryAttackLockReset, and checks the response of a command that
-  changes an authorization value with the new value. Only `tpmadmin` needs
-  it; a program that uses `hostkey` without `tpmadmin` (tpm2-kira) builds
-  with go-tpm as released. Drop the replace once upstream has them.
+  github.com/mrwiora/go-tpm, the branch of google/go-tpm#452): it adds
+  TPM2_NV_ChangeAuth and checks the response of a command that changes an
+  authorization value with the new value; TPM2_DictionaryAttackLockReset
+  comes from upstream (#450), which the fork is based on. Only `tpmadmin`
+  needs it; a program that uses `hostkey` without `tpmadmin` (tpm2-kira)
+  builds with go-tpm as required. Drop the replace once upstream has #452.
 - **RSA-2048 host keys** sign rsa-sha2-256 in `serve` (many TPMs lack
-  SHA-512); the agent offers rsa-sha2-512 too and fails it on such a TPM -
-  set sshd's `HostKeyAlgorithms` then, or use P-256.
+  SHA-512); the agent's `sshd.conf` offers rsa-sha2-512 only where the TPM
+  has it.
 - **A cleared TPM loses the CA** (above): there is no backup of it.

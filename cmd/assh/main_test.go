@@ -165,15 +165,20 @@ func TestCommand(t *testing.T) {
 	ca := filepath.Join(dir, "ca.json")
 	tpm := "--tpm=" + sw.Sock
 
-	out := run(t, "ca", "create", tpm, "--out", ca, "--authority", filepath.Join(dir, "auth.pub"), "--pcrs", "0,7,15", "--window", "15")
-	if !strings.Contains(out, "@cert-authority * ecdsa-sha2-nistp256 ") || !strings.Contains(out, "window: PCR 15") {
-		t.Fatalf("create:\n%s", out)
+	slot1 := func(pcrs string) string {
+		conf := filepath.Join(dir, "slot1-"+pcrs+".conf")
+		if err := os.WriteFile(conf, []byte("ASSH_CA_SLOT_1="+pcrs+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return "--config=" + conf
 	}
-	if out, err := assh("ca", "slot", "--ca", ca, "--add", "1", "--pcrs", "0,7").CombinedOutput(); err == nil || !strings.Contains(string(out), "the window would not close it") {
+	create := []string{"ca", "create", tpm, "--authority", filepath.Join(dir, "auth.pub"), "--pcrs", "0,7,15", "--window", "15"}
+	if out, err := assh(append(create, slot1("0,7"), "--out", filepath.Join(dir, "other.json"))...).CombinedOutput(); err == nil || !strings.Contains(string(out), "the window would not close it") {
 		t.Fatalf("a slot without the window: %v\n%s", err, out)
 	}
-	if out := run(t, "ca", "slot", "--ca", ca, "--add", "1", "--pcrs", "7,15"); !strings.Contains(out, "slot 1: signs while PCR 7 and 15") {
-		t.Fatalf("slot --add:\n%s", out)
+	out := run(t, append(create, slot1("7,15"), "--out", ca)...)
+	if !strings.Contains(out, "@cert-authority * ecdsa-sha2-nistp256 ") || !strings.Contains(out, "window: PCR 15") || !strings.Contains(out, "slot 1: signs while PCR 7 and 15") {
+		t.Fatalf("create:\n%s", out)
 	}
 	if out, err := assh("ca", "approve", tpm, "--ca", ca, "--slot", "0,1", "--digest", filepath.Join(dir, "d")).CombinedOutput(); err == nil || !strings.Contains(string(out), "for one slot") {
 		t.Fatalf("a digest for two slots: %v\n%s", err, out)
@@ -181,7 +186,6 @@ func TestCommand(t *testing.T) {
 	if out := run(t, "ca", "approve", tpm, "--ca", ca, "--slot", "0,1", "--authority-key", filepath.Join(dir, "auth.key")); !strings.Contains(out, "Approved in slots 0 and 1: 2 state(s)") {
 		t.Fatalf("approve two slots:\n%s", out)
 	}
-	run(t, "ca", "slot", "--ca", ca, "--remove", "1")
 	for _, bad := range []string{"0,0", "0,3", "x"} {
 		if out, err := assh("ca", "approve", tpm, "--ca", ca, "--slot", bad, "--authority-key", filepath.Join(dir, "auth.key")).CombinedOutput(); err == nil {
 			t.Fatalf("--slot %s: %s", bad, out)
@@ -238,7 +242,7 @@ func TestCommand(t *testing.T) {
 		"-pkeyopt", "digest:sha256", "-in", digest, "-out", sig).CombinedOutput(); err != nil {
 		t.Fatalf("openssl: %v %s", err, out)
 	}
-	if out := run(t, "ca", "approve", tpm, "--ca", ca, "--values", state+".2", "--signature", sig); !strings.Contains(out, "Approved in slot 0: 2 state(s)") {
+	if out := run(t, "ca", "approve", tpm, "--ca", ca, "--values", state+".2", "--signature", sig); !strings.Contains(out, "Approved in slot 0: 3 state(s)") {
 		t.Fatalf("approve:\n%s", out)
 	}
 
@@ -290,10 +294,10 @@ func TestCommand(t *testing.T) {
 }
 
 // assh.conf in place of the flags: 'ca create' makes every slot it names,
-// 'ca approve' approves them all, 'ca sync' follows the file's slots after
-// an edit, and 'serve' takes its CA, address, keys and certificate name
-// from it; a flag given wins over the file, and a --config file that is
-// not there is an error.
+// 'ca approve' approves them all, every command takes the file's slots
+// after an edit (the CA file stays as it is), and 'serve' takes its CA,
+// address, keys and certificate name from it; a flag given wins over the
+// file, and a --config file that is not there is an error.
 func TestConfig(t *testing.T) {
 	for _, tool := range []string{"ssh", "ssh-keygen"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -341,11 +345,13 @@ ASSH_STATE=%s
 		t.Fatalf("approve:\n%s", out)
 	}
 	write("0,7,15")
-	if out := run(t, "ca", "sync", "--config", conf); !strings.Contains(out, "slot 1: signs while PCR 0, 7 and 15 (sha256) hold an approved state; 0 approved") || !strings.Contains(out, "slot 0: signs while PCR 0, 2, 7 and 15 (sha256) hold an approved state; 1 approved") {
-		t.Fatalf("sync:\n%s", out)
+	for range 2 {
+		if out := run(t, "ca", "show", "--config", conf); !strings.Contains(out, "the CA's slots are assh.conf's") || !strings.Contains(out, "slot 1: signs while PCR 0, 7 and 15 (sha256) hold an approved state; 0 approved") || !strings.Contains(out, "slot 0: signs while PCR 0, 2, 7 and 15 (sha256) hold an approved state; 1 approved") {
+			t.Fatalf("show after the edit:\n%s", out)
+		}
 	}
-	if out := run(t, "ca", "sync", "--config", conf); !strings.Contains(out, "assh.conf's already") {
-		t.Fatalf("sync again:\n%s", out)
+	if b, _ := os.ReadFile(ca); !strings.Contains(string(b), `"slot": 1`) || strings.Count(string(b), `"signature"`) != 2 {
+		t.Fatalf("the CA file changed: %s", b)
 	}
 	if out, err := assh("ca", "show", "--config", conf, "--ca", filepath.Join(dir, "none.json")).CombinedOutput(); err == nil || !strings.Contains(string(out), "none.json") {
 		t.Fatalf("--ca wins: %v\n%s", err, out)
@@ -360,7 +366,7 @@ ASSH_STATE=%s
 		t.Fatalf("serve:\n%s", srv.String())
 	}
 	cert, ok := offeredKey(t, port).(*ssh.Certificate)
-	if !ok || cert.KeyId != "configured host" {
+	if !ok || cert.KeyId != "configured host slot=0 pcrs=0,2,7,15" {
 		t.Fatalf("the host certificate: %v", cert)
 	}
 	pub, _ := os.ReadFile(ca + ".pub")

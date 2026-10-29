@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/tpm2-trust/assh/persist"
 )
 
 // An authority in the TPM: three objects, nothing secret outside it.
@@ -130,9 +131,7 @@ func policyDigest(update ...func(*tpm2.PolicyCalculator) error) []byte {
 // PINIndexBranches are the branches of the PIN index's PolicyOR: its one
 // increment (PolicyCommandCode(NV_Increment) ; PolicyNvWritten(NO)), and a
 // PIN change (PolicyCommandCode(NV_ChangeAuth) ; PolicyAuthValue).
-func PINIndexBranches() tpm2.TPMLDigest { return pinBranches() }
-
-func pinBranches() tpm2.TPMLDigest {
+func PINIndexBranches() tpm2.TPMLDigest {
 	inc := policyDigest(
 		tpm2.PolicyCommandCode{Code: tpm2.TPMCCNVIncrement}.Update,
 		tpm2.PolicyNVWritten{WrittenSet: false}.Update)
@@ -153,7 +152,7 @@ func pinIndexPublic(h tpm2.TPMHandle) tpm2.TPMSNVPublic {
 			AuthRead:    true, // PolicySecret(P) proves its authorization value
 			OwnerRead:   true, // PolicyNV(P == k) reads it without the PIN
 		},
-		AuthPolicy: tpm2.TPM2BDigest{Buffer: policyDigest(tpm2.PolicyOr{PHashList: pinBranches()}.Update)},
+		AuthPolicy: tpm2.TPM2BDigest{Buffer: policyDigest(tpm2.PolicyOr{PHashList: PINIndexBranches()}.Update)},
 		DataSize:   8,
 	}
 }
@@ -214,18 +213,6 @@ func pinError(err error) error {
 	return err
 }
 
-func readNVPublic(t transport.TPM, h tpm2.TPMHandle) (*tpm2.TPMSNVPublic, tpm2.TPM2BName, error) {
-	rsp, err := tpm2.NVReadPublic{NVIndex: h}.Execute(t)
-	if err != nil {
-		return nil, tpm2.TPM2BName{}, err
-	}
-	pub, err := rsp.NVPublic.Contents()
-	if err != nil {
-		return nil, tpm2.TPM2BName{}, err
-	}
-	return pub, rsp.NVName, nil
-}
-
 func readCount(t transport.TPM, h tpm2.TPMHandle, name tpm2.TPM2BName, auth tpm2.AuthHandle) (uint64, error) {
 	rsp, err := tpm2.NVRead{AuthHandle: auth, NVIndex: tpm2.NamedHandle{Handle: h, Name: name}, Size: 8}.Execute(t)
 	if err != nil {
@@ -275,7 +262,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	if o.PINHandle == o.CounterHandle {
 		return nil, errors.New("the PIN index and the counter need two handles")
 	}
-	ca, err = newCA(o.CAOptions)
+	ca, err = newCA(t, o.CAOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +275,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 		return nil, errors.New("the TPM has no lockout authorization: anyone could reset its dictionary attack lockout and try PINs without end; set one first")
 	}
 	for _, h := range []tpm2.TPMHandle{o.PINHandle, o.CounterHandle} {
-		if _, _, err := readNVPublic(t, h); err == nil {
+		if _, _, err := persist.ReadNVPublic(t, h); err == nil {
 			return nil, fmt.Errorf("NV handle 0x%08X is in use", uint32(h))
 		}
 	}
@@ -311,7 +298,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	defer func() {
 		if err != nil {
 			for _, pub := range defined {
-				undefine(t, pub.NVIndex)
+				persist.RemoveNV(t, pub.NVIndex, persist.Shaped(pub))
 			}
 		}
 	}()
@@ -370,48 +357,15 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 		return nil, err
 	}
 
-	name, err := tpm2.ObjectName(aPub)
-	if err != nil {
+	if err := ca.makeKey(t, p); err != nil {
 		return nil, err
 	}
-	tmpl, err := keyTemplate(o.Type, caPolicyFor(*name, o.PolicyRef))
-	if err != nil {
-		return nil, err
-	}
-	key, err := createKey(t, p, tmpl, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating the %s CA in the TPM: %w", o.Type, err)
-	}
-	pub, err := key.OutPublic.Contents()
-	if err != nil {
-		return nil, err
-	}
-	ca.Public, ca.Private = tpm2.Marshal(pub), key.OutPrivate.Buffer
 	return ca, nil
-}
-
-func undefine(t transport.TPM, h tpm2.TPMHandle) error {
-	_, name, err := readNVPublic(t, h)
-	if err != nil {
-		return err
-	}
-	_, err = tpm2.NVUndefineSpace{AuthHandle: tpm2.TPMRHOwner, NVIndex: tpm2.NamedHandle{Handle: h, Name: name}}.Execute(t)
-	return err
-}
-
-// policySession starts a policy session that is flushed whatever happens
-// (go-tpm leaves a session loaded when a policy callback fails).
-func policySession(t transport.TPM) (tpm2.Session, func(), error) {
-	s, done, err := tpm2.PolicySession(t, tpm2.TPMAlgSHA256, 16)
-	if err != nil {
-		return nil, nil, err
-	}
-	return s, func() { done() }, nil
 }
 
 // incrementPINIndex is P's one increment, which needs no PIN.
 func incrementPINIndex(t transport.TPM, pub tpm2.TPMSNVPublic) error {
-	s, done, err := policySession(t)
+	s, done, err := tpm2.PolicySession(t, tpm2.TPMAlgSHA256, 16)
 	if err != nil {
 		return err
 	}
@@ -423,7 +377,7 @@ func incrementPINIndex(t transport.TPM, pub tpm2.TPMSNVPublic) error {
 	if _, err := (tpm2.PolicyNVWritten{PolicySession: h, WrittenSet: false}).Execute(t); err != nil {
 		return err
 	}
-	if _, err := (tpm2.PolicyOr{PolicySession: h, PHashList: pinBranches()}).Execute(t); err != nil {
+	if _, err := (tpm2.PolicyOr{PolicySession: h, PHashList: PINIndexBranches()}).Execute(t); err != nil {
 		return err
 	}
 	name := nvName(pub)
@@ -460,7 +414,7 @@ func (f *CA) checkPINIndex(t transport.TPM) (tpm2.TPMSNVPublic, uint64, error) {
 		return pub, k, err
 	}
 	gone := fmt.Errorf("the PIN index at 0x%08X is not the CA's (deleted or replaced): no approval can be made any more; create the CA again", uint32(pub.NVIndex))
-	_, name, err := readNVPublic(t, pub.NVIndex)
+	_, name, err := persist.ReadNVPublic(t, pub.NVIndex)
 	if err != nil || !bytes.Equal(name.Buffer, nvName(pub).Buffer) {
 		return pub, k, gone
 	}
@@ -553,7 +507,7 @@ func (a *tpmAuthority) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 		return nil, fmt.Errorf("the authority does not load in this TPM: %w", err)
 	}
 	defer flush(t, key.ObjectHandle)
-	s, done, err := policySession(t)
+	s, done, err := tpm2.PolicySession(t, tpm2.TPMAlgSHA256, 16)
 	if err != nil {
 		return nil, err
 	}
@@ -594,7 +548,7 @@ func (f *CA) Generation(t transport.TPM) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, name, err := readNVPublic(t, pub.NVIndex)
+	_, name, err := persist.ReadNVPublic(t, pub.NVIndex)
 	if err != nil || !bytes.Equal(name.Buffer, nvName(pub).Buffer) {
 		return 0, &counterGoneError{pub.NVIndex}
 	}
@@ -621,7 +575,7 @@ func (f *CA) incrementCounter(t transport.TPM, p *primary, now tpm2.TPMSNVPublic
 	if err != nil {
 		return err
 	}
-	s, done, err := policySession(t)
+	s, done, err := tpm2.PolicySession(t, tpm2.TPMAlgSHA256, 16)
 	if err != nil {
 		return err
 	}
@@ -653,7 +607,7 @@ func (f *CA) NextGeneration(t transport.TPM, pin PIN) error {
 	if _, _, err := f.checkPINIndex(t); err != nil {
 		return err
 	}
-	now, name, err := readNVPublic(t, gPub.NVIndex)
+	now, name, err := persist.ReadNVPublic(t, gPub.NVIndex)
 	unwritten := gPub
 	unwritten.Attributes.Written = false
 	switch {
@@ -707,10 +661,11 @@ func (f *CA) RedefineCounter(t transport.TPM, pin PIN) error {
 	if err := checkGate(t, p, pPub, k, b); err != nil {
 		return err
 	}
-	if _, _, err := readNVPublic(t, gPub.NVIndex); err == nil {
-		if err := undefine(t, gPub.NVIndex); err != nil {
-			return fmt.Errorf("removing what is at 0x%08X: %w", uint32(gPub.NVIndex), err)
-		}
+	// Whatever is at the counter's handle goes, of any shape: the handle
+	// is the CA's, and replacing what an attacker put there is what this
+	// is for - with the PIN proven above, never without.
+	if _, err := persist.RemoveNV(t, gPub.NVIndex, func(*tpm2.TPMSNVPublic, tpm2.TPM2BName) bool { return true }); err != nil {
+		return fmt.Errorf("removing what is at 0x%08X: %w", uint32(gPub.NVIndex), err)
 	}
 	unwritten := gPub
 	unwritten.Attributes.Written = false
@@ -725,7 +680,7 @@ func (f *CA) RedefineCounter(t transport.TPM, pin PIN) error {
 
 // checkGate proves the PIN to P and nothing else: a wrong one counts.
 func checkGate(t transport.TPM, p *primary, pub tpm2.TPMSNVPublic, k uint64, pin []byte) error {
-	s, done, err := policySession(t)
+	s, done, err := tpm2.PolicySession(t, tpm2.TPMAlgSHA256, 16)
 	if err != nil {
 		return err
 	}

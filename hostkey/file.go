@@ -49,9 +49,11 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/google/go-tpm/tpm2"
+	"github.com/tpm2-trust/assh/persist"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -63,15 +65,35 @@ const (
 	RSA2048 Type = "rsa2048" // RSA with 2048 bits, ssh's rsa-sha2-256
 )
 
-// ParseType reads a type as a person writes it.
+// ParseType reads a type as a person writes it, or a list of them in order
+// of preference ("rsa2048,p256"): a key is made with the first the TPM
+// accepts (ResolveType).
 func ParseType(s string) (Type, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "p256", "p-256", "ecdsa", "nistp256":
-		return P256, nil
-	case "rsa2048", "rsa-2048", "rsa":
-		return RSA2048, nil
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		var t Type
+		switch strings.ToLower(strings.TrimSpace(p)) {
+		case "p256", "p-256", "ecdsa", "nistp256":
+			t = P256
+		case "rsa2048", "rsa-2048", "rsa":
+			t = RSA2048
+		default:
+			return "", fmt.Errorf("unknown key type %q (p256 or rsa2048, or a list of them)", p)
+		}
+		if !slices.Contains(out, string(t)) {
+			out = append(out, string(t))
+		}
 	}
-	return "", fmt.Errorf("unknown key type %q (p256 or rsa2048)", s)
+	return Type(strings.Join(out, ",")), nil
+}
+
+// Choices are the types of t, a list's in order.
+func (t Type) Choices() []Type {
+	var out []Type
+	for _, p := range strings.Split(string(t), ",") {
+		out = append(out, Type(p))
+	}
+	return out
 }
 
 // Bank is a PCR bank the CA's policy reads.
@@ -80,6 +102,9 @@ type Bank string
 const (
 	SHA256 Bank = "sha256"
 	SHA1   Bank = "sha1"
+	// Auto is SHA-256 where the TPM has it active, else SHA-1 where the TPM
+	// allows it (ResolveBank); a CA is made with the bank it resolves to.
+	Auto Bank = "auto"
 )
 
 // ParseBank reads a bank name.
@@ -89,8 +114,10 @@ func ParseBank(s string) (Bank, error) {
 		return SHA256, nil
 	case "sha1":
 		return SHA1, nil
+	case "auto":
+		return Auto, nil
 	}
-	return "", fmt.Errorf("unknown PCR bank %q (sha256 or sha1)", s)
+	return "", fmt.Errorf("unknown PCR bank %q (sha256, sha1 or auto)", s)
 }
 
 func (b Bank) alg() tpm2.TPMAlgID {
@@ -149,8 +176,9 @@ type CA struct {
 // policy names no PCR, so a slot needs no key of its own: it is worth
 // nothing until the authority approves a state in it.
 type Slot struct {
-	Number int   `json:"slot"`
-	PCRs   []int `json:"pcrs"`
+	Number int     `json:"slot"`
+	PCRs   []int   `json:"pcrs"`
+	Signed *Signed `json:"signed,omitempty"` // PCRs a key elsewhere signs, besides the approved ones
 }
 
 // Approval is a PCR state of a slot the authority signed: the CA signs
@@ -181,8 +209,8 @@ func (a Approval) Equal(b *Approval) bool {
 func LoadCA(path string) (*CA, error) {
 	var data []byte
 	var err error
-	if IsVar(path) {
-		data, err = readVar(path)
+	if persist.IsVar(path) {
+		data, err = persist.ReadVar(path)
 	} else {
 		data, err = os.ReadFile(path)
 	}
@@ -239,12 +267,12 @@ func (f *CA) Marshal() ([]byte, error) {
 // at path: written beside it and renamed, so a reader never sees half. An
 // EFI variable ("efi:NAME") is written compact, in one piece.
 func (f *CA) Save(path string) error {
-	if IsVar(path) {
+	if persist.IsVar(path) {
 		b, err := json.Marshal(f)
 		if err != nil {
 			return err
 		}
-		return writeVar(path, b)
+		return persist.WriteVar(path, b)
 	}
 	b, err := f.Marshal()
 	if err != nil {
@@ -345,14 +373,18 @@ func (f *CA) FileGeneration() uint64 {
 
 // Approved is the approval that lets the CA sign when the PCRs hold
 // values, at the file's generation: the first slot's that has one, nil
-// when there is none.
-func (f *CA) Approved(values map[int][]byte) *Approval {
-	return f.approvedAt(values, f.FileGeneration())
+// when there is none. A slot with signed PCRs counts only where sigs has
+// the signature of their values.
+func (f *CA) Approved(values map[int][]byte, sigs PCRSignatures) *Approval {
+	return f.approvedAt(values, f.FileGeneration(), sigs)
 }
 
 // approvedAt scans the slots from the lowest number up.
-func (f *CA) approvedAt(values map[int][]byte, gen uint64) *Approval {
+func (f *CA) approvedAt(values map[int][]byte, gen uint64, sigs PCRSignatures) *Approval {
 	for _, s := range f.Slots {
+		if !f.signedMet(&s, values, sigs) {
+			continue
+		}
 		for i := range f.Approvals {
 			a := &f.Approvals[i]
 			if a.Slot == s.Number && a.Generation == gen && sameValues(s.PCRs, a.PCRs, values) {
@@ -388,7 +420,11 @@ func (f *CA) PCRs() []int {
 	seen := map[int]bool{}
 	var out []int
 	for _, s := range f.Slots {
-		for _, p := range s.PCRs {
+		pcrs := s.PCRs
+		if s.Signed != nil {
+			pcrs = append(slices.Clone(pcrs), s.Signed.PCRs...)
+		}
+		for _, p := range pcrs {
 			if !seen[p] {
 				seen[p] = true
 				out = append(out, p)
@@ -397,6 +433,21 @@ func (f *CA) PCRs() []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+// SetSigned gives slot n PCRs a key elsewhere signs (nil: none). Its
+// approvals go: they named the key.
+func (f *CA) SetSigned(n int, s *Signed) error {
+	i := slices.IndexFunc(f.Slots, func(x Slot) bool { return x.Number == n })
+	if i < 0 {
+		return fmt.Errorf("no slot %d", n)
+	}
+	if s != nil && slices.ContainsFunc(s.PCRs, func(p int) bool { return slices.Contains(f.Slots[i].PCRs, p) }) {
+		return fmt.Errorf("slot %d reads %s itself: a PCR is approved or signed, not both", n, PCRList(f.Slots[i].PCRs))
+	}
+	f.Slots[i].Signed = s
+	f.Approvals = slices.DeleteFunc(f.Approvals, func(a Approval) bool { return a.Slot == n })
+	return nil
 }
 
 // AddSlot gives the CA slot n, reading pcrs. It needs no authority: the
@@ -420,33 +471,14 @@ func (f *CA) AddSlot(n int, pcrs []int) error {
 	return nil
 }
 
-// RemoveSlot takes slot n and its approvals away. The last slot stays: a
-// CA without one never signs.
-func (f *CA) RemoveSlot(n int) error {
-	if f.Slot(n) == nil {
-		return fmt.Errorf("no slot %d", n)
-	}
-	if len(f.Slots) == 1 {
-		return errors.New("the CA's last slot: a CA without one never signs")
-	}
-	f.Slots = slices.DeleteFunc(f.Slots, func(s Slot) bool { return s.Number == n })
-	f.Approvals = slices.DeleteFunc(f.Approvals, func(a Approval) bool { return a.Slot == n })
-	return nil
-}
-
 func newSlot(n int, pcrs []int, window int) (Slot, error) {
 	if n < 0 || n >= MaxSlots {
 		return Slot{}, fmt.Errorf("slot %d: the slots are 0 to %d", n, MaxSlots-1)
 	}
-	if len(pcrs) == 0 {
-		return Slot{}, fmt.Errorf("slot %d reads no PCR", n)
-	}
 	pcrs = slices.Clone(pcrs)
 	sort.Ints(pcrs)
-	for i, p := range pcrs {
-		if p < 0 || p > 23 || (i > 0 && pcrs[i-1] == p) {
-			return Slot{}, fmt.Errorf("slot %d: not a PCR selection: %v", n, pcrs)
-		}
+	if err := checkSelection(pcrs); err != nil {
+		return Slot{}, fmt.Errorf("slot %d: %w", n, err)
 	}
 	if window != 0 && !slices.Contains(pcrs, window) {
 		return Slot{}, fmt.Errorf("slot %d does not read PCR %d, the window: the window would not close it", n, window)
@@ -454,11 +486,25 @@ func newSlot(n int, pcrs []int, window int) (Slot, error) {
 	return Slot{Number: n, PCRs: pcrs}, nil
 }
 
-// checkWindow makes sure pcr can be the window: one a boot cannot reset
-// (16 and 23 can), and not the firmware's PCR 0, which 0 means none of.
+// checkSelection makes sure pcrs are PCRs, each once, in order.
+func checkSelection(pcrs []int) error {
+	if len(pcrs) == 0 {
+		return errors.New("no PCR")
+	}
+	for i, p := range pcrs {
+		if p < 0 || p > 23 || (i > 0 && pcrs[i-1] >= p) {
+			return fmt.Errorf("not a PCR selection: %v", pcrs)
+		}
+	}
+	return nil
+}
+
+// checkWindow makes sure pcr can be the window, the PCR whose extension
+// closes the CA: one no process can reset (16 and 23 can; a reset reopens
+// it). A CA's window 0 means none.
 func checkWindow(pcr int) error {
 	if pcr < 0 || pcr > 23 || pcr == 16 || pcr == 23 {
-		return fmt.Errorf("PCR %d cannot be the window (1 to 22, not 16: a window must not be reset)", pcr)
+		return fmt.Errorf("PCR %d cannot close the CA (0 to 22, not 16: any process can reset 16 and 23)", pcr)
 	}
 	return nil
 }
@@ -477,11 +523,19 @@ func (f *CA) checkSlots() error {
 		if i > 0 && f.Slots[i-1].Number >= s.Number {
 			return errors.New("the slots are not in order")
 		}
+		if err := checkSelection(s.PCRs); err != nil {
+			return fmt.Errorf("slot %d: %w", s.Number, err)
+		}
 		if _, err := newSlot(s.Number, s.PCRs, f.Window); err != nil {
 			return err
 		}
-		if !slices.IsSorted(s.PCRs) {
-			return fmt.Errorf("slot %d: its PCRs are not in order", s.Number)
+		if s.Signed != nil {
+			if _, err := s.Signed.key(); err != nil {
+				return fmt.Errorf("slot %d: %w", s.Number, err)
+			}
+			if checkSelection(s.Signed.PCRs) != nil || slices.ContainsFunc(s.Signed.PCRs, func(p int) bool { return slices.Contains(s.PCRs, p) }) {
+				return fmt.Errorf("slot %d: its signed PCRs are no selection apart from its approved ones", s.Number)
+			}
 		}
 	}
 	for _, a := range f.Approvals {
@@ -511,13 +565,22 @@ func (f *CA) checkValues(s *Slot, values map[int][]byte) error {
 	return nil
 }
 
-// PCRList is "0, 7 and 15".
-func PCRList(pcrs []int) string {
-	s := make([]string, len(pcrs))
-	for i, p := range pcrs {
-		s[i] = fmt.Sprint(p)
+// Numbers is "0,7,15", as assh.conf and the flags write PCRs and slots.
+func Numbers(n []int) string {
+	s := make([]string, len(n))
+	for i, v := range n {
+		s[i] = strconv.Itoa(v)
 	}
-	if len(s) == 1 {
+	return strings.Join(s, ",")
+}
+
+// PCRList is "PCR 0, 7 and 15".
+func PCRList(pcrs []int) string {
+	s := strings.Split(Numbers(pcrs), ",")
+	switch len(pcrs) {
+	case 0:
+		return "no PCR"
+	case 1:
 		return "PCR " + s[0]
 	}
 	return "PCR " + strings.Join(s[:len(s)-1], ", ") + " and " + s[len(s)-1]
