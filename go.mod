@@ -12,4 +12,4 @@ require (
 // of a command that changes an authorization value, until they are released
 // upstream. A replace does not reach a module that uses assh: only tpmadmin
 // needs them, and hostkey does not import it.
-replace github.com/google/go-tpm => github.com/mrwiora/go-tpm v0.0.0-20261024135940-85890fca3a47
+replace github.com/google/go-tpm => github.com/mrwiora/go-tpm v0.0.0-20261029164022-f241ee1ef546

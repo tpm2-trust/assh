@@ -636,11 +636,12 @@ efivarfs itself is used (tpm2-kira's and safearch's VM runs).
   then fails about one time in eight. Move to the first release with the
   fix.
 - **assh builds with a fork of go-tpm** (`replace` in go.mod,
-  github.com/mrwiora/go-tpm): it adds TPM2_NV_ChangeAuth and
-  TPM2_DictionaryAttackLockReset, and checks the response of a command that
-  changes an authorization value with the new value. Only `tpmadmin` needs
-  it; a program that uses `hostkey` without `tpmadmin` (tpm2-kira) builds
-  with go-tpm as released. Drop the replace once upstream has them.
+  github.com/mrwiora/go-tpm, the branch of google/go-tpm#452): it adds
+  TPM2_NV_ChangeAuth and checks the response of a command that changes an
+  authorization value with the new value; TPM2_DictionaryAttackLockReset
+  comes from upstream (#450), which the fork is based on. Only `tpmadmin`
+  needs it; a program that uses `hostkey` without `tpmadmin` (tpm2-kira)
+  builds with go-tpm as required. Drop the replace once upstream has #452.
 - **RSA-2048 host keys** sign rsa-sha2-256 in `serve` (many TPMs lack
   SHA-512); the agent's `sshd.conf` offers rsa-sha2-512 only where the TPM
   has it.
