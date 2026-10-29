@@ -14,6 +14,7 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 
 	"github.com/tpm2-trust/assh/internal/swtpmtest"
+	"github.com/tpm2-trust/assh/persist"
 )
 
 var testPIN = []byte("pin-7GQ2xw")
@@ -336,7 +337,7 @@ func TestCounterClone(t *testing.T) {
 	if err := ca.RedefineCounter(tpm, pinOf([]byte("wrong-pin"))); !errors.Is(err, ErrWrongPIN) {
 		t.Fatalf("redefine with a wrong PIN: %v", err)
 	}
-	if _, name, _ := readNVPublic(tpm, g.NVIndex); !bytes.Equal(name.Buffer, nvName(other).Buffer) {
+	if _, name, _ := persist.ReadNVPublic(tpm, g.NVIndex); !bytes.Equal(name.Buffer, nvName(other).Buffer) {
 		t.Fatal("a wrong PIN removed what was at the counter's handle")
 	}
 	if err := ca.RedefineCounter(tpm, pinOf(testPIN)); err != nil {
@@ -380,7 +381,7 @@ func TestPINIndexClone(t *testing.T) {
 	if err := incrementPINIndex(tpm, unwritten); err != nil {
 		t.Fatal(err)
 	}
-	_, name, _ := readNVPublic(tpm, pPub.NVIndex)
+	_, name, _ := persist.ReadNVPublic(tpm, pPub.NVIndex)
 	v, _ := readCount(tpm, pPub.NVIndex, name, tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)})
 	if !bytes.Equal(name.Buffer, nvName(pPub).Buffer) || v <= k {
 		t.Fatalf("the clone: same Name %v, value %d (the CA's %d)", bytes.Equal(name.Buffer, nvName(pPub).Buffer), v, k)
@@ -535,4 +536,11 @@ func isMismatch(err error, none bool) bool {
 		}
 	}
 	return true
+}
+
+// undefine removes whatever is at h: the tests plant and take away indices
+// that are not the CA's.
+func undefine(t transport.TPM, h tpm2.TPMHandle) error {
+	_, err := persist.RemoveNV(t, h, func(*tpm2.TPMSNVPublic, tpm2.TPM2BName) bool { return true })
+	return err
 }

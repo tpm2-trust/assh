@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/tpm2-trust/assh/internal/swtpmtest"
+	"github.com/tpm2-trust/assh/persist"
 )
 
 // A CA kept in an EFI variable: written as efivarfs takes it (the
@@ -15,9 +16,9 @@ import (
 // knows; a name efivarfs would not take is refused.
 func TestCAInEFIVariable(t *testing.T) {
 	dir := t.TempDir()
-	old := efivarsDir
-	efivarsDir = dir
-	defer func() { efivarsDir = old }()
+	old := persist.VarDir
+	persist.VarDir = dir
+	defer func() { persist.VarDir = old }()
 
 	if _, err := LoadCA("efi:AsshTestCA"); !os.IsNotExist(err) {
 		t.Fatalf("no variable: %v", err)
@@ -50,7 +51,7 @@ func TestCAInEFIVariable(t *testing.T) {
 	if err := ca.Save("efi:AsshTestCA"); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "AsshTestCA-"+VarGUID))
+	raw, err := os.ReadFile(filepath.Join(dir, "AsshTestCA-"+persist.VarGUID))
 	if err != nil {
 		t.Fatal(err)
 	}

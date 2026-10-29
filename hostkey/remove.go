@@ -1,13 +1,13 @@
 package hostkey
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/tpm2-trust/assh/persist"
 )
 
 // RemoveCA removes the CA at path and its PIN index and counter: those the
@@ -36,9 +36,10 @@ func RemoveCA(t transport.TPM, path string, handles []tpm2.TPMHandle) ([]string,
 			pubs = append(pubs, g)
 		}
 		for _, pub := range pubs {
-			ok, err := removeIndex(t, pub.NVIndex, func(_ *tpm2.TPMSNVPublic, name tpm2.TPM2BName) bool {
-				return bytes.Equal(name.Buffer, nvName(pub).Buffer)
-			})
+			ok, err := persist.RemoveNV(t, pub.NVIndex, persist.Named(nvName(pub)))
+			if errors.Is(err, persist.ErrNotOurs) {
+				continue
+			}
 			if err != nil {
 				return removed, err
 			}
@@ -49,9 +50,12 @@ func RemoveCA(t transport.TPM, path string, handles []tpm2.TPMHandle) ([]string,
 	case os.IsNotExist(err):
 		pin, counter := written(pinIndexPublic(0)).Attributes, tpm2.TPMANV{NT: tpm2.TPMNTCounter, PolicyWrite: true, AuthRead: true, NoDA: true, Written: true}
 		for _, h := range handles {
-			ok, err := removeIndex(t, h, func(pub *tpm2.TPMSNVPublic, _ tpm2.TPM2BName) bool {
+			ok, err := persist.RemoveNV(t, h, func(pub *tpm2.TPMSNVPublic, _ tpm2.TPM2BName) bool {
 				return pub.DataSize == 8 && (pub.Attributes == pin || pub.Attributes == counter)
 			})
+			if errors.Is(err, persist.ErrNotOurs) {
+				continue
+			}
 			if err != nil {
 				return removed, err
 			}
@@ -63,18 +67,15 @@ func RemoveCA(t transport.TPM, path string, handles []tpm2.TPMHandle) ([]string,
 	default:
 		return nil, err
 	}
-	if IsVar(path) {
-		p, err := varPath(path)
+	if persist.IsVar(path) {
+		ok, err := persist.RemoveVar(path)
 		if err != nil {
 			return removed, err
 		}
-		if _, err := setImmutable(p, false); err != nil {
-			return removed, err
+		if ok {
+			removed = append(removed, path)
 		}
-		if err := os.Remove(p); err != nil {
-			return removed, err
-		}
-		return append(removed, path), nil
+		return removed, nil
 	}
 	for _, p := range []string{path, path + ".pub"} {
 		if err := os.Remove(p); err == nil {
@@ -84,23 +85,4 @@ func RemoveCA(t transport.TPM, path string, handles []tpm2.TPMHandle) ([]string,
 		}
 	}
 	return removed, nil
-}
-
-// removeIndex removes the index at h, with the owner's empty
-// authorization, when it is there and ours says so.
-func removeIndex(t transport.TPM, h tpm2.TPMHandle, ours func(*tpm2.TPMSNVPublic, tpm2.TPM2BName) bool) (bool, error) {
-	pub, name, err := readNVPublic(t, h)
-	if errors.Is(err, tpm2.TPMRCHandle) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("reading NV index 0x%08X: %w", uint32(h), err)
-	}
-	if !ours(pub, name) {
-		return false, nil
-	}
-	if _, err := (tpm2.NVUndefineSpace{AuthHandle: tpm2.TPMRHOwner, NVIndex: tpm2.NamedHandle{Handle: h, Name: name}}).Execute(t); err != nil {
-		return false, fmt.Errorf("removing NV index 0x%08X: %w", uint32(h), err)
-	}
-	return true, nil
 }

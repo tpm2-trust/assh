@@ -24,6 +24,7 @@ import (
 
 	"github.com/tpm2-trust/assh/config"
 	"github.com/tpm2-trust/assh/hostkey"
+	"github.com/tpm2-trust/assh/persist"
 	"github.com/tpm2-trust/assh/tpmadmin"
 )
 
@@ -43,6 +44,10 @@ const usage = `assh - an SSH host key in the TPM
   assh tpm da      [--max-tries 3 --recovery 1800 --lockout-recovery 1800] [--reset]
                    [--lockout-auth-fd N | --ask-lockout-auth]
                    [--new-lockout-auth | --new-lockout-auth-fd N]
+  assh efivar get  NAME          an EFI variable's value, without its attributes
+  assh efivar set  NAME VALUE | [--file FILE] NAME
+                                 written in place, in one write
+  assh efivar rm   NAME          removed (none there is not an error)
   assh serve       --ca FILE --authorized-keys FILE (-- COMMAND ... | --socket PATH)
                    [--listen :22] [--user NAME] [HOST KEY OPTIONS]
   assh agent       --ca FILE [--dir /run/assh] [--uid 0] [HOST KEY OPTIONS]
@@ -59,9 +64,13 @@ file's: 'ca create' makes them, and every command - 'agent' at its start -
 takes the file's slots as they are now (a slot gone or changed loses its
 approvals, a new one has none).
 Every command takes --tpm PATH (default /dev/tpmrm0). A CA FILE may be an
-EFI variable instead, efi:NAME (efivarfs, vendor GUID ` + hostkey.VarGUID + `):
+EFI variable instead, efi:NAME (efivarfs, vendor GUID ` + persist.VarGUID + `):
 where nothing else survives a reboot, or outside the boot image a slot
-measures.
+measures. 'efivar' reads, writes and removes such variables - aSSH's
+(NAME) or another vendor's (NAME-GUID) - the way the CA's are: written
+in place, never removed first, the immutable mark lifted and put back.
+ASSH_EFIVARS in the environment points it at another directory than
+efivarfs (tests).
 
 The CA is created in the TPM and never leaves it. It has up to 16 slots,
 each a PCR selection (ASSH_CA_SLOT_<N>; 'ca create --pcrs' is slot 0),
@@ -90,12 +99,17 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
+	if d := os.Getenv("ASSH_EFIVARS"); d != "" {
+		persist.VarDir = d
+	}
 	var err error
 	switch os.Args[1] {
 	case "ca":
 		err = caCommand(os.Args[2:])
 	case "tpm":
 		err = tpmCommand(os.Args[2:])
+	case "efivar":
+		err = efivarCommand(os.Args[2:])
 	case "serve":
 		err = serveCommand(os.Args[2:])
 	case "agent":
@@ -270,7 +284,7 @@ func caCommand(args []string) error {
 		if err := ca.Save(*out); err != nil {
 			return err
 		}
-		if !hostkey.IsVar(*out) {
+		if !persist.IsVar(*out) {
 			pub, _ := ca.AuthorizedKey()
 			if err := os.WriteFile(*out+".pub", pub, 0o644); err != nil {
 				return err
@@ -1108,4 +1122,47 @@ func waitForSignal() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
 	<-ch
+}
+
+// efivarCommand is 'efivar get|set|rm': an EFI variable, aSSH's or another
+// vendor's, read, written and removed as the CA's are (package persist).
+func efivarCommand(args []string) error {
+	if len(args) == 0 {
+		return errors.New("efivar needs get, set or rm")
+	}
+	fs := flag.NewFlagSet("efivar "+args[0], flag.ExitOnError)
+	file := fs.String("file", "", "set: the value from this file")
+	fs.Parse(args[1:])
+	if fs.NArg() < 1 {
+		return fmt.Errorf("efivar %s needs a variable: NAME or NAME-GUID", args[0])
+	}
+	location := persist.VarPrefix + fs.Arg(0)
+	switch args[0] {
+	case "get":
+		b, err := persist.ReadVar(location)
+		if err != nil {
+			return err
+		}
+		_, err = os.Stdout.Write(b)
+		return err
+	case "set":
+		var value []byte
+		switch {
+		case *file != "" && fs.NArg() == 1:
+			b, err := os.ReadFile(*file)
+			if err != nil {
+				return err
+			}
+			value = b
+		case *file == "" && fs.NArg() == 2:
+			value = []byte(fs.Arg(1))
+		default:
+			return errors.New("efivar set needs a value: NAME VALUE, or --file FILE NAME")
+		}
+		return persist.WriteVar(location, value)
+	case "rm":
+		_, err := persist.RemoveVar(location)
+		return err
+	}
+	return fmt.Errorf("efivar %s: get, set or rm", args[0])
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/go-tpm/tpm2"
+	"github.com/tpm2-trust/assh/persist"
 )
 
 // RemoveCA removes the CA's file and the indices it names; without a file
@@ -30,7 +31,7 @@ func TestRemoveCA(t *testing.T) {
 		}
 	}
 	for _, h := range handles {
-		if _, _, err := readNVPublic(tpm, h); err == nil {
+		if _, _, err := persist.ReadNVPublic(tpm, h); err == nil {
 			t.Errorf("0x%08X still there", uint32(h))
 		}
 	}
@@ -64,7 +65,7 @@ func TestRemoveCA(t *testing.T) {
 	if err != nil || slices.Contains(removed, "NV index 0x01802913") || !slices.Contains(removed, path) {
 		t.Fatalf("a file whose PIN index was replaced: %v %v", removed, err)
 	}
-	if _, _, err := readNVPublic(tpm, DefaultPINHandle); err != nil {
+	if _, _, err := persist.ReadNVPublic(tpm, DefaultPINHandle); err != nil {
 		t.Fatal("the other index was removed")
 	}
 }

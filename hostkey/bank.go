@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/tpm2-trust/assh/persist"
 )
 
 // SHA1Handle is the NV index whose presence allows SHA-1 on a TPM: a CA of
@@ -65,7 +66,7 @@ func ActiveBanks(t transport.TPM) ([]Bank, error) {
 
 // SHA1Allowed is whether SHA1Handle is there, as AllowSHA1 made it.
 func SHA1Allowed(t transport.TPM) (bool, error) {
-	pub, _, err := readNVPublic(t, SHA1Handle)
+	pub, _, err := persist.ReadNVPublic(t, SHA1Handle)
 	if errors.Is(err, tpm2.TPMRCHandle) {
 		return false, nil
 	}
@@ -82,15 +83,8 @@ func SHA1Allowed(t transport.TPM) (bool, error) {
 // AllowSHA1 defines SHA1Handle (allow) or removes it, with the owner's
 // empty authorization.
 func AllowSHA1(t transport.TPM, allow bool) error {
-	_, _, err := readNVPublic(t, SHA1Handle)
-	exists := err == nil
-	if err != nil && !errors.Is(err, tpm2.TPMRCHandle) {
-		return fmt.Errorf("reading NV index 0x%08X: %w", uint32(SHA1Handle), err)
-	}
-	if exists {
-		if err := undefine(t, SHA1Handle); err != nil {
-			return fmt.Errorf("removing NV index 0x%08X: %w", uint32(SHA1Handle), err)
-		}
+	if _, err := persist.RemoveNV(t, SHA1Handle, persist.Shaped(sha1Public())); err != nil {
+		return err
 	}
 	if !allow {
 		return nil

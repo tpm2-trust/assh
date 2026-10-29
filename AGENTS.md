@@ -52,6 +52,14 @@ name is a change to them: build and test tpm2-kira after one.
   runs as nobody, in namespaces of its own, confined by `sandbox`, and asks for
   every signature; it never gets the key or a session's other end before
   a login. Keep it that way.
+- **NV indices and EFI variables go through `persist`.** Nothing calls
+  NVUndefineSpace or writes efivarfs by itself: an index is removed only
+  when it is provably ours (`persist.Shaped`, `persist.Named`) - the one
+  exception, `RedefineCounter`, replaces what is at the CA's own handle
+  after the PIN is proven - absent is not an error, and a variable is
+  written in place, never removed first. Programs built on aSSH use the
+  same package (tpm2-kira) or the `assh efivar` command (safearch's
+  scripts).
 - **A confinement step covers every thread.** prctl, Landlock and
   seccomp act on the thread that asks, and a Go program has several from
   its start: `sandbox` takes each step on all of them

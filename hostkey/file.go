@@ -53,6 +53,7 @@ import (
 	"strings"
 
 	"github.com/google/go-tpm/tpm2"
+	"github.com/tpm2-trust/assh/persist"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -208,8 +209,8 @@ func (a Approval) Equal(b *Approval) bool {
 func LoadCA(path string) (*CA, error) {
 	var data []byte
 	var err error
-	if IsVar(path) {
-		data, err = readVar(path)
+	if persist.IsVar(path) {
+		data, err = persist.ReadVar(path)
 	} else {
 		data, err = os.ReadFile(path)
 	}
@@ -266,12 +267,12 @@ func (f *CA) Marshal() ([]byte, error) {
 // at path: written beside it and renamed, so a reader never sees half. An
 // EFI variable ("efi:NAME") is written compact, in one piece.
 func (f *CA) Save(path string) error {
-	if IsVar(path) {
+	if persist.IsVar(path) {
 		b, err := json.Marshal(f)
 		if err != nil {
 			return err
 		}
-		return writeVar(path, b)
+		return persist.WriteVar(path, b)
 	}
 	b, err := f.Marshal()
 	if err != nil {

@@ -1,12 +1,11 @@
-package hostkey
+package persist
 
-// A CA file kept in an EFI variable: where a machine has no other place
-// that survives a reboot (a read-only image), or none outside a boot image
-// whose measurement an approval names. Nothing in it is secret - the CA's
-// key is wrapped by this TPM, the approvals are signatures the TPM checks
-// each time the CA signs - so the variable is a plain one, no
-// authenticated write: whoever writes it can delete the CA (root can in
-// any design), never make it sign.
+// EFI variables: where a machine has no other place that survives a reboot
+// (a read-only image), or none outside a boot image whose measurement an
+// approval names. The variables written here are plain ones - non-volatile,
+// boot service and runtime access, no authenticated write - so they hold
+// nothing whose change would matter unchecked: aSSH's CA is checked by the
+// TPM each time it signs, safearch's selection by the signed command line.
 
 import (
 	"encoding/binary"
@@ -14,16 +13,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"golang.org/x/sys/unix"
 )
 
-// VarPrefix names a CA kept in an EFI variable: "efi:NAME" wherever a CA
-// file's path goes (LoadCA, Save).
+// VarPrefix names an EFI variable wherever a file's path goes: "efi:NAME"
+// (aSSH's vendor GUID) or "efi:NAME-GUID".
 const VarPrefix = "efi:"
 
-// VarGUID is the vendor GUID of assh's variables.
+// VarGUID is the vendor GUID of aSSH's variables.
 const VarGUID = "24415b90-39be-45c0-a9a3-d547ebe28ea0"
 
 // varAttributes: non-volatile, boot service and runtime access.
@@ -35,15 +35,25 @@ const fsImmutable = 0x10
 // efivarfsMagic is EFIVARFS_MAGIC of linux/magic.h.
 const efivarfsMagic = 0xde5e81e4
 
-// efivarsDir is where efivarfs is mounted.
-var efivarsDir = "/sys/firmware/efi/efivars"
+// VarDir is where efivarfs is mounted; tests, and the assh command's
+// ASSH_EFIVARS, point it elsewhere.
+var VarDir = "/sys/firmware/efi/efivars"
 
-// IsVar reports whether location names an EFI variable ("efi:NAME").
+// guidSuffix is a vendor GUID at the end of a variable's location.
+var guidSuffix = regexp.MustCompile(`-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
+
+// IsVar reports whether location names an EFI variable ("efi:...").
 func IsVar(location string) bool { return strings.HasPrefix(location, VarPrefix) }
 
-// varPath is the efivarfs file of location's variable.
-func varPath(location string) (string, error) {
+// VarPath is the efivarfs file of location's variable: "efi:NAME" with
+// aSSH's GUID, "efi:NAME-GUID" with that one.
+func VarPath(location string) (string, error) {
 	name := strings.TrimPrefix(location, VarPrefix)
+	guid := VarGUID
+	if m := guidSuffix.FindStringSubmatch(strings.ToLower(name)); m != nil {
+		guid = m[1]
+		name = name[:len(name)-len(m[0])]
+	}
 	if name == "" || len(name) > 64 {
 		return "", fmt.Errorf("%s: not an EFI variable name", location)
 	}
@@ -52,13 +62,13 @@ func varPath(location string) (string, error) {
 			return "", fmt.Errorf("%s: not an EFI variable name (letters, digits, _ and -)", location)
 		}
 	}
-	return filepath.Join(efivarsDir, name+"-"+VarGUID), nil
+	return filepath.Join(VarDir, name+"-"+guid), nil
 }
 
-// readVar is the variable's contents, without its attributes; an error
+// ReadVar is the variable's contents, without its attributes; an error
 // that os.IsNotExist knows when there is none.
-func readVar(location string) ([]byte, error) {
-	path, err := varPath(location)
+func ReadVar(location string) ([]byte, error) {
+	path, err := VarPath(location)
 	if err != nil {
 		return nil, err
 	}
@@ -72,12 +82,12 @@ func readVar(location string) ([]byte, error) {
 	return b[4:], nil
 }
 
-// writeVar replaces the variable's contents, in one write: the firmware
-// takes the whole variable or none of it. efivarfs marks a variable
-// immutable against an accidental rm; the mark is lifted for the write and
-// put back.
-func writeVar(location string, data []byte) error {
-	path, err := varPath(location)
+// WriteVar replaces the variable's contents, in one write: the firmware
+// takes the whole variable or none of it, and the old one stays until the
+// new one is there. efivarfs marks a variable immutable against an
+// accidental rm; the mark is lifted for the write and put back.
+func WriteVar(location string, data []byte) error {
+	path, err := VarPath(location)
 	if err != nil {
 		return err
 	}
@@ -114,6 +124,25 @@ func writeVar(location string, data []byte) error {
 		_, err = setImmutable(path, true)
 	}
 	return err
+}
+
+// RemoveVar removes the variable, lifting the immutable mark first. It
+// reports whether there was one.
+func RemoveVar(location string) (bool, error) {
+	path, err := VarPath(location)
+	if err != nil {
+		return false, err
+	}
+	if _, err := setImmutable(path, false); err != nil {
+		return false, err
+	}
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // setImmutable sets or clears path's immutable flag and reports whether it

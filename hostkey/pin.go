@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/tpm2-trust/assh/persist"
 )
 
 // An authority in the TPM: three objects, nothing secret outside it.
@@ -212,18 +213,6 @@ func pinError(err error) error {
 	return err
 }
 
-func readNVPublic(t transport.TPM, h tpm2.TPMHandle) (*tpm2.TPMSNVPublic, tpm2.TPM2BName, error) {
-	rsp, err := tpm2.NVReadPublic{NVIndex: h}.Execute(t)
-	if err != nil {
-		return nil, tpm2.TPM2BName{}, err
-	}
-	pub, err := rsp.NVPublic.Contents()
-	if err != nil {
-		return nil, tpm2.TPM2BName{}, err
-	}
-	return pub, rsp.NVName, nil
-}
-
 func readCount(t transport.TPM, h tpm2.TPMHandle, name tpm2.TPM2BName, auth tpm2.AuthHandle) (uint64, error) {
 	rsp, err := tpm2.NVRead{AuthHandle: auth, NVIndex: tpm2.NamedHandle{Handle: h, Name: name}, Size: 8}.Execute(t)
 	if err != nil {
@@ -286,7 +275,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 		return nil, errors.New("the TPM has no lockout authorization: anyone could reset its dictionary attack lockout and try PINs without end; set one first")
 	}
 	for _, h := range []tpm2.TPMHandle{o.PINHandle, o.CounterHandle} {
-		if _, _, err := readNVPublic(t, h); err == nil {
+		if _, _, err := persist.ReadNVPublic(t, h); err == nil {
 			return nil, fmt.Errorf("NV handle 0x%08X is in use", uint32(h))
 		}
 	}
@@ -309,7 +298,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	defer func() {
 		if err != nil {
 			for _, pub := range defined {
-				undefine(t, pub.NVIndex)
+				persist.RemoveNV(t, pub.NVIndex, persist.Shaped(pub))
 			}
 		}
 	}()
@@ -374,15 +363,6 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	return ca, nil
 }
 
-func undefine(t transport.TPM, h tpm2.TPMHandle) error {
-	_, name, err := readNVPublic(t, h)
-	if err != nil {
-		return err
-	}
-	_, err = tpm2.NVUndefineSpace{AuthHandle: tpm2.TPMRHOwner, NVIndex: tpm2.NamedHandle{Handle: h, Name: name}}.Execute(t)
-	return err
-}
-
 // incrementPINIndex is P's one increment, which needs no PIN.
 func incrementPINIndex(t transport.TPM, pub tpm2.TPMSNVPublic) error {
 	s, done, err := tpm2.PolicySession(t, tpm2.TPMAlgSHA256, 16)
@@ -434,7 +414,7 @@ func (f *CA) checkPINIndex(t transport.TPM) (tpm2.TPMSNVPublic, uint64, error) {
 		return pub, k, err
 	}
 	gone := fmt.Errorf("the PIN index at 0x%08X is not the CA's (deleted or replaced): no approval can be made any more; create the CA again", uint32(pub.NVIndex))
-	_, name, err := readNVPublic(t, pub.NVIndex)
+	_, name, err := persist.ReadNVPublic(t, pub.NVIndex)
 	if err != nil || !bytes.Equal(name.Buffer, nvName(pub).Buffer) {
 		return pub, k, gone
 	}
@@ -568,7 +548,7 @@ func (f *CA) Generation(t transport.TPM) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, name, err := readNVPublic(t, pub.NVIndex)
+	_, name, err := persist.ReadNVPublic(t, pub.NVIndex)
 	if err != nil || !bytes.Equal(name.Buffer, nvName(pub).Buffer) {
 		return 0, &counterGoneError{pub.NVIndex}
 	}
@@ -627,7 +607,7 @@ func (f *CA) NextGeneration(t transport.TPM, pin PIN) error {
 	if _, _, err := f.checkPINIndex(t); err != nil {
 		return err
 	}
-	now, name, err := readNVPublic(t, gPub.NVIndex)
+	now, name, err := persist.ReadNVPublic(t, gPub.NVIndex)
 	unwritten := gPub
 	unwritten.Attributes.Written = false
 	switch {
@@ -681,10 +661,11 @@ func (f *CA) RedefineCounter(t transport.TPM, pin PIN) error {
 	if err := checkGate(t, p, pPub, k, b); err != nil {
 		return err
 	}
-	if _, _, err := readNVPublic(t, gPub.NVIndex); err == nil {
-		if err := undefine(t, gPub.NVIndex); err != nil {
-			return fmt.Errorf("removing what is at 0x%08X: %w", uint32(gPub.NVIndex), err)
-		}
+	// Whatever is at the counter's handle goes, of any shape: the handle
+	// is the CA's, and replacing what an attacker put there is what this
+	// is for - with the PIN proven above, never without.
+	if _, err := persist.RemoveNV(t, gPub.NVIndex, func(*tpm2.TPMSNVPublic, tpm2.TPM2BName) bool { return true }); err != nil {
+		return fmt.Errorf("removing what is at 0x%08X: %w", uint32(gPub.NVIndex), err)
 	}
 	unwritten := gPub
 	unwritten.Attributes.Written = false
