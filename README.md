@@ -8,7 +8,8 @@ unencrypted boot image. It is a Go library and a command:
 | | |
 |---|---|
 | `hostkey` | the CA in the TPM, its slots and the approvals of the PCR states it signs in, the per-boot host key and its certificate - or a temporary key when no slot is approved |
-| `server` | an SSH server split in two: the side that speaks SSH runs as nobody, in namespaces of its own, under Landlock, and holds neither the key nor what a login leads to |
+| `server` | an SSH server split in two: the side that speaks SSH runs as nobody, in namespaces of its own, confined by `sandbox`, and holds neither the key nor what a login leads to |
+| `sandbox` | what a process that parses outside input takes from itself, on every thread: new privileges, executable memory, files (Landlock), the system calls that administer the machine (seccomp) |
 | `agent` | an ssh-agent socket that lends the host key to OpenSSH's sshd (`HostKeyAgent`) |
 | `tpmadmin` | what the TPM itself holds for an authority with a PIN: the PIN, the dictionary attack parameters, the lockout authorization |
 | `cmd/assh` | the command: `ca create`, `ca show`, `ca approve`, `ca pin`, `ca remove`, `tpm da`, `tpm sha1`, `serve`, `agent` |

@@ -7,9 +7,11 @@ package server
 // login. So it opens the port and starts its own program again - led to
 // ChildMain - handing it the listening socket and one end of a control
 // socket. This process then gives up everything it does not need - it runs
-// as nobody, in network, IPC, PID and mount namespaces of its own, with no
-// new privileges and, where the kernel has Landlock, no access to any file
-// - and only then speaks SSH (golang.org/x/crypto/ssh).
+// as nobody, in network, IPC, PID and mount namespaces of its own, and
+// takes from itself what package sandbox takes, on every thread: new
+// privileges, executable memory, every file (Landlock), the system calls
+// that administer the machine (seccomp) - and only then speaks SSH
+// (golang.org/x/crypto/ssh).
 //
 // It holds no host key: the key exchange is signed by the server, asked
 // over the control socket. It runs nothing: a login's shell becomes a
@@ -27,10 +29,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
+
+	"github.com/tpm2-trust/assh/sandbox"
 )
 
 // Limits of the unprivileged half: connections that have not logged in
@@ -61,7 +64,10 @@ func ChildMain() error {
 	if err != nil {
 		return fmt.Errorf("no listening socket: %w", err)
 	}
-	sandbox := sandboxSelf()
+	confined, err := sandboxSelf()
+	if err != nil {
+		return fmt.Errorf("the unprivileged half cannot confine itself: %w", err)
+	}
 
 	init, fd, err := ctl.recv()
 	if fd >= 0 {
@@ -74,76 +80,27 @@ func ChildMain() error {
 	if err != nil {
 		return err
 	}
-	ctl.send(msg{T: "ready", Text: sandbox}, -1)
+	ctl.send(msg{T: "ready", Text: confined}, -1)
 	go s.control()
 	s.accept(ln)
 	return nil
 }
 
-// sandboxSelf takes what is left to take from this process - no new
-// privileges, no file - and describes what it runs with, for the log.
-func sandboxSelf() string {
+// sandboxSelf takes what is left to take from this process (sandbox: no
+// new privileges, no file, none of the administering system calls, on
+// every thread) and describes what it runs with, for the log.
+func sandboxSelf() (string, error) {
 	desc := fmt.Sprintf("uid %d", os.Geteuid())
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err == nil {
-		desc += ", no new privileges"
-	}
 	if os.Getpid() == 1 {
 		// The first process of its own PID namespace: the server asked
 		// for network, IPC, PID, mount and UTS namespaces at once.
 		desc += ", namespaces of its own"
 	}
-	if abi, err := landlockDenyAll(); err != nil {
-		desc += ", no Landlock (" + err.Error() + ")"
-	} else {
-		desc += fmt.Sprintf(", Landlock ABI %d: no file access", abi)
+	confined, err := sandbox.Apply(sandbox.Policy{})
+	if err != nil {
+		return "", err
 	}
-	return desc
-}
-
-// landlockDenyAll restricts this process to no file system access at all
-// (and no TCP bind or connect, no signals or abstract sockets beyond it,
-// where the kernel knows those): a ruleset that handles every right and
-// allows none. It reports the kernel's Landlock ABI.
-func landlockDenyAll() (int, error) {
-	abi, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, 0, 0, unix.LANDLOCK_CREATE_RULESET_VERSION)
-	if errno != 0 {
-		return 0, errno
-	}
-	var attr unix.LandlockRulesetAttr
-	size := uintptr(8) // access_fs alone, ABI 1-3
-	attr.Access_fs = unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_WRITE_FILE |
-		unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR |
-		unix.LANDLOCK_ACCESS_FS_REMOVE_DIR | unix.LANDLOCK_ACCESS_FS_REMOVE_FILE |
-		unix.LANDLOCK_ACCESS_FS_MAKE_CHAR | unix.LANDLOCK_ACCESS_FS_MAKE_DIR |
-		unix.LANDLOCK_ACCESS_FS_MAKE_REG | unix.LANDLOCK_ACCESS_FS_MAKE_SOCK |
-		unix.LANDLOCK_ACCESS_FS_MAKE_FIFO | unix.LANDLOCK_ACCESS_FS_MAKE_BLOCK |
-		unix.LANDLOCK_ACCESS_FS_MAKE_SYM
-	if abi >= 2 {
-		attr.Access_fs |= unix.LANDLOCK_ACCESS_FS_REFER
-	}
-	if abi >= 3 {
-		attr.Access_fs |= unix.LANDLOCK_ACCESS_FS_TRUNCATE
-	}
-	if abi >= 4 {
-		attr.Access_net = unix.LANDLOCK_ACCESS_NET_BIND_TCP | unix.LANDLOCK_ACCESS_NET_CONNECT_TCP
-		size = 16
-	}
-	if abi >= 5 {
-		attr.Access_fs |= unix.LANDLOCK_ACCESS_FS_IOCTL_DEV
-	}
-	if abi >= 6 {
-		attr.Scoped = unix.LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | unix.LANDLOCK_SCOPE_SIGNAL
-		size = 24
-	}
-	fd, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, uintptr(unsafe.Pointer(&attr)), size, 0)
-	if errno != 0 {
-		return int(abi), errno
-	}
-	defer unix.Close(int(fd))
-	if _, _, errno := unix.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, fd, 0, 0); errno != 0 {
-		return int(abi), errno
-	}
-	return int(abi), nil
+	return desc + ", " + confined, nil
 }
 
 // child is the SSH side of the unprivileged half.

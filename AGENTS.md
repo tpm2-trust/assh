@@ -46,9 +46,14 @@ exported name is a change to them: build and test tpm2-kira after one.
   (`hostkey.fileVersion`); another version is an error that says to
   create the CA again. No migrations.
 - **The side that speaks SSH holds nothing.** `server`'s unprivileged half
-  runs as nobody, in namespaces of its own, under Landlock, and asks for
+  runs as nobody, in namespaces of its own, confined by `sandbox`, and asks for
   every signature; it never gets the key or a session's other end before
   a login. Keep it that way.
+- **A confinement step covers every thread.** prctl, Landlock and
+  seccomp act on the thread that asks, and a Go program has several from
+  its start: `sandbox` takes each step on all of them
+  (`syscall.AllThreadsSyscall`, seccomp's TSYNC). Never confine with a
+  plain `unix.Prctl` or `unix.Syscall`.
 - **Tests run with `-count=1` and wait for a state, never for a time.**
   TPM tests use swtpm (`internal/swtpmtest`) and are skipped without it.
 - **Comments and docs say what it is**, not what it was.
