@@ -14,7 +14,7 @@ permissions:
       scan_mode:
         description: 'Scan mode (quick, standard, or deep)'
         required: false
-        default: 'quick'
+        default: 'standard'
         type: choice
         options:
           - quick
