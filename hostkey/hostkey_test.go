@@ -70,9 +70,7 @@ func TestCertifiedHostKey(t *testing.T) {
 			}
 			checkTrusted(t, ca, hk)
 
-			if err := ExtendPCR(tpm, 15, "assh: closed"); err != nil {
-				t.Fatal(err)
-			}
+			swtpmtest.Extend(t, tpm, 15, "assh: closed")
 			if m := temporary(t, tpm, ca, opts); !slices.Equal(m.Slots[0].Changed, []int{15}) {
 				t.Fatalf("issue after closing: %v", m)
 			}
@@ -204,9 +202,7 @@ func TestSlots(t *testing.T) {
 	checkTrusted(t, ca, certified(t, tpm, ca, opts, 0))
 
 	// The OS moved: slot 1 certifies.
-	if err := ExtendPCR(tpm, 14, "another OS"); err != nil {
-		t.Fatal(err)
-	}
+	swtpmtest.Extend(t, tpm, 14, "another OS")
 	checkTrusted(t, ca, certified(t, tpm, ca, opts, 1))
 	// The window closes every slot.
 	if err := ca.Close(tpm); err != nil {
@@ -219,9 +215,7 @@ func TestSlots(t *testing.T) {
 	// The firmware moved: no slot certifies.
 	sw.Reboot(t)
 	checkTrusted(t, ca, certified(t, tpm, ca, opts, 0))
-	if err := ExtendPCR(tpm, 7, "another firmware"); err != nil {
-		t.Fatal(err)
-	}
+	swtpmtest.Extend(t, tpm, 7, "another firmware")
 	m := temporary(t, tpm, ca, opts)
 	if m.Error() != "slot 0: PCR 7 not as approved; slot 1: PCR 7 not as approved" {
 		t.Fatal(m)
@@ -367,9 +361,6 @@ func TestApprovalChecked(t *testing.T) {
 	}
 	if err := ca2.Approve(rsaAuth, 0, values); err != nil {
 		t.Fatal(err)
-	}
-	if err := ExtendPCR(tpm, 16, "x"); err == nil {
-		t.Fatal("closed with a resettable PCR")
 	}
 }
 

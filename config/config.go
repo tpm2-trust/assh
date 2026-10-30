@@ -44,13 +44,13 @@ type Config struct {
 	Authority  string        // ASSH_AUTHORITY: the authority's public key (PEM), a key elsewhere
 	AuthTPM    bool          // ASSH_AUTHORITY_TPM: the authority in the TPM, opened by a PIN
 	AuthOnce   bool          // ASSH_AUTHORITY_ONCE: an authority for the creation alone
+	WindowOpen bool          // ASSH_WINDOW_OPEN: with AuthOnce, the creating boot's window left open
 	PINHandle  uint32        // ASSH_PIN_HANDLE
 	CounterHdl uint32        // ASSH_COUNTER_HANDLE
 
 	HostKeyType hostkey.Type // ASSH_HOSTKEY_TYPE
 	Principals  []string     // ASSH_PRINCIPALS: comma-separated; * any
 	KeyID       string       // ASSH_KEY_ID
-	ClosePCR    int          // ASSH_CLOSE_PCR: a PCR extended when the window closes; -1 none
 	State       string       // ASSH_STATE: "" the command's own
 
 	Listen         string // ASSH_LISTEN
@@ -83,7 +83,6 @@ func Default() Config {
 		HostKeyType: hostkey.P256,
 		Principals:  []string{"*"},
 		KeyID:       "assh",
-		ClosePCR:    -1,
 		Listen:      ":22",
 		ChildUIDs:   sandbox.DefaultUIDs,
 		AgentDir:    "/run/assh",
@@ -202,8 +201,8 @@ func (c *Config) set(key, val string) error {
 		}
 	case "ASSH_KEY_ID":
 		c.KeyID, err = nonEmpty(val)
-	case "ASSH_CLOSE_PCR":
-		c.ClosePCR, err = pcr(val, -1)
+	case "ASSH_WINDOW_OPEN":
+		c.WindowOpen, err = yesNo(val)
 	case "ASSH_STATE":
 		c.State = val
 	case "ASSH_LISTEN":
@@ -233,6 +232,9 @@ func (c *Config) set(key, val string) error {
 func (c *Config) check() error {
 	if n := btoi(c.Authority != "") + btoi(c.AuthTPM) + btoi(c.AuthOnce); n > 1 {
 		return errors.New("ASSH_AUTHORITY, ASSH_AUTHORITY_TPM=yes and ASSH_AUTHORITY_ONCE=yes: the authority is one of them")
+	}
+	if c.WindowOpen && !c.AuthOnce {
+		return errors.New("ASSH_WINDOW_OPEN=yes is for ASSH_AUTHORITY_ONCE=yes alone")
 	}
 	for n, p := range c.Signed {
 		base, ok := c.Slots[n]
@@ -271,14 +273,6 @@ func yesNo(v string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("yes or no, not %q", v)
-}
-
-func pcr(v string, none int) (int, error) {
-	p, err := strconv.Atoi(v)
-	if err != nil || p < none || p > 23 {
-		return 0, fmt.Errorf("a PCR number, not %q", v)
-	}
-	return p, nil
 }
 
 func handle(v string) (uint32, error) {
@@ -334,13 +328,13 @@ func (c Config) Lines() [][2]string {
 	add("ASSH_AUTHORITY", c.Authority, "", false)
 	add("ASSH_AUTHORITY_TPM", map[bool]string{true: "yes", false: "no"}[c.AuthTPM], "no", false)
 	add("ASSH_AUTHORITY_ONCE", map[bool]string{true: "yes", false: "no"}[c.AuthOnce], "no", false)
+	add("ASSH_WINDOW_OPEN", map[bool]string{true: "yes", false: "no"}[c.WindowOpen], "no", false)
 	add("ASSH_PIN_HANDLE", fmt.Sprintf("0x%08X", c.PINHandle), fmt.Sprintf("0x%08X", d.PINHandle), false)
 	add("ASSH_COUNTER_HANDLE", fmt.Sprintf("0x%08X", c.CounterHdl), fmt.Sprintf("0x%08X", d.CounterHdl), false)
 	add("ASSH_WINDOW_HANDLE", fmt.Sprintf("0x%08X", c.WindowHdl), fmt.Sprintf("0x%08X", d.WindowHdl), false)
 	add("ASSH_HOSTKEY_TYPE", string(c.HostKeyType), string(d.HostKeyType), false)
 	add("ASSH_PRINCIPALS", strings.Join(c.Principals, ","), "*", false)
 	add("ASSH_KEY_ID", c.KeyID, d.KeyID, false)
-	add("ASSH_CLOSE_PCR", strconv.Itoa(c.ClosePCR), "-1", false)
 	add("ASSH_STATE", c.State, "", false)
 	add("ASSH_LISTEN", c.Listen, d.Listen, false)
 	add("ASSH_AUTHORIZED_KEYS", c.AuthorizedKeys, "", false)

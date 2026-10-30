@@ -35,7 +35,7 @@ import (
 
 const usage = `assh - an SSH host key in the TPM
 
-  assh ca create   --out FILE (--authority PUB.pem | --authority-tpm | --authority-once [--values FILE] [--events PCR:EVENT ...])
+  assh ca create   --out FILE (--authority PUB.pem | --authority-tpm | --authority-once [--values FILE] [--events PCR:EVENT ...] [--window-open])
                    [--type p256|rsa2048] [--pcrs 0,7] [--bank sha256|sha1|auto] [--ref TEXT]
                    [--window-handle 0x01802915] [--pin-handle 0x01802913] [--counter-handle 0x01802912]
                    [--pin-fd N] [--pcr-key PEM]
@@ -63,7 +63,7 @@ const usage = `assh - an SSH host key in the TPM
   assh close       [--ca FILE]   the window closed, nothing else (after the agent)
 
 Host key options: [--key-type p256|rsa2048] [--principals '*'] [--key-id TEXT]
-                  [--close-pcr N] [--state FILE]
+                  [--state FILE]
 
 Every command takes --config FILE, assh.conf (default ` + config.DefaultPath + ` when it
 is there): KEY=VALUE lines that set what the flags set - ASSH_CA,
@@ -212,6 +212,7 @@ func caCommand(args []string) error {
 		bank := fs.String("bank", string(cfg.Bank), "their bank: sha256, sha1, or auto (sha256 where the TPM has it, else sha1 where 'tpm sha1 --allow' allows it)")
 		ref := fs.String("ref", cfg.PolicyRef, "what the authority's approvals are bound to (at most 32 bytes)")
 		authOnce := fs.Bool("authority-once", cfg.AuthOnce, "an authority for the creation alone: it approves every slot now and is gone - no approval ever after")
+		windowOpen := fs.Bool("window-open", cfg.WindowOpen, "--authority-once: leave this boot's window open, so that the CA signs in it until 'agent' or 'serve' closes it - only where nothing untrusted runs before them (an initrd)")
 		valuesPath := fs.String("values", "", "--authority-once: the PCR values to approve, as 'agent' recorded them; default: what the TPM holds now")
 		var events eventList
 		fs.Var(&events, "events", "--authority-once: PCR:EVENT - that PCR approved as from zero with these events in order (a state known before it is booted); repeatable")
@@ -220,6 +221,9 @@ func caCommand(args []string) error {
 		cfg.PCRKey = *pcrKey
 		if *out == "" || btoi(*authPath != "")+btoi(*authTPM)+btoi(*authOnce) != 1 {
 			return errors.New("ca create needs --out, and one of --authority, --authority-tpm and --authority-once")
+		}
+		if *windowOpen && !*authOnce {
+			return errors.New("--window-open is for --authority-once alone: any other CA is approved later, in a running system, where an open window signs for whoever comes first")
 		}
 		t, err := hostkey.ParseType(*typ)
 		if err != nil {
@@ -251,7 +255,7 @@ func caCommand(args []string) error {
 		if err != nil {
 			return err
 		}
-		opts := hostkey.CAOptions{Type: t, Bank: b, Slots: slots, WindowHandle: wh, PolicyRef: []byte(*ref)}
+		opts := hostkey.CAOptions{Type: t, Bank: b, Slots: slots, WindowHandle: wh, WindowOpen: *windowOpen, PolicyRef: []byte(*ref)}
 		var ca *hostkey.CA
 		if *authOnce {
 			// The values every slot is approved for, as the slots will hold
@@ -312,7 +316,11 @@ func caCommand(args []string) error {
 		fmt.Print(ca.Describe())
 		line, _ := ca.KnownHosts("*")
 		fmt.Printf("Clients trust it with this known_hosts line (narrow the * to the host's names):\n  %s\n", line)
-		fmt.Println("Its window is closed in this boot: it signs from the next boot on.")
+		if *windowOpen {
+			fmt.Println("Its window is OPEN in this boot: it signs until 'agent' or 'serve' closes it (or 'assh close').")
+		} else {
+			fmt.Println("Its window is closed in this boot: it signs from the next boot on.")
+		}
 		if !*authOnce {
 			fmt.Printf("Approve the PCR state it may sign in: assh ca approve --ca %s ...\n", *out)
 		}
@@ -1084,7 +1092,6 @@ func readPrivateKey(path string) (crypto.Signer, error) {
 // hostKeyFlags are what 'serve' and 'agent' share.
 type hostKeyFlags struct {
 	tpm, ca, state, keyType, principals, keyID string
-	closePCR                                   int
 	// conf is assh.conf: its slots are what a CA not created yet will read
 	// (noCA), its window handle what is closed when the CA cannot be read.
 	conf config.Config
@@ -1101,7 +1108,6 @@ func (h *hostKeyFlags) add(fs *flag.FlagSet, cfg config.Config, defaultState str
 	fs.StringVar(&h.keyType, "key-type", string(cfg.HostKeyType), "the host key: p256 or rsa2048, or a list in order of preference (the first the TPM takes)")
 	fs.StringVar(&h.principals, "principals", strings.Join(cfg.Principals, ","), "the host names the certificate is valid for, comma-separated; * any (the clients' known_hosts patterns still choose the hosts)")
 	fs.StringVar(&h.keyID, "key-id", cfg.KeyID, "the certificate's name in the clients' logs")
-	fs.IntVar(&h.closePCR, "close-pcr", cfg.ClosePCR, "also extend this PCR (0-15) when the window closes, for what others bind to it (default: none)")
 }
 
 // issue makes this boot's host key: certified through the first slot
@@ -1206,26 +1212,20 @@ func (h *hostKeyFlags) temporary(hk *hostkey.HostKey, err error, log ...func(str
 
 // closeWindow closes the window: the CA's window index, or - when the CA
 // could not be read - the one assh.conf names, if it is defined as a
-// window; then the extra PCR, if one is set.
+// window.
 func (h *hostKeyFlags) closeWindow(tpm transport.TPM, ca *hostkey.CA, log func(string)) error {
 	handle := tpm2.TPMHandle(h.conf.WindowHdl)
 	if ca != nil && ca.WindowHandle() != 0 {
 		handle = ca.WindowHandle()
 	}
-	var errs []error
-	if there, err := hostkey.CloseWindow(tpm, handle); err != nil {
-		errs = append(errs, err)
-	} else if there {
+	there, err := hostkey.CloseWindow(tpm, handle)
+	if err != nil {
+		return err
+	}
+	if there {
 		log(fmt.Sprintf("the window is closed (NV index 0x%08X): the CA signs nothing more until the next boot", uint32(handle)))
 	}
-	if h.closePCR >= 0 {
-		if err := hostkey.ExtendPCR(tpm, h.closePCR, "assh: closed"); err != nil {
-			errs = append(errs, err)
-		} else {
-			log(fmt.Sprintf("PCR %d is extended", h.closePCR))
-		}
-	}
-	return errors.Join(errs...)
+	return nil
 }
 
 // waitTPM opens the TPM once its device is there: early in a boot it may

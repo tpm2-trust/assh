@@ -4,6 +4,20 @@ Reasoning behind aSSH's design that the code and the README no longer
 carry: why it is as it is, what was tried and measured. The README says
 what it is.
 
+## A PCR extended at the close (until 2026-10-30)
+
+Before W, the window was a PCR (15) every slot had to read, extended when
+the window closed. With W in the CA's policy (2026-10-29) the PCR stayed as
+an extra, `--close-pcr` / `ASSH_CLOSE_PCR`, for what others bound to it
+(tpm2-kira's code screen, safearch). It was removed so that a CA closes one
+way everywhere: W alone. A PCR extended at the close also broke anything
+bound to it afterwards (a volume enrolled with `--tpm2-pcrs=15`), and a
+slot that leaves the PCR out was never stopped by it.
+
+W closed at creation made safearch's identity, made in the initrd, certify
+only from its second boot; `--window-open` restores the first, for CAs made
+once alone.
+
 ## go-tpm pinned past v0.9.8 (2026-10)
 
 go-tpm v0.9.8 cut an authorization value at any zero byte in its HMAC

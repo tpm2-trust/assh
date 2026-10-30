@@ -201,10 +201,10 @@ func TestCommand(t *testing.T) {
 	port := freePort(t)
 	state := filepath.Join(dir, "serve.pcrs.json")
 	srv := start(t, "serve", tpm, "--ca", ca, "--listen", fmt.Sprintf("127.0.0.1:%d", port),
-		"--authorized-keys", client+".pub", "--state", state, "--close-pcr", "15",
+		"--authorized-keys", client+".pub", "--state", state,
 		"--", "/bin/sh", "-c", "echo hello from $ASSH_USER")
 	srv.wait(t, "listening on")
-	if !strings.Contains(srv.String(), "the window is closed (NV index 0x01802915)") || !strings.Contains(srv.String(), "PCR 15 is extended") || !strings.Contains(srv.String(), "through slot 0") {
+	if !strings.Contains(srv.String(), "the window is closed (NV index 0x01802915)") || !strings.Contains(srv.String(), "through slot 0") {
 		t.Fatalf("serve:\n%s", srv.String())
 	}
 	caPub, _ := os.ReadFile(ca + ".pub")
@@ -214,10 +214,12 @@ func TestCommand(t *testing.T) {
 		t.Fatalf("ssh: %v\n%s\n%s", err, login, srv.String())
 	}
 
-	// The window is closed: a second server serves a temporary key.
+	// The window is closed: a second server serves a temporary key, in a
+	// state of PCR 15 not approved yet (approved below, from its record).
+	extend(t, sw, 15, "another combination")
 	port2 := freePort(t)
 	second := start(t, "serve", tpm, "--ca", ca, "--listen", fmt.Sprintf("127.0.0.1:%d", port2),
-		"--authorized-keys", client+".pub", "--state", state+".2", "--close-pcr", "15", "--", "/bin/sh", "-c", "echo hello from $ASSH_USER")
+		"--authorized-keys", client+".pub", "--state", state+".2", "--", "/bin/sh", "-c", "echo hello from $ASSH_USER")
 	second.wait(t, "listening on")
 	if !strings.Contains(second.String(), "is TEMPORARY: the CA's window is closed until the next boot") {
 		t.Fatalf("second serve:\n%s", second.String())
@@ -328,7 +330,6 @@ ASSH_TPM=%s
 ASSH_CA=%s
 ASSH_CA_SLOT_0=0,2,7,15
 ASSH_CA_SLOT_1=%s
-ASSH_CLOSE_PCR=15
 ASSH_AUTHORITY=%s
 ASSH_LISTEN=127.0.0.1:%d
 ASSH_AUTHORIZED_KEYS=%s
@@ -366,7 +367,7 @@ ASSH_STATE=%s
 	sw.Reboot(t) // a CA signs from the boot after its creation
 	srv := start(t, "serve", "--config", conf, "--", "/bin/sh", "-c", "echo hello from $ASSH_USER")
 	srv.wait(t, "listening on")
-	if !strings.Contains(srv.String(), "through slot 0") || !strings.Contains(srv.String(), "PCR 15 is extended") {
+	if !strings.Contains(srv.String(), "through slot 0") {
 		t.Fatalf("serve:\n%s", srv.String())
 	}
 	cert, ok := offeredKey(t, port).(*ssh.Certificate)

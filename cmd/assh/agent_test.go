@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -73,9 +75,7 @@ func extend(t *testing.T, sw *swtpmtest.SWTPM, pcr int, event string) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if err := hostkey.ExtendPCR(c, pcr, event); err != nil {
-		t.Fatal(err)
-	}
+	swtpmtest.Extend(t, c, pcr, event)
 }
 
 // agentSigns runs the agent and has it sign as sshd would, with the CA's
@@ -316,7 +316,6 @@ ASSH_CA=%s
 ASSH_AUTHORITY_TPM=yes
 ASSH_CA_SLOT_0=0,7,15
 ASSH_CA_SLOT_1=7,15
-ASSH_CLOSE_PCR=15
 ASSH_STATE=%s
 ASSH_AGENT_DIR=%s
 ASSH_AGENT_UID=%d
@@ -327,7 +326,7 @@ ASSH_AGENT_UID=%d
 	ag := start(t, "agent", "--config", conf)
 	ag.wait(t, "agent at")
 	ag.stop()
-	if !strings.Contains(ag.String(), "is TEMPORARY: no CA at "+ca+" yet") || !strings.Contains(ag.String(), "PCR 15 is extended") {
+	if !strings.Contains(ag.String(), "is TEMPORARY: no CA at "+ca+" yet") {
 		t.Fatalf("the agent before the CA:\n%s", ag.String())
 	}
 	if _, err := os.Stat(filepath.Join(runDir, "host-cert.pub")); err == nil {
@@ -405,7 +404,6 @@ ASSH_CA=%s
 ASSH_CA_BANK=auto
 ASSH_AUTHORITY_TPM=yes
 ASSH_CA_SLOT_0=0,7,15
-ASSH_CLOSE_PCR=15
 ASSH_STATE=%s
 ASSH_AGENT_DIR=%s
 ASSH_AGENT_UID=%d
@@ -419,7 +417,7 @@ ASSH_AGENT_UID=%d
 	}
 
 	s.must([][]byte{lockout}, "tpm", "da", "--config", conf, "--new-lockout-auth-fd", "3", "--max-tries", "3", "--recovery", "1800", "--lockout-recovery", "1800")
-	if out := agent(); !strings.Contains(out, "is TEMPORARY: no CA at "+ca+", and none can be made") || !strings.Contains(out, "sha1 is not allowed") || !strings.Contains(out, "PCR 15 is extended") {
+	if out := agent(); !strings.Contains(out, "is TEMPORARY: no CA at "+ca+", and none can be made") || !strings.Contains(out, "sha1 is not allowed") {
 		t.Fatalf("the agent, sha1 not allowed:\n%s", out)
 	}
 	if _, err := os.Stat(state); !os.IsNotExist(err) {
@@ -480,7 +478,6 @@ func TestMoveAhead(t *testing.T) {
 ASSH_CA=%s
 ASSH_AUTHORITY_TPM=yes
 ASSH_CA_SLOT_0=0,7,15
-ASSH_CLOSE_PCR=15
 ASSH_STATE=%s
 ASSH_AGENT_DIR=%s
 ASSH_AGENT_UID=%d
@@ -543,7 +540,6 @@ func TestAgentRSA(t *testing.T) {
 ASSH_CA=%s
 ASSH_HOSTKEY_TYPE=rsa2048
 ASSH_CA_SLOT_0=7,15
-ASSH_CLOSE_PCR=15
 ASSH_AGENT_DIR=%s
 ASSH_AGENT_UID=%d
 `, sw.Sock, filepath.Join(dir, "ca.json"), runDir, os.Getuid())), 0o644)
@@ -602,7 +598,6 @@ ASSH_AUTHORITY_ONCE=yes
 ASSH_CA_SLOT_0=0,7,15
 ASSH_CA_SLOT_0_SIGNED=11
 ASSH_CA_SLOT_1=7,15
-ASSH_CLOSE_PCR=15
 ASSH_PCR_KEY=%s
 ASSH_PCR_SIGNATURE=%s
 ASSH_KEY_ID=safespace
@@ -659,5 +654,55 @@ ASSH_AGENT_UID=%d
 	}
 	if out, err := assh("ca", "approve", "--yes", "--config", conf).CombinedOutput(); err == nil {
 		t.Fatalf("an approval after the creation:\n%s", out)
+	}
+}
+
+// The identity made once with the window of its boot left open
+// (ASSH_WINDOW_OPEN, safearch's initrd): the agent of that boot certifies and
+// closes it, a second agent in the same boot finds it closed. Any other
+// authority refuses an open window.
+func TestAuthorityOnceWindowOpen(t *testing.T) {
+	sw := swtpmtest.Start(t)
+	dir := t.TempDir()
+	ca, runDir := filepath.Join(dir, "ca.json"), filepath.Join(dir, "run")
+	conf := filepath.Join(dir, "assh.conf")
+	os.WriteFile(conf, []byte(fmt.Sprintf(`ASSH_TPM=%s
+ASSH_CA=%s
+ASSH_AUTHORITY_ONCE=yes
+ASSH_WINDOW_OPEN=yes
+ASSH_CA_SLOT_0=0,7,15
+ASSH_AGENT_DIR=%s
+ASSH_AGENT_UID=%d
+`, sw.Sock, ca, runDir, os.Getuid())), 0o644)
+	agent := func() string {
+		t.Helper()
+		ag := start(t, "agent", "--config", conf)
+		ag.wait(t, "agent at")
+		ag.stop()
+		return ag.String()
+	}
+
+	extend(t, sw, 15, "combination:a")
+	out := run(t, "ca", "create", "--config", conf, "--events", "15:combination:a", "--events", "15:sealed")
+	if !strings.Contains(out, "Its window is OPEN in this boot") {
+		t.Fatalf("ca create:\n%s", out)
+	}
+	extend(t, sw, 15, "sealed")
+	if out := agent(); !strings.Contains(out, "through slot 0") || !strings.Contains(out, "the window is closed (NV index 0x01802915)") {
+		t.Fatalf("the creation's boot:\n%s", out)
+	}
+	if out := agent(); !strings.Contains(out, "TEMPORARY: the CA's window is closed until the next boot") {
+		t.Fatalf("a second agent in the creation's boot:\n%s", out)
+	}
+
+	auth := filepath.Join(dir, "auth.pub")
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	der, _ := x509.MarshalPKIXPublicKey(k.Public())
+	writePEM(t, auth, "PUBLIC KEY", der)
+	for _, a := range [][]string{{"--authority", auth}, {"--authority-tpm", "--pin-fd", "0"}} {
+		args := append([]string{"ca", "create", "--tpm=" + sw.Sock, "--out", filepath.Join(dir, "other.json"), "--window-handle", "0x01802916", "--window-open"}, a...)
+		if out, err := assh(args...).CombinedOutput(); err == nil || !strings.Contains(string(out), "--window-open is for --authority-once alone") {
+			t.Fatalf("%v: %v\n%s", a, err, out)
+		}
 	}
 }

@@ -40,9 +40,7 @@ func signPCRs(t *testing.T, key *rsa.PrivateKey, bank Bank, pcrs []int, values m
 
 func event(t *testing.T, tpm transport.TPM, pcr int, e string) {
 	t.Helper()
-	if err := ExtendPCR(tpm, pcr, e); err != nil {
-		t.Fatal(err)
-	}
+	swtpmtest.Extend(t, tpm, pcr, e)
 }
 
 // A CA made once: its authority, made in the TPM for the creation, approves

@@ -202,16 +202,19 @@ suspend keeps the lock.
   `assh close` after the agent too (`ExecStopPost=`), which also closes it
   when the agent could not start, or assh.conf does not parse.
 - **A CA is created with its window closed**: it signs from the next boot
-  on, never in a boot whose window has been open to every process.
+  on, never in a boot whose window has been open to every process. The
+  one exception is a CA whose authority is made once (below): `ca create
+  --window-open` (`ASSH_WINDOW_OPEN=yes`) leaves the window of its boot
+  open, so that it signs in that boot until `agent` or `serve` closes it -
+  for a creation where nothing untrusted runs before them (an initrd). Any
+  other CA refuses it: its approvals come later, in a running system, where
+  an open window signs for whoever comes first.
 - W defined again alike (root can, with the owner authorization) has W's
   Name back, but its first value lands above every value a counter had:
   never v. Deleting or incrementing W stops the CA - a denial of service,
   never a way in.
-- `--close-pcr N` (`ASSH_CLOSE_PCR`, 0 to 15) extends a PCR as well when
-  the window closes, for what others bind to it (tpm2-kira's code screen,
-  safearch's PCR 15). Anything bound to that PCR that is used afterwards
-  (a volume enrolled with `systemd-cryptenroll --tpm2-pcrs=15`) no longer
-  unlocks.
+- W is the window alone: closing it extends no PCR. A PCR in a slot (the
+  combination in PCR 15, say) is what the approval says, nothing more.
 
 ### The temporary key
 
@@ -369,7 +372,9 @@ calculated from their events (`--events PCR:EVENT`) - and flushes it; the
 NULL hierarchy's seed is new at the next boot anyway. Nobody can approve
 another state after: no PIN to guess, no key to steal, nothing root can
 do. What the approvals do not cover gets a temporary key until the CA is
-made again; with signed PCRs, updates need nothing.
+made again; with signed PCRs, updates need nothing. With `--window-open`
+(`ASSH_WINDOW_OPEN=yes`) it certifies in the boot that made it as well
+(see [The window](#the-window)).
 
 ### PCRs a build signs
 
@@ -629,10 +634,11 @@ ASSH_PRINCIPALS=host.example,192.0.2.10
 | `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0) | slot 0 `0,7` |
 | `ASSH_CA_REF` | `ca create --ref` | `assh` |
 | `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM`, `ASSH_AUTHORITY_ONCE` | `ca create --authority`, `--authority-tpm`, `--authority-once` (`yes`/`no`) | - |
+| `ASSH_WINDOW_OPEN` | `ca create --window-open` (`yes`/`no`; with `--authority-once` alone): the window of the creating boot left open | `no` |
 | `ASSH_CA_SLOT_<N>_SIGNED`, `ASSH_PCR_KEY`, `ASSH_PCR_SIGNATURE` | PCRs of slot N a key signs, `ca create --pcr-key` (PEM), its signatures (systemd's JSON) | - |
 | `ASSH_WINDOW_HANDLE`, `ASSH_PIN_HANDLE`, `ASSH_COUNTER_HANDLE` | `--window-handle`, `--pin-handle`, `--counter-handle` | `0x01802915`, `0x01802913`, `0x01802912` |
 | `ASSH_HOSTKEY_TYPE`, `ASSH_PRINCIPALS`, `ASSH_KEY_ID` | `--key-type` (as `ASSH_CA_TYPE`, a list too), `--principals`, `--key-id` | `p256`, `*`, `assh` |
-| `ASSH_CLOSE_PCR`, `ASSH_STATE` | `--close-pcr` (a PCR extended as well when the window closes), `--state` | none, the command's own |
+| `ASSH_STATE` | `--state` | the command's own |
 | `ASSH_LISTEN`, `ASSH_AUTHORIZED_KEYS`, `ASSH_USER`, `ASSH_SOCKET` | `serve --listen`, `--authorized-keys`, `--user`, `--socket` | `:22` |
 | `ASSH_CHILD_UIDS` | `serve --child-uids` | `0x7FFE0000-0x7FFEFFFF` |
 | `ASSH_AGENT_DIR`, `ASSH_AGENT_UID` | `agent --dir`, `--uid` | `/run/assh`, `0` |
@@ -651,7 +657,7 @@ server's settings in one.
 
 | Command | What it does |
 |---|---|
-| `ca create` | makes the CA in the TPM with its slots, its window index (closed in this boot), and its authority: `--authority PUB`, `--authority-tpm` (asks for the new PIN), `--authority-once`; prints the known_hosts line |
+| `ca create` | makes the CA in the TPM with its slots, its window index (closed in this boot; `--window-open` with `--authority-once`), and its authority: `--authority PUB`, `--authority-tpm` (asks for the new PIN), `--authority-once`; prints the known_hosts line |
 | `ca show` | the CA, its slots and approvals, the known_hosts line; with the TPM: the counter's generation, whether the window is open and the CA signs now, the dictionary attack state |
 | `ca approve` | approves a state for slots (`--slot N[,N...]`, default every slot): the TPM's now, `--values FILE`, `--events PCR:EVENT`; with the PIN (`--next-generation`, `--redefine-counter`), or a key elsewhere (`--authority-key`, `--digest`, `--signature`); shows the statement and asks (`--yes`) |
 | `ca sign` | where the key is: signs what a statement says (`--authority-key`, `--statement`, `--signature`) |

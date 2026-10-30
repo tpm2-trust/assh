@@ -20,7 +20,9 @@ import (
 // The CA's policy is PolicyAuthorize(authority, ref) ; PolicyCommandCode(Sign)
 // ; PolicyNV(W == v). Closing the window is TPM2_NV_ReadLock(W): PolicyNV then
 // fails, whatever an approval says, until TPM2_Startup(CLEAR) - the next boot.
-// W is closed when it is made: a CA signs from the boot after its creation.
+// W is closed when it is made: a CA signs from the boot after its creation -
+// except a CA whose authority is made once (CreateOnceCA), where the creator
+// may leave it open (CAOptions.WindowOpen).
 // Undefined and defined again alike, W has its Name back but its first value
 // lands above every value a counter has had (TPM 2.0 Part 1, 37.2.6.3): never
 // v again. Deleting W stops the CA, as deleting the CA would.
@@ -62,9 +64,9 @@ func windowPublic(h tpm2.TPMHandle) tpm2.TPMSNVPublic {
 	}
 }
 
-// defineWindow defines W at h, gives it its one value and closes it: a new
-// CA signs from the next boot on.
-func defineWindow(t transport.TPM, h tpm2.TPMHandle) (*Window, error) {
+// defineWindow defines W at h and gives it its one value. Unless open, it
+// closes it: the new CA signs from the next boot on.
+func defineWindow(t transport.TPM, h tpm2.TPMHandle, open bool) (*Window, error) {
 	if err := ownerNVHandle(h); err != nil {
 		return nil, err
 	}
@@ -105,8 +107,10 @@ func defineWindow(t transport.TPM, h tpm2.TPMHandle) (*Window, error) {
 	}
 	// Closed in the boot that makes it: the CA signs from the next boot on,
 	// not in one whose window has been open to every process all along.
-	if _, err := CloseWindow(t, h); err != nil {
-		return fail(err)
+	if !open {
+		if _, err := CloseWindow(t, h); err != nil {
+			return fail(err)
+		}
 	}
 	return &Window{Public: tpm2.Marshal(pub), Value: v}, nil
 }
@@ -204,21 +208,4 @@ func CloseWindow(t transport.TPM, h tpm2.TPMHandle) (bool, error) {
 		return true, fmt.Errorf("closing the window (NV index 0x%08X): %w", uint32(h), err)
 	}
 	return true, nil
-}
-
-// ExtendPCR extends pcr with event in every bank (TPM2_PCR_Event): for what
-// others bind to that PCR, beside the CA's window. 16 and 23, which any
-// process can reset, and the DRTM PCRs 17-22 are refused.
-func ExtendPCR(t transport.TPM, pcr int, event string) error {
-	if pcr < 0 || pcr > 15 {
-		return fmt.Errorf("PCR %d: 0 to 15 (16 to 23 can be reset)", pcr)
-	}
-	_, err := tpm2.PCREvent{
-		PCRHandle: tpm2.AuthHandle{Handle: tpm2.TPMHandle(pcr), Auth: tpm2.PasswordAuth(nil)},
-		EventData: tpm2.TPM2BEvent{Buffer: []byte(event)},
-	}.Execute(t)
-	if err != nil {
-		return fmt.Errorf("extending PCR %d: %w", pcr, err)
-	}
-	return nil
 }

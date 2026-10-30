@@ -248,6 +248,9 @@ func LockoutAuthSet(t transport.TPM) (bool, error) {
 // removes what it made. The CA has no approval yet; its counter is at
 // generation 1.
 func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
+	if o.WindowOpen {
+		return nil, errOpenWindow
+	}
 	if o.PINHandle == 0 {
 		o.PINHandle = DefaultPINHandle
 	}
@@ -357,7 +360,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	if err := ca.Sync(t); err != nil {
 		return nil, err
 	}
-	if ca.Window, err = defineWindow(t, wHandle); err != nil {
+	if ca.Window, err = defineWindow(t, wHandle, false); err != nil {
 		return nil, err
 	}
 	defined = append(defined, windowPublic(wHandle))

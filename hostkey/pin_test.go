@@ -256,9 +256,7 @@ func TestMove(t *testing.T) {
 	swtpmtest.NoneLeft(t, tpm, "refused signature")
 
 	// The new state Y: PCR 15 moves on, approved at generation 2.
-	if err := ExtendPCR(tpm, 15, "combination Y"); err != nil {
-		t.Fatal(err)
-	}
+	swtpmtest.Extend(t, tpm, 15, "combination Y")
 	if err := approveNow(t, tpm, ca, testPIN); err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,48 @@
-# PLAN: security fixes, P1
+# PLAN: the window W alone; a window left open for a creation by `--authority-once`
+
+Status: **aSSH done** (2026-10-30), uncommitted. aSSH first; tpm2-kira and safearch follow after the
+owner is told.
+
+## Goal
+
+- W is the window, everywhere: nothing else closes a CA, and no PCR is extended at the
+  close. `--close-pcr` / `ASSH_CLOSE_PCR` go.
+- An opt-in for a CA made where nothing untrusted runs before `agent` closes the window
+  (safearch's initrd): `ca create --window-open` / `ASSH_WINDOW_OPEN=yes` makes W without
+  locking it, so the CA certifies in the boot that made it.
+
+## Steps
+
+- [x] 1. `CAOptions.WindowOpen`: `CreateOnceCA` alone takes it; `CreateCA` and
+       `CreatePINCA` refuse it (their approvals come later, in a running system: an open
+       window would sign for any root process). `defineWindow` locks W unless asked.
+- [x] 2. `ca create --window-open`, `ASSH_WINDOW_OPEN` (refused without
+       `--authority-once`); the message says the window is open until `agent`/`serve`
+       closes it.
+- [x] 3. `--close-pcr`, `ASSH_CLOSE_PCR`, `Config.ClosePCR` and the extend at the close
+       go; `hostkey.ExtendPCR` moves to the tests (`swtpmtest.Extend`).
+- [x] 4. Tests: a once-CA with the window open signs in the creating boot until closed;
+       `CreateCA`/`CreatePINCA` with it refused; `ca create --window-open` without
+       `--authority-once` refused; `ASSH_CLOSE_PCR` an unknown key.
+- [x] 5. README (flag, key table, security), AGENTS.md (the window rule's one exception),
+       HISTORY.md (the close PCR).
+- [x] 6. `go test -count=1 ./...` (passes); then tell the owner what tpm2-kira and safearch need.
+
+## What breaks
+
+- `ASSH_CLOSE_PCR` in an assh.conf is an unknown key: tpm2-kira writes it (to be removed
+  there, with PCR 15 dropped from its default slots), safearch does not.
+- `hostkey.ExtendPCR` is gone: tpm2-kira's code screen calls it (removed there).
+
+## Decisions (2026-10-30)
+
+1. The opt-in only with `--authority-once`.
+2. `--close-pcr` removed entirely.
+3. tpm2-kira drops PCR 15 from its default slots (after aSSH, once the owner is told).
+
+---
+
+# PLAN (done): security fixes, P1
 
 Status: **implemented** (2026-10-29); the VM runs are to come. From the security review of
 4f0ddf1; P2, P3 and the info items are in TODO-SEC.md.

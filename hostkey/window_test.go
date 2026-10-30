@@ -62,13 +62,13 @@ func TestWindow(t *testing.T) {
 	sw.Reboot(t)
 	certified(t, tpm, ca, opts, 0)
 
-	// W undefined and defined again alike, then given its one increment:
-	// its value is above v, the CA signs nothing.
+	// W undefined and defined again alike, given its one increment and left
+	// open: its value is above v, the CA signs nothing.
 	w, _ := ca.window()
 	if ok, err := persist.RemoveNV(tpm, w.NVIndex, persist.Any); err != nil || !ok {
 		t.Fatal(err)
 	}
-	clone, err := defineWindow(tpm, w.NVIndex)
+	clone, err := defineWindow(tpm, w.NVIndex, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,4 +142,46 @@ func TestCloseWindow(t *testing.T) {
 	if pub.Attributes.ReadLocked {
 		t.Fatal("the foreign index was read-locked")
 	}
+}
+
+// A CA whose authority is made once may leave the window of the boot that
+// makes it open: it signs in that boot until Close, and from the next boot
+// on as any CA. Every other CA refuses it: its approvals come later, in a
+// running system.
+func TestWindowOpen(t *testing.T) {
+	sw := swtpmtest.Start(t)
+	tpm := sw.Open(t)
+	opts := IssueOptions{Principals: []string{"host.example"}, Open: sw.Opener()}
+	now, err := ReadPCRs(tpm, SHA256, []int{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := CreateOnceCA(tpm, CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7}, WindowOpen: true}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open, err := ca.WindowOpen(tpm); err != nil || !open {
+		t.Fatalf("a CA made with its window open: open %v, %v", open, err)
+	}
+	certified(t, tpm, ca, opts, 0)
+	if err := ca.Close(tpm); err != nil {
+		t.Fatal(err)
+	}
+	if hk, err := Issue(tpm, ca, opts); err != nil || !errors.Is(hk.Temporary, ErrWindowClosed) {
+		t.Fatalf("after Close: %v %v", hk, err)
+	}
+	sw.Reboot(t)
+	certified(t, tpm, ca, opts, 0)
+
+	o := CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7}, WindowOpen: true, WindowHandle: 0x01802916}
+	if _, err := CreateCA(tpm, authority(t).Public(), o); !errors.Is(err, errOpenWindow) {
+		t.Fatalf("CreateCA with its window open: %v", err)
+	}
+	if _, err := CreatePINCA(tpm, PINCAOptions{CAOptions: o, PIN: func() ([]byte, error) { return []byte("123456"), nil }}); !errors.Is(err, errOpenWindow) {
+		t.Fatalf("CreatePINCA with its window open: %v", err)
+	}
+	if _, _, err := persist.ReadNVPublic(tpm, 0x01802916); err == nil {
+		t.Fatal("a refused CA left a window index")
+	}
+	swtpmtest.NoneLeft(t, tpm, "TestWindowOpen")
 }

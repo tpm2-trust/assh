@@ -160,6 +160,12 @@ type CAOptions struct {
 	Slots []SlotSpec
 	// WindowHandle is W's NV handle (window.go); 0: DefaultWindowHandle.
 	WindowHandle tpm2.TPMHandle
+	// WindowOpen leaves the window of the boot that makes the CA open, so
+	// that it signs in it until Close. CreateOnceCA alone takes it, for a
+	// creation where nothing untrusted runs before the window is closed (an
+	// initrd): its approvals exist from the start. CreateCA and CreatePINCA
+	// refuse it.
+	WindowOpen bool
 	// PolicyRef ties the authority's signatures to this CA's use ("assh
 	// boot", say): an approval made for a CA with another reference does
 	// not let this one sign. At most 32 bytes.
@@ -238,6 +244,17 @@ func (f *CA) makeKey(t transport.TPM, p *primary) error {
 // has no approval yet: Approve adds them. Its approvals are never revoked;
 // CreatePINCA makes a CA whose are.
 func CreateCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, error) {
+	if o.WindowOpen {
+		return nil, errOpenWindow
+	}
+	return createCA(t, authority, o)
+}
+
+// errOpenWindow refuses an open window for a CA whose approvals come later,
+// in a running system: it would sign for whoever runs first.
+var errOpenWindow = errors.New("a window left open is for a CA whose authority is made once (--authority-once)")
+
+func createCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, error) {
 	ca, err := newCA(t, o)
 	if err != nil {
 		return nil, err
@@ -261,7 +278,7 @@ func CreateCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, er
 		return nil, err
 	}
 	defer flush(t, p.handle)
-	if ca.Window, err = defineWindow(t, windowHandle(o.WindowHandle)); err != nil {
+	if ca.Window, err = defineWindow(t, windowHandle(o.WindowHandle), o.WindowOpen); err != nil {
 		return nil, err
 	}
 	if err := ca.makeKey(t, p); err != nil {

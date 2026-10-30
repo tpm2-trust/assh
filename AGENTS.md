@@ -28,7 +28,10 @@ name is a change to them: build and test tpm2-kira after one.
   approval can leave it out. A CA is created with its window closed, and
   every way out of `agent`/`serve` - a failure at any step - closes it
   (`assh close` after the unit, too). Never add a path that returns before
-  the close, or a CA that signs in the boot that made it.
+  the close, or a CA that signs in the boot that made it - but a CA made
+  once with `--window-open`, whose approvals exist at its creation, made
+  where nothing untrusted runs before the agent (an initrd). Nothing but W
+  closes a CA: no PCR is extended at the close.
 - **A temporary key is a host key like the others**: made in the TPM
   under the NULL hierarchy, never in software, and never certified. It is
   what a server serves when no slot certifies, and before the CA exists

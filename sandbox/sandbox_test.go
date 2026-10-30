@@ -90,6 +90,9 @@ func confinedChecks(dir string) int {
 	}
 	for _, t := range tasks {
 		b, err := os.ReadFile(t)
+		if errors.Is(err, os.ErrNotExist) {
+			continue // the thread ended since the listing
+		}
 		if err != nil {
 			return fail("%s: %v", t, err)
 		}
