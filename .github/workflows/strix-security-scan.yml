@@ -37,7 +37,8 @@ jobs:
         run: |
           # Official Strix installer, always the latest release
           curl -fsSL https://strix.ai/install | bash
-          strix --version
+          # $GITHUB_PATH takes effect from the next step on
+          "$HOME/.strix/bin/strix" --version
 
       - name: Run Strix Security Scan
         env:
