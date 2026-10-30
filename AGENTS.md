@@ -22,14 +22,18 @@ name is a change to them: build and test tpm2-kira after one.
 - **hostkey builds with go-tpm as released.** tpm2-kira compiles assh with
   its own go-tpm; assh's `replace` (the fork) does not reach it. Commands
   only the fork has are used in `tpmadmin` alone.
-- **The window closes every slot.** A CA with a window has every slot
-  read that PCR; a slot that does not would sign after the window closed.
+- **The window is the CA's own policy, and it fails closed.** Every CA
+  has a window index W that its policy reads (`PolicyAuthorize ;
+  PolicyCommandCode(Sign) ; PolicyNV(W == v)`), read-locked to close it: no
+  approval can leave it out. A CA is created with its window closed, and
+  every way out of `agent`/`serve` - a failure at any step - closes it
+  (`assh close` after the unit, too). Never add a path that returns before
+  the close, or a CA that signs in the boot that made it.
 - **A temporary key is a host key like the others**: made in the TPM
   under the NULL hierarchy, never in software, and never certified. It is
   what a server serves when no slot certifies, and before the CA exists
-  (assh.conf naming its slots: their PCRs recorded, the window closed all
-  the same); an unreadable CA file or a TPM that does not open stays an
-  error.
+  (assh.conf naming its slots: their PCRs recorded); an unreadable CA file
+  or a TPM that does not open stays an error - with the window closed.
 - **SHA-1 only where the TPM allows it.** `auto` reads SHA-1 only on a
   TPM without an active SHA-256 bank and while `hostkey.SHA1Handle` is
   there; others (safearch's initrd) read that index at its handle, so it
@@ -49,15 +53,22 @@ name is a change to them: build and test tpm2-kira after one.
   (`hostkey.fileVersion`); another version is an error that says to
   create the CA again. No migrations.
 - **The side that speaks SSH holds nothing.** `server`'s unprivileged half
-  runs as nobody, in namespaces of its own, confined by `sandbox`, and asks for
-  every signature; it never gets the key or a session's other end before
-  a login. Keep it that way.
+  runs as a uid no one else has (`sandbox.ClaimUID`; nobody only when none
+  is free), in namespaces of its own, confined by `sandbox` - not dumpable,
+  no namespace it could make - and asks for every signature; it never gets
+  the key or a session's other end before a login. Keep it that way.
+- **Whoever approves reads what is approved.** `ca approve` shows the
+  statement and asks; a key elsewhere signs a statement (`ca sign`), not
+  bytes it cannot read. Nothing from the CA file or assh.conf is taken as
+  what the owner meant.
 - **NV indices and EFI variables go through `persist`.** Nothing calls
   NVUndefineSpace or writes efivarfs by itself: an index is removed only
-  when it is provably ours (`persist.Shaped`, `persist.Named`) - the one
-  exception, `RedefineCounter`, replaces what is at the CA's own handle
-  after the PIN is proven - absent is not an error, and a variable is
-  written in place, never removed first. Programs built on aSSH use the
+  when it is provably ours - defined exactly as aSSH defines it at that
+  handle (`persist.Defined`), never because a CA file names it; the
+  exceptions: `RedefineCounter` replaces what is at the CA's own handle
+  after the PIN is proven, and `ca remove --force` removes what a person
+  saw and confirmed (`persist.Any`) - absent is not an error, and a
+  variable is written in place, never removed first. Programs built on aSSH use the
   same package (tpm2-kira) or the `assh efivar` command (safearch's
   scripts).
 - **A confinement step covers every thread.** prctl, Landlock and

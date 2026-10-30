@@ -1,6 +1,6 @@
 // Package config is assh.conf: every setting of assh in one file, KEY=VALUE
 // lines (ASSH_*), so that a command needs no more than --config. The CA
-// (where it is kept, its key, its slots and their PCRs, the window), the
+// (where it is kept, its key, its slots and their PCRs, its window index), the
 // host key and the server. A flag given on the command line wins over the
 // file. Projects that use assh as a library read the same file through this
 // package and take the settings they use.
@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/tpm2-trust/assh/hostkey"
+	"github.com/tpm2-trust/assh/sandbox"
 )
 
 // DefaultPath is where the assh command looks when no --config is given.
@@ -38,7 +39,7 @@ type Config struct {
 	Signed     map[int][]int // ASSH_CA_SLOT_<N>_SIGNED: PCRs of slot N that ASSH_PCR_KEY signs
 	PCRKey     string        // ASSH_PCR_KEY: the public key (PEM) whose signatures of PCRs a slot takes
 	PCRSigs    string        // ASSH_PCR_SIGNATURE: its signatures as systemd writes them (JSON)
-	Window     int           // ASSH_CA_WINDOW: 0 none
+	WindowHdl  uint32        // ASSH_WINDOW_HANDLE: the CA's window index
 	PolicyRef  string        // ASSH_CA_REF
 	Authority  string        // ASSH_AUTHORITY: the authority's public key (PEM), a key elsewhere
 	AuthTPM    bool          // ASSH_AUTHORITY_TPM: the authority in the TPM, opened by a PIN
@@ -49,13 +50,15 @@ type Config struct {
 	HostKeyType hostkey.Type // ASSH_HOSTKEY_TYPE
 	Principals  []string     // ASSH_PRINCIPALS: comma-separated; * any
 	KeyID       string       // ASSH_KEY_ID
-	ClosePCR    int          // ASSH_CLOSE_PCR: -1 the CA's window
+	ClosePCR    int          // ASSH_CLOSE_PCR: a PCR extended when the window closes; -1 none
 	State       string       // ASSH_STATE: "" the command's own
 
 	Listen         string // ASSH_LISTEN
 	AuthorizedKeys string // ASSH_AUTHORIZED_KEYS
 	User           string // ASSH_USER
 	Socket         string // ASSH_SOCKET
+	// ASSH_CHILD_UIDS: where the unprivileged half's uid is chosen from
+	ChildUIDs sandbox.UIDRange
 
 	AgentDir string // ASSH_AGENT_DIR
 	AgentUID int    // ASSH_AGENT_UID
@@ -76,11 +79,13 @@ func Default() Config {
 		PolicyRef:   "assh",
 		PINHandle:   uint32(hostkey.DefaultPINHandle),
 		CounterHdl:  uint32(hostkey.DefaultCounterHandle),
+		WindowHdl:   uint32(hostkey.DefaultWindowHandle),
 		HostKeyType: hostkey.P256,
 		Principals:  []string{"*"},
 		KeyID:       "assh",
 		ClosePCR:    -1,
 		Listen:      ":22",
+		ChildUIDs:   sandbox.DefaultUIDs,
 		AgentDir:    "/run/assh",
 		Set:         map[string]bool{},
 	}
@@ -167,8 +172,6 @@ func (c *Config) set(key, val string) error {
 		c.CAType, err = hostkey.ParseType(val)
 	case "ASSH_CA_BANK":
 		c.Bank, err = hostkey.ParseBank(val)
-	case "ASSH_CA_WINDOW":
-		c.Window, err = pcr(val, 0)
 	case "ASSH_CA_REF":
 		if len(val) > 32 {
 			return errors.New("at most 32 bytes")
@@ -188,6 +191,8 @@ func (c *Config) set(key, val string) error {
 		c.PINHandle, err = handle(val)
 	case "ASSH_COUNTER_HANDLE":
 		c.CounterHdl, err = handle(val)
+	case "ASSH_WINDOW_HANDLE":
+		c.WindowHdl, err = handle(val)
 	case "ASSH_HOSTKEY_TYPE":
 		c.HostKeyType, err = hostkey.ParseType(val)
 	case "ASSH_PRINCIPALS":
@@ -209,6 +214,8 @@ func (c *Config) set(key, val string) error {
 		c.User = val
 	case "ASSH_SOCKET":
 		c.Socket = val
+	case "ASSH_CHILD_UIDS":
+		c.ChildUIDs, err = sandbox.ParseUIDRange(val)
 	case "ASSH_AGENT_DIR":
 		c.AgentDir, err = nonEmpty(val)
 	case "ASSH_AGENT_UID":
@@ -222,15 +229,8 @@ func (c *Config) set(key, val string) error {
 	return err
 }
 
-// check is what one line cannot tell: the slots fit the window.
+// check is what one line cannot tell.
 func (c *Config) check() error {
-	if c.Window != 0 {
-		for _, n := range c.SlotNumbers() {
-			if !slices.Contains(c.Slots[n], c.Window) {
-				return fmt.Errorf("%s does not read PCR %d, ASSH_CA_WINDOW: the window would not close it", slotKey(n), c.Window)
-			}
-		}
-	}
 	if n := btoi(c.Authority != "") + btoi(c.AuthTPM) + btoi(c.AuthOnce); n > 1 {
 		return errors.New("ASSH_AUTHORITY, ASSH_AUTHORITY_TPM=yes and ASSH_AUTHORITY_ONCE=yes: the authority is one of them")
 	}
@@ -330,13 +330,13 @@ func (c Config) Lines() [][2]string {
 	}
 	add("ASSH_PCR_KEY", c.PCRKey, "", false)
 	add("ASSH_PCR_SIGNATURE", c.PCRSigs, "", false)
-	add("ASSH_CA_WINDOW", strconv.Itoa(c.Window), "0", false)
 	add("ASSH_CA_REF", c.PolicyRef, d.PolicyRef, false)
 	add("ASSH_AUTHORITY", c.Authority, "", false)
 	add("ASSH_AUTHORITY_TPM", map[bool]string{true: "yes", false: "no"}[c.AuthTPM], "no", false)
 	add("ASSH_AUTHORITY_ONCE", map[bool]string{true: "yes", false: "no"}[c.AuthOnce], "no", false)
 	add("ASSH_PIN_HANDLE", fmt.Sprintf("0x%08X", c.PINHandle), fmt.Sprintf("0x%08X", d.PINHandle), false)
 	add("ASSH_COUNTER_HANDLE", fmt.Sprintf("0x%08X", c.CounterHdl), fmt.Sprintf("0x%08X", d.CounterHdl), false)
+	add("ASSH_WINDOW_HANDLE", fmt.Sprintf("0x%08X", c.WindowHdl), fmt.Sprintf("0x%08X", d.WindowHdl), false)
 	add("ASSH_HOSTKEY_TYPE", string(c.HostKeyType), string(d.HostKeyType), false)
 	add("ASSH_PRINCIPALS", strings.Join(c.Principals, ","), "*", false)
 	add("ASSH_KEY_ID", c.KeyID, d.KeyID, false)
@@ -346,6 +346,7 @@ func (c Config) Lines() [][2]string {
 	add("ASSH_AUTHORIZED_KEYS", c.AuthorizedKeys, "", false)
 	add("ASSH_USER", c.User, "", false)
 	add("ASSH_SOCKET", c.Socket, "", false)
+	add("ASSH_CHILD_UIDS", c.ChildUIDs.String(), d.ChildUIDs.String(), false)
 	add("ASSH_AGENT_DIR", c.AgentDir, d.AgentDir, false)
 	add("ASSH_AGENT_UID", strconv.Itoa(c.AgentUID), "0", false)
 	return out
@@ -435,14 +436,14 @@ func quote(v string) string {
 
 // Match makes the CA's slots the file's: a slot the file adds is added, one
 // it leaves out is taken away with its approvals, one whose PCRs changed is
-// replaced (its approvals go). The file's window, key type, bank and policy
-// ref are the CA's for good: a difference is an error that says to create
+// replaced (its approvals go). The file's window index, key type, bank and
+// policy ref are the CA's for good: a difference is an error that says to create
 // the CA again. changed says whether the CA is different now; a file
 // without slots changes nothing.
 func (c Config) Match(ca *hostkey.CA) (changed bool, err error) {
 	switch {
-	case c.Window != ca.Window:
-		return false, fmt.Errorf("ASSH_CA_WINDOW is %d, the CA's window %d: a window is the CA's for good, create the CA again", c.Window, ca.Window)
+	case c.Set["ASSH_WINDOW_HANDLE"] && c.WindowHdl != uint32(ca.WindowHandle()):
+		return false, fmt.Errorf("ASSH_WINDOW_HANDLE is 0x%08X, the CA's window index 0x%08X: create the CA again", c.WindowHdl, uint32(ca.WindowHandle()))
 	case !slices.Contains(c.CAType.Choices(), ca.Type):
 		return false, fmt.Errorf("ASSH_CA_TYPE is %s, the CA's key %s: create the CA again", c.CAType, ca.Type)
 	case c.Bank != hostkey.Auto && c.Bank != ca.Bank:

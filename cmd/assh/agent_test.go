@@ -73,7 +73,7 @@ func extend(t *testing.T, sw *swtpmtest.SWTPM, pcr int, event string) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if err := hostkey.Close(c, pcr, event); err != nil {
+	if err := hostkey.ExtendPCR(c, pcr, event); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -148,8 +148,8 @@ func agentTemporary(t *testing.T, s *secrets, sw *swtpmtest.SWTPM, ca, runDir st
 }
 
 // A CA with its authority in the TPM, as safespace runs it: the lockout
-// authorization first; the PIN on a file descriptor; two slots with the
-// window PCR 15, slot 0 also reading PCR 14 (the OS); an OpenSSH login; a
+// authorization first; the PIN on a file descriptor; two slots reading
+// PCR 15, slot 0 also PCR 14 (the OS); an OpenSSH login; a
 // move to another combination revokes the approval of the old one, and
 // until it is approved the agent serves a temporary key; with the OS
 // changed, slot 1 certifies; a PIN change; and the PIN in no file, output,
@@ -167,7 +167,7 @@ func TestPINCommand(t *testing.T) {
 	ca := filepath.Join(dir, "ca.json")
 	pin, newPIN, lockout := []byte("pin-7GQ2xw"), []byte("pin-new-4Rt8"), []byte("lockout-Zq93nB")
 
-	if out, err := s.run([][]byte{pin}, "ca", "create", tpm, "--out", ca, "--authority-tpm", "--pin-fd", "3", "--pcrs", "7,14,15", "--window", "15"); err == nil || !strings.Contains(out, "no lockout authorization") {
+	if out, err := s.run([][]byte{pin}, "ca", "create", tpm, "--out", ca, "--authority-tpm", "--pin-fd", "3", "--pcrs", "7,14,15"); err == nil || !strings.Contains(out, "no lockout authorization") {
 		t.Fatalf("created without a lockout authorization: %v\n%s", err, out)
 	}
 	out := s.must([][]byte{lockout}, "tpm", "da", tpm, "--new-lockout-auth-fd", "3", "--max-tries", "3", "--recovery", "1800", "--lockout-recovery", "1800")
@@ -178,18 +178,18 @@ func TestPINCommand(t *testing.T) {
 	if err := os.WriteFile(conf, []byte("ASSH_CA_SLOT_1=7,15\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out = s.must([][]byte{pin}, "ca", "create", tpm, "--config", conf, "--out", ca, "--authority-tpm", "--pin-fd", "3", "--pcrs", "7,14,15", "--window", "15")
+	out = s.must([][]byte{pin}, "ca", "create", tpm, "--config", conf, "--out", ca, "--authority-tpm", "--pin-fd", "3", "--pcrs", "7,14,15")
 	if !strings.Contains(out, "opened by a PIN") || !strings.Contains(out, "@cert-authority * ecdsa-sha2-nistp256 ") {
 		t.Fatalf("create:\n%s", out)
 	}
-	if out, err := s.run(nil, "ca", "approve", tpm, "--ca", ca, "--pin", string(pin)); err == nil || !strings.Contains(out, "flag provided but not defined: -pin") {
+	if out, err := s.run(nil, "ca", "approve", "--yes", tpm, "--ca", ca, "--pin", string(pin)); err == nil || !strings.Contains(out, "flag provided but not defined: -pin") {
 		t.Fatalf("--pin: %v\n%s", err, out)
 	}
 
 	// The PIN waits on its descriptor: it is in neither argv nor the
 	// environment of the process that reads it.
 	r, w, _ := os.Pipe()
-	c := assh("ca", "approve", tpm, "--ca", ca, "--pin-fd", "3")
+	c := assh("ca", "approve", "--yes", tpm, "--ca", ca, "--pin-fd", "3")
 	c.ExtraFiles = []*os.File{r}
 	var approveOut bytes.Buffer
 	c.Stdout, c.Stderr = &approveOut, &approveOut
@@ -212,6 +212,7 @@ func TestPINCommand(t *testing.T) {
 		t.Fatalf("approve: %v\n%s", err, approveOut.String())
 	}
 	s.out.Write(approveOut.Bytes())
+	sw.Reboot(t) // a CA signs from the boot after its creation
 
 	// An OpenSSH login through @cert-authority.
 	client := filepath.Join(dir, "client")
@@ -243,7 +244,7 @@ func TestPINCommand(t *testing.T) {
 		t.Fatalf("agent in Y before the move:\n%s", out)
 	}
 	values := filepath.Join(runDir, "agent.pcrs.json")
-	out = s.must([][]byte{pin}, "ca", "approve", tpm, "--ca", ca, "--slot", "0,1", "--values", values, "--next-generation", "--pin-fd", "3")
+	out = s.must([][]byte{pin}, "ca", "approve", "--yes", tpm, "--ca", ca, "--slot", "0,1", "--values", values, "--next-generation", "--pin-fd", "3")
 	if !strings.Contains(out, "generation 2: every approval before it is revoked") || !strings.Contains(out, "Approved in slots 0 and 1 at generation 2") {
 		t.Fatalf("the move:\n%s", out)
 	}
@@ -274,10 +275,10 @@ func TestPINCommand(t *testing.T) {
 
 	// A PIN change: the old PIN opens nothing.
 	s.must([][]byte{pin, newPIN}, "ca", "pin", tpm, "--ca", ca, "--pin-fd", "3", "--new-pin-fd", "4")
-	if out, err := s.run([][]byte{pin}, "ca", "approve", tpm, "--ca", ca, "--pin-fd", "3"); err == nil || !strings.Contains(out, "wrong PIN") {
+	if out, err := s.run([][]byte{pin}, "ca", "approve", "--yes", tpm, "--ca", ca, "--pin-fd", "3"); err == nil || !strings.Contains(out, "wrong PIN") {
 		t.Fatalf("approve with the old PIN: %v\n%s", err, out)
 	}
-	s.must([][]byte{newPIN}, "ca", "approve", tpm, "--ca", ca, "--pin-fd", "3")
+	s.must([][]byte{newPIN}, "ca", "approve", "--yes", tpm, "--ca", ca, "--pin-fd", "3")
 	if out := s.must([][]byte{lockout}, "tpm", "da", tpm, "--lockout-auth-fd", "3", "--reset"); !strings.Contains(out, "0 of 3 failures") {
 		t.Fatalf("reset:\n%s", out)
 	}
@@ -315,7 +316,7 @@ ASSH_CA=%s
 ASSH_AUTHORITY_TPM=yes
 ASSH_CA_SLOT_0=0,7,15
 ASSH_CA_SLOT_1=7,15
-ASSH_CA_WINDOW=15
+ASSH_CLOSE_PCR=15
 ASSH_STATE=%s
 ASSH_AGENT_DIR=%s
 ASSH_AGENT_UID=%d
@@ -345,7 +346,7 @@ ASSH_AGENT_UID=%d
 
 	s.must([][]byte{lockout}, "tpm", "da", "--config", conf, "--new-lockout-auth-fd", "3", "--max-tries", "3", "--recovery", "1800", "--lockout-recovery", "1800")
 	s.must([][]byte{pin}, "ca", "create", "--config", conf, "--pin-fd", "3")
-	if out := s.must([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state, "--pin-fd", "3"); !strings.Contains(out, "Approved in slots 0 and 1 at generation 1") {
+	if out := s.must([][]byte{pin}, "ca", "approve", "--yes", "--config", conf, "--values", state, "--pin-fd", "3"); !strings.Contains(out, "Approved in slots 0 and 1 at generation 1") {
 		t.Fatalf("approve:\n%s", out)
 	}
 	if out := run(t, "ca", "show", "--config", conf); !strings.Contains(out, "\n  @cert-authority * ecdsa-sha2-nistp256 ") {
@@ -356,7 +357,7 @@ ASSH_AGENT_UID=%d
 	ag = start(t, "agent", "--config", conf)
 	ag.wait(t, "agent at")
 	ag.stop()
-	if !strings.Contains(ag.String(), "TEMPORARY") || !strings.Contains(ag.String(), "slot 0: PCR 15 not as approved") || !strings.Contains(ag.String(), "stays in "+state) {
+	if !strings.Contains(ag.String(), "TEMPORARY: the CA's window is closed until the next boot") || !strings.Contains(ag.String(), "stays in "+state) {
 		t.Fatalf("the agent in the boot of the creation:\n%s", ag.String())
 	}
 	if again, _ := os.ReadFile(state); !bytes.Equal(again, b) {
@@ -404,7 +405,7 @@ ASSH_CA=%s
 ASSH_CA_BANK=auto
 ASSH_AUTHORITY_TPM=yes
 ASSH_CA_SLOT_0=0,7,15
-ASSH_CA_WINDOW=15
+ASSH_CLOSE_PCR=15
 ASSH_STATE=%s
 ASSH_AGENT_DIR=%s
 ASSH_AGENT_UID=%d
@@ -439,7 +440,7 @@ ASSH_AGENT_UID=%d
 		t.Fatalf("the state: %v\n%s", err, b)
 	}
 	s.must([][]byte{pin}, "ca", "create", "--config", conf, "--pin-fd", "3")
-	s.must([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state, "--pin-fd", "3")
+	s.must([][]byte{pin}, "ca", "approve", "--yes", "--config", conf, "--values", state, "--pin-fd", "3")
 	if out := run(t, "ca", "show", "--config", conf); !strings.Contains(out, "(sha1)") {
 		t.Fatalf("ca show:\n%s", out)
 	}
@@ -479,7 +480,7 @@ func TestMoveAhead(t *testing.T) {
 ASSH_CA=%s
 ASSH_AUTHORITY_TPM=yes
 ASSH_CA_SLOT_0=0,7,15
-ASSH_CA_WINDOW=15
+ASSH_CLOSE_PCR=15
 ASSH_STATE=%s
 ASSH_AGENT_DIR=%s
 ASSH_AGENT_UID=%d
@@ -499,14 +500,14 @@ ASSH_AGENT_UID=%d
 	boot("a")
 	s.must([][]byte{lockout}, "tpm", "da", "--config", conf, "--new-lockout-auth-fd", "3", "--max-tries", "3", "--recovery", "1800", "--lockout-recovery", "1800")
 	s.must([][]byte{pin}, "ca", "create", "--config", conf, "--pin-fd", "3")
-	s.must([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state, "--pin-fd", "3")
+	s.must([][]byte{pin}, "ca", "approve", "--yes", "--config", conf, "--values", state, "--pin-fd", "3")
 	if out := boot("a"); !strings.Contains(out, "through slot 0") {
 		t.Fatalf("a, approved:\n%s", out)
 	}
-	if out, err := s.run([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state, "--events", "14:x", "--pin-fd", "3"); err == nil || !strings.Contains(out, "no slot of the CA reads PCR 14") {
+	if out, err := s.run([][]byte{pin}, "ca", "approve", "--yes", "--config", conf, "--values", state, "--events", "14:x", "--pin-fd", "3"); err == nil || !strings.Contains(out, "no slot of the CA reads PCR 14") {
 		t.Fatalf("--events for a PCR no slot reads: %v\n%s", err, out)
 	}
-	s.must([][]byte{pin}, "ca", "approve", "--config", conf, "--values", state,
+	s.must([][]byte{pin}, "ca", "approve", "--yes", "--config", conf, "--values", state,
 		"--events", "15:combination:b", "--events", "15:sealed", "--next-generation", "--pin-fd", "3")
 	if out := boot("b"); !strings.Contains(out, "through slot 0") {
 		t.Fatalf("b, approved ahead:\n%s", out)
@@ -516,7 +517,7 @@ ASSH_AGENT_UID=%d
 	}
 
 	out := run(t, "ca", "remove", "--config", conf)
-	for _, want := range []string{"removed NV index 0x01802913", "removed NV index 0x01802912", "removed " + ca + "\n"} {
+	for _, want := range []string{"NV index 0x01802913", "NV index 0x01802912", "NV index 0x01802915", "removed " + ca + "\n"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("ca remove:\n%s", out)
 		}
@@ -542,7 +543,7 @@ func TestAgentRSA(t *testing.T) {
 ASSH_CA=%s
 ASSH_HOSTKEY_TYPE=rsa2048
 ASSH_CA_SLOT_0=7,15
-ASSH_CA_WINDOW=15
+ASSH_CLOSE_PCR=15
 ASSH_AGENT_DIR=%s
 ASSH_AGENT_UID=%d
 `, sw.Sock, filepath.Join(dir, "ca.json"), runDir, os.Getuid())), 0o644)
@@ -582,8 +583,9 @@ func writeSignatures(t *testing.T, sw *swtpmtest.SWTPM, key *rsa.PrivateKey, pat
 // The identity made once, as safearch's initrd makes it: in the initrd's
 // state (PCR 15 the combination alone) 'ca create --authority-once' approves
 // the agent's state ahead (--events: the combination, then "sealed"); slot 0
-// takes PCR 11 from the build's signature. The agent of that boot certifies
-// through slot 0; an update (another PCR 11, signed) too, with no step;
+// takes PCR 11 from the build's signature. The agent of that boot serves a
+// temporary key (the window of the creation's boot is closed), the next boot
+// certifies through slot 0; an update (another PCR 11, signed) too, with no step;
 // without the signature slot 1; and nothing can approve another state.
 func TestAuthorityOnce(t *testing.T) {
 	sw := swtpmtest.Start(t)
@@ -600,7 +602,7 @@ ASSH_AUTHORITY_ONCE=yes
 ASSH_CA_SLOT_0=0,7,15
 ASSH_CA_SLOT_0_SIGNED=11
 ASSH_CA_SLOT_1=7,15
-ASSH_CA_WINDOW=15
+ASSH_CLOSE_PCR=15
 ASSH_PCR_KEY=%s
 ASSH_PCR_SIGNATURE=%s
 ASSH_KEY_ID=safespace
@@ -631,8 +633,14 @@ ASSH_AGENT_UID=%d
 	}
 	root()
 	writeSignatures(t, sw, build, sigs)
-	if out := agent(); !strings.Contains(out, "through slot 0") {
+	if out := agent(); !strings.Contains(out, "TEMPORARY: the CA's window is closed until the next boot") {
 		t.Fatalf("the creation's boot:\n%s", out)
+	}
+	initrd("uki A")
+	root()
+	writeSignatures(t, sw, build, sigs)
+	if out := agent(); !strings.Contains(out, "through slot 0") {
+		t.Fatalf("the boot after the creation:\n%s", out)
 	}
 	if b, _ := os.ReadFile(filepath.Join(runDir, "status")); !strings.Contains(string(b), "key_id=safespace slot=0 pcrs=0,7,15 signed=11\n") {
 		t.Fatalf("status:\n%s", b)
@@ -649,7 +657,7 @@ ASSH_AGENT_UID=%d
 	if out := agent(); !strings.Contains(out, "through slot 1") || !strings.Contains(out, "no signatures of PCRs") {
 		t.Fatalf("no signature:\n%s", out)
 	}
-	if out, err := assh("ca", "approve", "--config", conf).CombinedOutput(); err == nil {
+	if out, err := assh("ca", "approve", "--yes", "--config", conf).CombinedOutput(); err == nil {
 		t.Fatalf("an approval after the creation:\n%s", out)
 	}
 }

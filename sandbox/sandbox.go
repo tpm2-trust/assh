@@ -1,7 +1,8 @@
 // Package sandbox confines the process that calls it - every thread of it -
-// for the rest of its life: no new privileges, no memory that becomes
-// executable, no file but what the policy names (Landlock), and none of
-// the system calls that administer the machine (seccomp). Nothing of it
+// for the rest of its life: no new privileges, not dumpable (no other
+// process of its uid may trace it or read its memory), no memory that
+// becomes executable, no file but what the policy names (Landlock), and
+// none of the system calls that administer the machine (seccomp). Nothing of it
 // can be undone, and threads made later inherit it.
 //
 // Go runs a program on several threads from its start, and prctl, Landlock
@@ -43,6 +44,12 @@ func Apply(p Policy) (string, error) {
 		return "", fmt.Errorf("no new privileges: %w", err)
 	}
 	desc = append(desc, "no new privileges")
+
+	// Process-wide: no ptrace, no /proc/<pid>/mem for others of its uid.
+	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+		return "", fmt.Errorf("not dumpable: %w", err)
+	}
+	desc = append(desc, "not dumpable")
 
 	// Process-wide: no mapping turns executable, none is both.
 	if err := unix.Prctl(unix.PR_SET_MDWE, unix.PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0); err != nil {
@@ -153,8 +160,10 @@ var errNoFilter = errors.New("not built for this architecture")
 // modules, the clock, other processes' memory, namespaces, user IDs,
 // keyrings, BPF, running a program - with EPERM, so that an unexpected one
 // fails the call and not the process; a system call of another
-// architecture's ABI ends the process. It reports how many are refused.
-// TSYNC puts the filter on every thread.
+// architecture's ABI ends the process. clone is refused with EPERM when it
+// asks for a namespace, and clone3, whose flags the filter cannot read,
+// with ENOSYS: Go then makes its threads with clone. It reports how many
+// calls are refused. TSYNC puts the filter on every thread.
 func seccomp() (int, error) {
 	if auditArch == 0 {
 		return 0, errNoFilter
@@ -164,37 +173,43 @@ func seccomp() (int, error) {
 		ldAbsW = unix.BPF_LD | unix.BPF_W | unix.BPF_ABS
 		jeqK   = unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K
 		jgeK   = unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K
+		jsetK  = unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K
 		retK   = unix.BPF_RET | unix.BPF_K
-		// struct seccomp_data: int nr; __u32 arch; ...
-		offNr   = 0
-		offArch = 4
+		// struct seccomp_data: int nr; __u32 arch; __u64 ip; __u64 args[6].
+		// args[0]'s low word: both architectures are little-endian.
+		offNr    = 0
+		offArch  = 4
+		offArg0  = 16
+		newSpace = unix.CLONE_NEWNS | unix.CLONE_NEWCGROUP | unix.CLONE_NEWUTS | unix.CLONE_NEWIPC |
+			unix.CLONE_NEWUSER | unix.CLONE_NEWPID | unix.CLONE_NEWNET
 	)
-	prog := []unix.SockFilter{
-		{Code: ldAbsW, K: offArch},
-		{Code: jeqK, Jt: 1, Jf: 0, K: auditArch},
-		{Code: retK, K: unix.SECCOMP_RET_KILL_PROCESS},
-		{Code: ldAbsW, K: offNr},
-	}
-	// The last two instructions: allow, refuse. Each check jumps to the
-	// refusal on a match.
-	checks := len(denied)
+	var b filter
+	b.op(unix.SockFilter{Code: ldAbsW, K: offArch})
+	b.jump(jeqK, auditArch, "nr", "kill")
+	b.label("nr")
+	b.op(unix.SockFilter{Code: ldAbsW, K: offNr})
 	if syscallBit != 0 {
-		checks++
+		b.jump(jgeK, syscallBit, "refuse", "")
 	}
-	refuse := len(prog) + checks + 1
-	jumpTo := func(target int) uint8 { return uint8(target - len(prog) - 1) }
-	if syscallBit != 0 {
-		prog = append(prog, unix.SockFilter{Code: jgeK, Jt: jumpTo(refuse), Jf: 0, K: syscallBit})
-	}
+	b.jump(jeqK, unix.SYS_CLONE3, "nosys", "")
+	b.jump(jeqK, unix.SYS_CLONE, "clone", "")
 	for _, nr := range denied {
-		prog = append(prog, unix.SockFilter{Code: jeqK, Jt: jumpTo(refuse), Jf: 0, K: uint32(nr)})
+		b.jump(jeqK, uint32(nr), "refuse", "")
 	}
-	prog = append(prog,
-		unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ALLOW},
-		unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)},
-	)
-	if checks > 255 {
-		return 0, fmt.Errorf("the filter is too long for its jumps")
+	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ALLOW})
+	b.label("clone")
+	b.op(unix.SockFilter{Code: ldAbsW, K: offArg0})
+	b.jump(jsetK, newSpace, "refuse", "")
+	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ALLOW})
+	b.label("refuse")
+	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)})
+	b.label("nosys")
+	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ERRNO | uint32(unix.ENOSYS)})
+	b.label("kill")
+	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_KILL_PROCESS})
+	prog, err := b.assemble()
+	if err != nil {
+		return 0, err
 	}
 	fprog := unix.SockFprog{Len: uint16(len(prog)), Filter: &prog[0]}
 	if _, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC,
@@ -204,7 +219,61 @@ func seccomp() (int, error) {
 		}
 		return 0, errno
 	}
-	return len(denied), nil
+	return len(denied) + 2, nil
+}
+
+// filter is a BPF program whose jumps name labels; "" goes on with the
+// next instruction.
+type filter struct {
+	prog   []unix.SockFilter
+	jumps  map[int][2]string
+	labels map[string]int
+}
+
+func (f *filter) op(i unix.SockFilter) { f.prog = append(f.prog, i) }
+
+func (f *filter) label(name string) {
+	if f.labels == nil {
+		f.labels = map[string]int{}
+	}
+	f.labels[name] = len(f.prog)
+}
+
+func (f *filter) jump(code uint16, k uint32, ifTrue, ifFalse string) {
+	if f.jumps == nil {
+		f.jumps = map[int][2]string{}
+	}
+	f.jumps[len(f.prog)] = [2]string{ifTrue, ifFalse}
+	f.op(unix.SockFilter{Code: code, K: k})
+}
+
+// assemble resolves the labels: BPF jumps forward only, at most 255
+// instructions.
+func (f *filter) assemble() ([]unix.SockFilter, error) {
+	off := func(at int, name string) (uint8, error) {
+		if name == "" {
+			return 0, nil
+		}
+		to, ok := f.labels[name]
+		if !ok {
+			return 0, fmt.Errorf("the filter has no label %q", name)
+		}
+		d := to - at - 1
+		if d < 0 || d > 255 {
+			return 0, fmt.Errorf("the filter's jump to %q is out of reach", name)
+		}
+		return uint8(d), nil
+	}
+	for at, j := range f.jumps {
+		var err error
+		if f.prog[at].Jt, err = off(at, j[0]); err != nil {
+			return nil, err
+		}
+		if f.prog[at].Jf, err = off(at, j[1]); err != nil {
+			return nil, err
+		}
+	}
+	return f.prog, nil
 }
 
 // deniedCommon are the refused system calls every architecture has.

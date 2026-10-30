@@ -19,12 +19,12 @@ It is a Go library and a command, `assh`. Who uses it:
 | Package | What it is |
 |---|---|
 | `hostkey` | the CA in the TPM, its slots and the approvals of the PCR states it signs in, the per-boot host key and its certificate - or a temporary key when no slot certifies |
-| `server` | an SSH server split in two: the half that speaks SSH runs as nobody, in namespaces of its own, confined by `sandbox`, and holds neither the key nor what a login leads to |
+| `server` | an SSH server split in two: the half that speaks SSH runs as a uid no one else has, in namespaces of its own, confined by `sandbox`, and holds neither the key nor what a login leads to |
 | `agent` | an ssh-agent socket that lends the host key to OpenSSH's sshd (`HostKeyAgent`) |
 | `config` | assh.conf: every setting in one `KEY=VALUE` file |
 | `tpmadmin` | what the TPM itself holds for an authority with a PIN: the PIN, the dictionary attack parameters, the lockout authorization |
 | `persist` | NV indices and EFI variables, written and removed one way for every program built on aSSH |
-| `sandbox` | what a process that parses outside input takes from itself, on every thread |
+| `sandbox` | what a process that parses outside input takes from itself, on every thread; a uid for it that no one else has |
 | `cmd/assh` | the command (below) |
 
 ## Quick start: sshd with a host key in the TPM
@@ -39,14 +39,13 @@ install -m 644 systemd/assh-agent.service /etc/systemd/system/
 # 1. The TPM's dictionary attack protection, and a lockout authorization (asked twice; keep it off the machine)
 assh tpm da --new-lockout-auth --max-tries 3 --recovery 1800 --lockout-recovery 1800
 
-# 2. The CA's settings: two slots, the window PCR 15, the CA in an EFI variable
+# 2. The CA's settings: two slots, the CA in an EFI variable
 mkdir -p /etc/assh
 cat >/etc/assh/assh.conf <<'EOF'
 ASSH_CA=efi:AsshCA
 ASSH_AUTHORITY_TPM=yes
 ASSH_CA_SLOT_0=0,2,7,11,15
 ASSH_CA_SLOT_1=7,15
-ASSH_CA_WINDOW=15
 EOF
 
 # 3. sshd takes its host key from the agent
@@ -61,11 +60,12 @@ and approve the recorded state:
 
 ```bash
 assh ca create                                   # asks for the new PIN twice; prints the known_hosts line
-assh ca approve --values /run/assh/agent.pcrs.json   # every slot; asks for the PIN
+assh ca approve --values /run/assh/agent.pcrs.json   # every slot: shows what it approves, asks, then the PIN
 reboot
 ```
 
-From the next boot on the host key is certified. On every client:
+A CA signs from the boot after its creation; from then on the host key
+is certified. On every client:
 
 ```
 @cert-authority host.example,192.0.2.10 ecdsa-sha2-nistp256 AAAA...   # the line ca create printed
@@ -163,10 +163,11 @@ sequenceDiagram
   S->>T: policy session: PolicyPCR(the slot's PCRs as they are now)
   S->>T: with a counter: PolicyNV(G == n as it is now)
   S->>T: PolicyAuthorize(approved, policyRef, ticket)
-  Note over T: the session's digest is the CA's policy<br/>only if the state is the approved one
+  S->>T: PolicyCommandCode(Sign) ; PolicyNV(W == v): the window open
+  Note over T: the session's digest is the CA's policy<br/>only if the state is the approved one<br/>and the window is open
   S->>T: make the host key (NULL hierarchy)
   S->>T: Sign the host certificate with the CA, in that session
-  S->>T: PCR_Extend(window): the CA signs nothing more this boot
+  S->>T: NV_ReadLock(W): the CA signs nothing more this boot
 ```
 
 An approval edited in the file fails the signature check; one for
@@ -175,24 +176,42 @@ Both keys are loaded in the owner hierarchy: PolicyAuthorize refuses the
 ticket of a NULL-hierarchy key. When no slot holds, the host key is
 temporary.
 
+The CA's whole policy, fixed at creation:
+
+```
+CA policy = PolicyAuthorize(authority, ref) ; PolicyCommandCode(Sign) ; PolicyNV(W == v)
+```
+
+The part after PolicyAuthorize is the CA's own: no approval can leave it
+out. In an approved state the CA signs and does nothing else (no Certify,
+no Quote), and only while its window is open. Its ADMIN role goes through
+the policy too (`adminWithPolicy`), so no empty password reaches it.
+
 ### The window
 
-The CA's window (`ca create --window 15`, `ASSH_CA_WINDOW`) is a PCR that
-`agent` and `serve` extend right after the host key is certified
-(`hostkey.Close`; `--close-pcr` for another). Every slot must read it - a
-slot that does not would sign after the window closed, and is refused -
-so the CA signs nothing more until the next boot: a process started
-later, or a restarted server, gets a temporary key.
+Every CA has a window index W of its own (`0x01802915` by default,
+`ASSH_WINDOW_HANDLE`, `ca create --window-handle`): an NV counter that can
+be read-locked until the next boot (`TPMA_NV_READ_STCLEAR`), given its one
+value v when the CA is made. The CA's policy reads it, so closing the
+window - `TPM2_NV_ReadLock(W)` - stops the CA in every slot, whatever an
+approval says, until `TPM2_Startup(CLEAR)`: the next boot. A resume from
+suspend keeps the lock.
 
-PCR 15 is the usual choice: the firmware does not use it and it cannot be
-reset (16 and 23 can be reset by any process, and are refused). Its value
-before the window closes must be the same at every boot - systemd may
-extend it with the machine ID or a volume key (`tpm2-measure-pcr=`) before
-the server starts, which is fine as long as that order is fixed. Anything
-bound to PCR 15 that is used after the window closed (a volume enrolled
-with `systemd-cryptenroll --tpm2-pcrs=15`) no longer unlocks. A CA without
-a window is closed by the boot itself (tpm2-kira's: the OS separator
-extends PCR 0 and 7).
+- `agent` and `serve` close it right after the host key is certified - and
+  on every other way out, a failure at any step included. The unit runs
+  `assh close` after the agent too (`ExecStopPost=`), which also closes it
+  when the agent could not start, or assh.conf does not parse.
+- **A CA is created with its window closed**: it signs from the next boot
+  on, never in a boot whose window has been open to every process.
+- W defined again alike (root can, with the owner authorization) has W's
+  Name back, but its first value lands above every value a counter had:
+  never v. Deleting or incrementing W stops the CA - a denial of service,
+  never a way in.
+- `--close-pcr N` (`ASSH_CLOSE_PCR`, 0 to 15) extends a PCR as well when
+  the window closes, for what others bind to it (tpm2-kira's code screen,
+  safearch's PCR 15). Anything bound to that PCR that is used afterwards
+  (a volume enrolled with `systemd-cryptenroll --tpm2-pcrs=15`) no longer
+  unlocks.
 
 ### The temporary key
 
@@ -223,15 +242,19 @@ remove it once the state is approved.
 - A CA file that cannot be read, or a TPM that cannot be opened, is an
   error, not a temporary key.
 - **Before the CA exists** - its file or EFI variable not there, and
-  assh.conf naming the slots - the PCRs of those slots are recorded and
-  the window closed all the same. The CA is then created and this boot's
-  recorded state approved (the quick start); the next boot certifies.
-  Not in the same boot: the window is closed, or any process could have
-  the new CA certify.
+  assh.conf naming the slots - the PCRs of those slots are recorded. The
+  CA is then created and this boot's recorded state approved (the quick
+  start); the next boot certifies. Not in the same boot: a new CA's window
+  is closed, or any process could have it certify.
 
 ## The authority
 
-Who may approve a state is decided once, at `ca create`:
+Who may approve a state is decided once, at `ca create`. Whoever
+approves reads what is approved: `ca approve` shows each slot's statement -
+the CA, the authority, the bank, every PCR and its value, the key of
+signed PCRs, the generation - and asks before it signs (`--yes` for
+scripts). Neither the CA file nor assh.conf is trusted for it: root could
+have edited a slot to read PCR 7 alone.
 
 | | Key elsewhere (`--authority PUB`) | In the TPM, a PIN (`--authority-tpm`) | Once (`--authority-once`) |
 |---|---|---|---|
@@ -252,27 +275,30 @@ key never comes to the machine.
 openssl ecparam -name prime256v1 -genkey -noout -out authority.key
 openssl ec -in authority.key -pubout -out authority.pub
 
-# 2. On the machine: the CA (slots and window from assh.conf, or flags)
-assh ca create --out /etc/assh/os-ca.json --authority authority.pub --pcrs 0,7,11,15 --window 15
+# 2. On the machine: the CA (slots from assh.conf, or flags)
+assh ca create --out /etc/assh/os-ca.json --authority authority.pub --pcrs 0,7,11,15
 # -> /etc/assh/os-ca.json.pub, and the known_hosts line
 
-# 3. The digest of a state of a slot: the TPM's now (no --values), or one a server recorded
+# 3. The statement of a state of a slot: the TPM's now (no --values), or one a server recorded
 assh ca approve --ca /etc/assh/os-ca.json --slot 0 --values /run/assh/agent.pcrs.json --digest d.bin
+# -> d.bin.statement (and d.bin, the digest alone)
 
-# 4. Off the machine: sign the digest
-openssl pkeyutl -sign -inkey authority.key -pkeyopt digest:sha256 -in d.bin -out d.sig
+# 4. Off the machine: read what it says, and sign it
+assh ca sign --authority-key authority.key --statement d.bin.statement --signature d.sig
 
 # 5. On the machine: add the approval
 assh ca approve --ca /etc/assh/os-ca.json --slot 0 --values /run/assh/agent.pcrs.json --signature d.sig
 ```
 
+- `ca sign` computes the digest from the statement it shows, not from
+  bytes it cannot read, and refuses a statement for another authority.
+  Signing `d.bin` with anything else (`openssl pkeyutl -sign -pkeyopt
+  digest:sha256`) works too, but signs blind.
 - With `--values`, steps 3 and 5 need no TPM: they run wherever a copy of
   the CA file is, and the file with the new approval goes back to the
-  machine.
-- Step 4 is anything that signs a SHA-256 digest with the key: PKCS #1
-  v1.5 for RSA, DER ECDSA. Step 5 checks the signature before it saves.
+  machine. Step 5 checks the signature before it saves.
 - With the key at hand, `--authority-key authority.key` does steps 3 to 5
-  in one.
+  in one, after showing the statement.
 
 **Its approvals are never revoked.** Removing an approval from the file
 revokes nothing: a copy of the file from before still works should the
@@ -281,7 +307,8 @@ CA, or use the authority in the TPM.
 
 ### In the TPM: a PIN, and revocation
 
-Three things in the TPM, none of them secret outside it:
+Three things in the TPM besides the window index, none of them secret
+outside it:
 
 ```
 P  PIN index   NV counter at 0x01802913, its authorization value = the PIN.
@@ -292,11 +319,12 @@ A  authority   ECDSA P-256 key, made in the TPM, its wrapped copy in the CA
                the PIN, and no PCR condition.
 G  counter     NV counter at 0x01802912, incremented through P - the PIN.
                Every approval names its value: PolicyPCR ; PolicyNV(G == n).
+W  window      as every CA's (above).
 ```
 
 ```bash
 assh tpm da --new-lockout-auth --max-tries 3 --recovery 1800 --lockout-recovery 1800
-assh ca create --out /etc/assh/os-ca.json --authority-tpm --pcrs 7,14,15 --window 15   # the PIN twice
+assh ca create --out /etc/assh/os-ca.json --authority-tpm --pcrs 7,14,15   # the PIN twice
 assh ca approve --ca /etc/assh/os-ca.json --slot 0,1      # this state, both slots; the PIN once
 assh ca approve --ca /etc/assh/os-ca.json --slot 0,1 --values /run/assh/agent.pcrs.json --next-generation
 assh ca pin --ca /etc/assh/os-ca.json                     # change the PIN
@@ -360,7 +388,8 @@ A new build carries its own signature, so the slot stays met after an
 update and nobody approves anything. Settings:
 `ASSH_CA_SLOT_<N>_SIGNED=11`, `ASSH_PCR_KEY` (`ca create --pcr-key`: the
 key, PEM; RSA with 2048 bits, which every TPM checks), `ASSH_PCR_SIGNATURE`
-(where `agent` and `serve` read the signatures). Every image the key
+(where `agent` and `serve` read the signatures). `ca approve` refuses a
+slot whose key is not `ASSH_PCR_KEY`: the CA file could name any. Every image the key
 signed meets the slot, an old one too.
 
 ## Over the machine's life
@@ -396,8 +425,8 @@ takes the file's slots as they are - `agent` and `serve` at their next
 start, nothing to run. A slot added signs nothing until approved; one
 taken away, or whose PCRs changed, loses its approvals. The CA file keeps
 what it has until a command saves the CA (`ca approve`), so an edit undone
-brings the approvals back. The window, the key type, the bank and the ref
-are the CA's for good: a file that differs in them is not applied (the
+brings the approvals back. The window index, the key type, the bank and
+the ref are the CA's for good: a file that differs in them is not applied (the
 CA's own slots, and a warning).
 
 ### When the TPM is cleared, the CA is lost
@@ -405,8 +434,8 @@ CA's own slots, and a warning).
 TPM2_Clear (`tpm2_clear`, "Clear TPM" in the firmware's setup, a firmware
 update that resets a firmware TPM) gives the owner hierarchy a new storage
 seed, and another TPM (a new mainboard) has one of its own. The wrapped
-copies of the CA and of A then load nowhere, and P and G are gone with
-the clear. Nothing brings the CA back, by design: a CA that could be
+copies of the CA and of A then load nowhere, and P, G and W are gone
+with the clear. Nothing brings the CA back, by design: a CA that could be
 restored would be a secret kept outside the TPM.
 
 What remains is what a new machine needs: `ca create`, an approval, and
@@ -415,11 +444,21 @@ lets you log in - after checking its fingerprint - to do it.
 
 ### Removing a CA
 
-`ca remove --ca FILE` removes the CA file and, for the authority in the
-TPM, its PIN index and counter - each only where the TPM holds that very
-index (the same Name); with no file there, those at the handles that have
-the shape of aSSH's. No PIN: the owner authorization is enough. Clients
-then need a new line for the next CA.
+`ca remove --ca FILE` removes the CA file, its window index and, for the
+authority in the TPM, its PIN index and counter. An index goes only where
+the TPM holds one defined exactly as aSSH defines it at that handle -
+attributes, size, policy; the counter's policy names the PIN index the TPM
+holds and its value, read there. What the file says is no proof: a file
+edited to name another program's index leaves that index. With no file,
+the handles of assh.conf or the flags are taken by the same rule. No PIN:
+the owner authorization is enough. Clients then need a new line for the
+next CA.
+
+What is left is named, and `--force` removes it - for what a previous
+installation left at aSSH's handles (an index of another format, a CA file
+lost): every index at the handles of assh.conf or the flags, never one a
+CA file names, each shown (handle, size, attributes, Name) and removed
+after a confirmation (`--yes` for scripts).
 
 ## Where the CA is kept: a file or an EFI variable
 
@@ -552,11 +591,13 @@ flowchart LR
 ```
 
 The half that speaks SSH is started by the server with the listening
-socket and one end of a control socket. It runs as nobody (`UID`, 65534),
-in network, IPC, PID, mount and UTS namespaces of its own, and before it
-reads a byte from the network takes from itself, on every thread
-(`sandbox`): new privileges, memory that becomes executable, every file
-(Landlock), the system calls that administer the machine (seccomp). It
+socket and one end of a control socket. It runs as a uid no one else has
+(below), in network, IPC, PID, mount and UTS namespaces of its own, and
+before it reads a byte from the network takes from itself, on every thread
+(`sandbox`): new privileges, being traced or read by another process of
+its uid (not dumpable), memory that becomes executable, every file
+(Landlock), the system calls that administer the machine and those that
+make a namespace (seccomp: `clone` with a `CLONE_NEW*` flag, `clone3`). It
 holds no host key - every signature is asked over the control socket - and
 runs nothing: a login's shell becomes one end of a socket pair that it
 relays. A compromise of the SSH code gets what a login gets, and no key.
@@ -576,7 +617,6 @@ a flag given on the command line wins over the file.
 ASSH_CA=efi:AsshOSCA
 ASSH_CA_SLOT_0=0,2,7,11,15
 ASSH_CA_SLOT_1=7,15
-ASSH_CA_WINDOW=15
 ASSH_AUTHORITY=/etc/assh/authority.pub
 ASSH_PRINCIPALS=host.example,192.0.2.10
 ```
@@ -587,13 +627,14 @@ ASSH_PRINCIPALS=host.example,192.0.2.10
 | `ASSH_CA` | `--ca`, `ca create --out` | - (a file, or `efi:NAME`) |
 | `ASSH_CA_TYPE`, `ASSH_CA_BANK` | `ca create --type` (`p256`, `rsa2048`, or a list in order of preference, `rsa2048,p256`: the first the TPM takes), `--bank` (`sha256`, `sha1`, `auto`) | `p256`, `sha256` |
 | `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0) | slot 0 `0,7` |
-| `ASSH_CA_WINDOW`, `ASSH_CA_REF` | `ca create --window`, `--ref` | none, `assh` |
+| `ASSH_CA_REF` | `ca create --ref` | `assh` |
 | `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM`, `ASSH_AUTHORITY_ONCE` | `ca create --authority`, `--authority-tpm`, `--authority-once` (`yes`/`no`) | - |
 | `ASSH_CA_SLOT_<N>_SIGNED`, `ASSH_PCR_KEY`, `ASSH_PCR_SIGNATURE` | PCRs of slot N a key signs, `ca create --pcr-key` (PEM), its signatures (systemd's JSON) | - |
-| `ASSH_PIN_HANDLE`, `ASSH_COUNTER_HANDLE` | `--pin-handle`, `--counter-handle` | `0x01802913`, `0x01802912` |
+| `ASSH_WINDOW_HANDLE`, `ASSH_PIN_HANDLE`, `ASSH_COUNTER_HANDLE` | `--window-handle`, `--pin-handle`, `--counter-handle` | `0x01802915`, `0x01802913`, `0x01802912` |
 | `ASSH_HOSTKEY_TYPE`, `ASSH_PRINCIPALS`, `ASSH_KEY_ID` | `--key-type` (as `ASSH_CA_TYPE`, a list too), `--principals`, `--key-id` | `p256`, `*`, `assh` |
-| `ASSH_CLOSE_PCR`, `ASSH_STATE` | `--close-pcr`, `--state` | the CA's window, the command's own |
+| `ASSH_CLOSE_PCR`, `ASSH_STATE` | `--close-pcr` (a PCR extended as well when the window closes), `--state` | none, the command's own |
 | `ASSH_LISTEN`, `ASSH_AUTHORIZED_KEYS`, `ASSH_USER`, `ASSH_SOCKET` | `serve --listen`, `--authorized-keys`, `--user`, `--socket` | `:22` |
+| `ASSH_CHILD_UIDS` | `serve --child-uids` | `0x7FFE0000-0x7FFEFFFF` |
 | `ASSH_AGENT_DIR`, `ASSH_AGENT_UID` | `agent --dir`, `--uid` | `/run/assh`, `0` |
 
 Nothing in it is secret, and nothing in it is trusted: it says what the
@@ -610,16 +651,18 @@ server's settings in one.
 
 | Command | What it does |
 |---|---|
-| `ca create` | makes the CA in the TPM with its slots, and its authority: `--authority PUB`, `--authority-tpm` (asks for the new PIN), `--authority-once`; prints the known_hosts line |
-| `ca show` | the CA, its slots and approvals, the known_hosts line; with the TPM: the counter's generation, whether the CA signs now, the dictionary attack state |
-| `ca approve` | approves a state for slots (`--slot N[,N...]`, default every slot): the TPM's now, `--values FILE`, `--events PCR:EVENT`; with the PIN (`--next-generation`, `--redefine-counter`), or a key elsewhere (`--authority-key`, `--digest`, `--signature`) |
+| `ca create` | makes the CA in the TPM with its slots, its window index (closed in this boot), and its authority: `--authority PUB`, `--authority-tpm` (asks for the new PIN), `--authority-once`; prints the known_hosts line |
+| `ca show` | the CA, its slots and approvals, the known_hosts line; with the TPM: the counter's generation, whether the window is open and the CA signs now, the dictionary attack state |
+| `ca approve` | approves a state for slots (`--slot N[,N...]`, default every slot): the TPM's now, `--values FILE`, `--events PCR:EVENT`; with the PIN (`--next-generation`, `--redefine-counter`), or a key elsewhere (`--authority-key`, `--digest`, `--signature`); shows the statement and asks (`--yes`) |
+| `ca sign` | where the key is: signs what a statement says (`--authority-key`, `--statement`, `--signature`) |
 | `ca pin` | changes the PIN (`--pin-fd`, `--new-pin-fd`) |
-| `ca remove` | the CA and its PIN index and counter |
+| `ca remove` | the CA and its window index, PIN index and counter; `--force` for leftovers at aSSH's handles |
 | `tpm da` | the TPM's dictionary attack parameters, `--reset`, the lockout authorization (`--new-lockout-auth`, `--ask-lockout-auth`, `--lockout-auth-fd`) |
 | `tpm sha1` | the active banks; `--allow`, `--forbid` |
 | `efivar get NAME`, `set NAME VALUE` / `set --file FILE NAME`, `rm NAME` | an EFI variable, aSSH's (`NAME`) or another vendor's (`NAME-GUID`), the way `persist` does it |
 | `serve` | an SSH server of its own (above) |
 | `agent` | an ssh-agent for sshd (above) |
+| `close` | closes the window, nothing else: the unit's `ExecStopPost=` |
 
 `ASSH_EFIVARS` in the environment points every command at another
 directory than efivarfs (tests).
@@ -638,7 +681,7 @@ hk, err := hostkey.Issue(tpm, ca, hostkey.IssueOptions{
 if hk.Temporary != nil {                    // no slot certified
 	log.Printf("temporary host key %s: %v", hk.Fingerprint(), hk.Temporary)
 }
-hostkey.Close(tpm, ca.Window, "myapp: closed") // with a window: no certificate after this
+ca.Close(tpm)                               // the window: no certificate after this, until the next boot
 
 ln, _ := net.Listen("tcp", ":2222")
 srv, err := server.Start(server.Options{
@@ -658,7 +701,7 @@ the build's key:
 signed, _ := hostkey.NewSigned([]int{11}, buildKey)
 ca, _ := hostkey.CreateCA(tpm, authorityPub, hostkey.CAOptions{Type: hostkey.P256, Bank: hostkey.SHA256,
 	Slots: []hostkey.SlotSpec{{Number: 0, PCRs: []int{0, 7, 11, 15}, Signed: signed}, {Number: 1, PCRs: []int{7, 15}}},
-	Window: 15, PolicyRef: []byte("myapp")})
+	PolicyRef: []byte("myapp")})                // its window closed: it signs from the next boot on
 d, _ := ca.ApprovalDigest(0, values)        // sign d elsewhere, then:
 ca.AddApproval(0, values, sig)              // or ca.Approve(signer, 0, values) with the key at hand
 ca.Save("efi:AsshCA")
@@ -675,7 +718,7 @@ ca.Approve(a, 0, values)
 tpmadmin.ChangePIN(tpm, ca, askOldPIN, askNewPIN)
 
 ca, _ = hostkey.CreateOnceCA(tpm, opts, values) // every slot approved, the authority gone
-hostkey.RemoveCA(tpm, "efi:AsshCA", nil)    // the CA, its PIN index and counter
+hostkey.RemoveCA(tpm, "efi:AsshCA", hostkey.Handles{}) // the CA and its indices, where they are aSSH's
 ```
 
 `tpmadmin` needs the go-tpm fork (below); a program that uses `hostkey`
@@ -689,9 +732,12 @@ efivar`):
 
 - **Only what is provably one's own is removed.** `persist.RemoveNV(tpm,
   handle, ours)` takes an index only when `ours` says so:
-  `persist.Shaped(public area)` - the attributes, policy and size its owner
-  defines - or `persist.Named(name)`, the Name of the very index. Anything
-  else at the handle is left, `persist.ErrNotOurs`.
+  `persist.Defined(public area)` - the attributes, size and policy its
+  owner defines, for an index whose template is its owner's alone;
+  `persist.Shaped` without the policy; `persist.Named(name)`, the Name of
+  the very index. Anything else at the handle is left,
+  `persist.ErrNotOurs`. `persist.Any` is for a removal a person asked for,
+  having seen what is there (`ca remove --force`).
 - **Absent is not an error.** A removal reports whether something went.
 - **An EFI variable is written in place, in one write, never removed
   first** (`persist.WriteVar`): efivarfs replaces it whole, so a crash
@@ -702,10 +748,11 @@ efivar`):
 ### sandbox: confinement on every thread
 
 `sandbox.Apply(sandbox.Policy{ReadBeneath: dirs})` confines the calling
-process for the rest of its life: no new privileges, no memory that
+process for the rest of its life: no new privileges, not dumpable (no
+other process of its uid traces it or reads its memory), no memory that
 becomes executable (`PR_SET_MDWE`), no file but beneath `dirs` (Landlock;
 none with an empty policy), and none of the system calls that administer
-the machine (seccomp). It returns what it did, for the log; a kernel
+the machine or make a namespace (seccomp). It returns what it did, for the log; a kernel
 without Landlock or MDWE is said there, not an error.
 
 prctl, Landlock and seccomp act on the thread that asks, and a Go program
@@ -715,13 +762,26 @@ cannot do that and gets an error. It is the second line: the parent
 starts the process without root, in namespaces of its own (as `server`
 does); this is what the process then takes from itself.
 
+`sandbox.ClaimUID(range, dir)` gives that parent a uid for the process
+that no one else has: the first of the range (`sandbox.DefaultUIDs`,
+`0x7FFE0000-0x7FFEFFFF`, above every range systemd hands out) that no
+user or group database names and no process runs as, held by a lock file
+in `dir` (`/run/assh/uid`) until `Release` - so two servers never share
+one. `server` uses it, and falls back to nobody (65534) when none is free.
+Sharing nobody would let every other nobody process signal the confined
+one.
+
 ## Security
 
 What it protects against, with any authority: a copy of the disk or the
 boot image (no key in it), another machine (the CA loads in this TPM
 alone), another PCR state (the CA does not sign), a process after the
-window closed (no certificate), a compromise of the SSH code (no key in
-that process).
+window closed - or in the boot that created the CA, or after the agent
+failed - (no certificate: the TPM enforces the window, not an approval), a
+CA file or assh.conf edited by root (the TPM checks the CA; the owner reads
+what is approved; `ca remove` removes nothing that is not aSSH's), a
+compromise of the SSH code (no key in that process; no namespace it could
+make, no process of its uid that could attach to it).
 
 What it does not:
 
@@ -742,6 +802,7 @@ authorization empty, as on most machines:
 | undefining G and defining it again alike | until it is incremented its Name differs and the CA signs nothing; it cannot be incremented without the PIN; the owner's next `--next-generation` lands above every old value |
 | replacing G with another index | the CA signs nothing; `ca approve --redefine-counter`, with the PIN, puts G back |
 | copying the CA file to another TPM | neither the CA nor A loads there |
+| undefining W and defining it again alike, to reopen the window | its first value lands above v: the CA signs nothing |
 
 Not protected against:
 

@@ -37,10 +37,11 @@ func TestCertifiedHostKey(t *testing.T) {
 			sw := swtpmtest.Start(t)
 			tpm := sw.Open(t)
 			auth := authority(t)
-			ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: typ, Bank: SHA256, PCRs: []int{15, 7, 0}, Window: 15, PolicyRef: []byte("assh test")})
+			ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: typ, Bank: SHA256, PCRs: []int{15, 7, 0}, PolicyRef: []byte("assh test")})
 			if err != nil {
 				t.Fatal(err)
 			}
+			sw.Reboot(t) // a CA signs from the boot after its creation
 			if len(ca.Slots) != 1 || !slices.Equal(ca.Slots[0].PCRs, []int{0, 7, 15}) || !slices.Equal(ca.PCRs(), []int{0, 7, 15}) {
 				t.Fatalf("slots %v", ca.Slots)
 			}
@@ -69,7 +70,7 @@ func TestCertifiedHostKey(t *testing.T) {
 			}
 			checkTrusted(t, ca, hk)
 
-			if err := Close(tpm, 15, "assh: closed"); err != nil {
+			if err := ExtendPCR(tpm, 15, "assh: closed"); err != nil {
 				t.Fatal(err)
 			}
 			if m := temporary(t, tpm, ca, opts); !slices.Equal(m.Slots[0].Changed, []int{15}) {
@@ -153,26 +154,27 @@ func TestSlots(t *testing.T) {
 	sw := swtpmtest.Start(t)
 	tpm := sw.Open(t)
 	auth := authority(t)
-	ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 14, 15}, Window: 15})
+	ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 14, 15}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	sw.Reboot(t) // a CA signs from the boot after its creation
 	if err := ca.AddSlot(1, []int{15, 7}); err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range []struct {
 		n    int
 		pcrs []int
-	}{{1, []int{8, 15}}, {2, []int{7}}, {2, []int{7, 15}}, {16, []int{8, 15}}, {-1, []int{8, 15}}, {2, nil}, {2, []int{15, 24}}} {
+	}{{1, []int{8, 15}}, {2, []int{7, 15}}, {16, []int{8, 15}}, {-1, []int{8, 15}}, {2, nil}, {2, []int{15, 24}}} {
 		if err := ca.AddSlot(bad.n, bad.pcrs); err == nil {
 			t.Errorf("slot %d with %v added", bad.n, bad.pcrs)
 		}
 	}
-	if _, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7}, Window: 15}); err == nil {
+	if _, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7}}); err == nil {
 		t.Error("a CA whose slot 0 does not read the window")
 	}
 	for _, w := range []int{16, 23, 24} {
-		if _, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, w}, Window: w}); err == nil {
+		if _, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, w}}); err == nil {
 			t.Errorf("PCR %d as the window", w)
 		}
 	}
@@ -202,22 +204,22 @@ func TestSlots(t *testing.T) {
 	checkTrusted(t, ca, certified(t, tpm, ca, opts, 0))
 
 	// The OS moved: slot 1 certifies.
-	if err := Close(tpm, 14, "another OS"); err != nil {
+	if err := ExtendPCR(tpm, 14, "another OS"); err != nil {
 		t.Fatal(err)
 	}
 	checkTrusted(t, ca, certified(t, tpm, ca, opts, 1))
-	// The window closes it too.
-	if err := Close(tpm, 15, "assh: closed"); err != nil {
+	// The window closes every slot.
+	if err := ca.Close(tpm); err != nil {
 		t.Fatal(err)
 	}
-	if m := temporary(t, tpm, ca, opts); len(m.Slots) != 2 || !slices.Equal(m.Slots[0].Changed, []int{14, 15}) || !slices.Equal(m.Slots[1].Changed, []int{15}) {
-		t.Fatalf("after closing: %v", m)
+	if hk, err := Issue(tpm, ca, opts); err != nil || !errors.Is(hk.Temporary, ErrWindowClosed) {
+		t.Fatalf("after closing: %v %v", hk, err)
 	}
 
 	// The firmware moved: no slot certifies.
 	sw.Reboot(t)
 	checkTrusted(t, ca, certified(t, tpm, ca, opts, 0))
-	if err := Close(tpm, 7, "another firmware"); err != nil {
+	if err := ExtendPCR(tpm, 7, "another firmware"); err != nil {
 		t.Fatal(err)
 	}
 	m := temporary(t, tpm, ca, opts)
@@ -265,7 +267,7 @@ func TestTemporaryKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkTemporary(t, ca, hk)
-	if !strings.Contains(hk.Temporary.Error(), "does not load in this TPM") {
+	if !strings.Contains(hk.Temporary.Error(), "not in this TPM") {
 		t.Fatalf("why: %v", hk.Temporary)
 	}
 	swtpmtest.NoneLeft(t, otpm, "Issue on another TPM")
@@ -359,14 +361,14 @@ func TestApprovalChecked(t *testing.T) {
 		t.Fatal("took values for too few PCRs")
 	}
 	rsaAuth, _ := rsa.GenerateKey(rand.Reader, 2048)
-	ca2, err := CreateCA(tpm, rsaAuth.Public(), CAOptions{Type: RSA2048, Bank: SHA256, PCRs: []int{0, 7}, PolicyRef: []byte("assh test")})
+	ca2, err := CreateCA(tpm, rsaAuth.Public(), CAOptions{Type: RSA2048, Bank: SHA256, PCRs: []int{0, 7}, PolicyRef: []byte("assh test"), WindowHandle: 0x01802916})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := ca2.Approve(rsaAuth, 0, values); err != nil {
 		t.Fatal(err)
 	}
-	if err := Close(tpm, 16, "x"); err == nil {
+	if err := ExtendPCR(tpm, 16, "x"); err == nil {
 		t.Fatal("closed with a resettable PCR")
 	}
 }

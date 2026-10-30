@@ -49,6 +49,12 @@ func CreateOnceCA(t transport.TPM, o CAOptions, values map[int][]byte) (*CA, err
 	if err != nil {
 		return nil, err
 	}
+	ok := false
+	defer func() {
+		if !ok {
+			ca.removeWindow(t)
+		}
+	}()
 	// The approvals, by the authority loaded once more (the NULL hierarchy's
 	// seed is the same until the boot ends), then flushed for good.
 	p, err = createPrimary(t, tpm2.TPMRHNull)
@@ -74,5 +80,6 @@ func CreateOnceCA(t transport.TPM, o CAOptions, values map[int][]byte) (*CA, err
 			return nil, err
 		}
 	}
+	ok = true
 	return ca, nil
 }

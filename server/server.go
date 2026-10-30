@@ -21,9 +21,12 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
+
+	"github.com/tpm2-trust/assh/sandbox"
 )
 
-// nobody is who the unprivileged half runs as by default: owning no file.
+// nobody is who the unprivileged half runs as when no uid of its own is
+// free: owning no file.
 const nobody = 65534
 
 // namespaces are the namespaces the unprivileged half gets of its own: no
@@ -57,9 +60,12 @@ type Options struct {
 	// served here (ssh without a command)".
 	Name   string
 	Notice string
-	// UID runs the unprivileged half when the server runs as root;
-	// default 65534 (nobody).
-	UID uint32
+	// UID runs the unprivileged half when the server runs as root. 0
+	// chooses one nobody else uses from UIDs (sandbox.ClaimUID, its lock
+	// in UIDLockDir), and nobody (65534) when none is free.
+	UID        uint32
+	UIDs       sandbox.UIDRange // zero: sandbox.DefaultUIDs
+	UIDLockDir string           // "": sandbox.DefaultLockDir
 }
 
 // Session is a login's interactive session: what is typed comes in, what
@@ -130,7 +136,7 @@ func ParseAuthorizedKeys(data []byte) ([]string, int) {
 }
 
 // Start starts the unprivileged half on the listener. As root it runs as
-// Options.UID in namespaces of its own (without them where the kernel
+// Options.UID (or a uid of its own) in namespaces of its own (without them where the kernel
 // cannot); run as another user it runs as that user. Start returns when
 // it is ready.
 func Start(o Options) (*Server, error) {
@@ -149,9 +155,25 @@ func Start(o Options) (*Server, error) {
 	if o.Notice == "" {
 		o.Notice = "only an interactive session is served here (ssh without a command)"
 	}
-	if o.UID == 0 {
-		o.UID = nobody
+	var claimed *sandbox.UID
+	if o.UID == 0 && os.Geteuid() == 0 {
+		if o.UIDs == (sandbox.UIDRange{}) {
+			o.UIDs = sandbox.DefaultUIDs
+		}
+		u, err := sandbox.ClaimUID(o.UIDs, o.UIDLockDir)
+		if err != nil {
+			o.Log("the unprivileged half runs as nobody, a uid others may share: " + err.Error())
+			o.UID = nobody
+		} else {
+			claimed, o.UID = u, u.ID
+		}
 	}
+	started := false
+	defer func() {
+		if !started {
+			claimed.Release()
+		}
+	}()
 	lf, err := o.Listener.File()
 	o.Listener.Close()
 	if err != nil {
@@ -206,8 +228,10 @@ func Start(o Options) (*Server, error) {
 	}
 	s := &Server{cmd: cmd, ctl: ctl, exited: make(chan struct{}), signer: o.HostKey, opts: o,
 		sessions: map[uint64]*Session{}}
+	started = true
 	go func() {
 		cmd.Wait()
+		claimed.Release()
 		close(s.exited)
 	}()
 

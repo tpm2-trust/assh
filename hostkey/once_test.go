@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 
@@ -39,7 +40,7 @@ func signPCRs(t *testing.T, key *rsa.PrivateKey, bank Bank, pcrs []int, values m
 
 func event(t *testing.T, tpm transport.TPM, pcr int, e string) {
 	t.Helper()
-	if err := Close(tpm, pcr, e); err != nil {
+	if err := ExtendPCR(tpm, pcr, e); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -73,7 +74,7 @@ func TestCreateOnceCA(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ca, err := CreateOnceCA(tpm, CAOptions{Type: P256, Bank: bank, Window: 15,
+			ca, err := CreateOnceCA(tpm, CAOptions{Type: P256, Bank: bank,
 				Slots: []SlotSpec{{Number: 0, PCRs: []int{0, 7, 15}, Signed: signed}, {Number: 1, PCRs: []int{7, 15}}}}, values)
 			swtpmtest.NoneLeft(t, tpm, "CreateOnceCA")
 			if err != nil {
@@ -101,7 +102,12 @@ func TestCreateOnceCA(t *testing.T) {
 				return o
 			}
 
-			// The boot it was made in, signed: slot 0.
+			// Not in the boot it was made in: its window is closed.
+			if hk, err := Issue(tpm, ca, opts(tpm, build)); err != nil || !errors.Is(hk.Temporary, ErrWindowClosed) {
+				t.Fatalf("in the boot of its creation: %v %v", hk, err)
+			}
+			// The next boot of that build, signed: slot 0.
+			tpm = boot("uki A", "a")
 			checkTrusted(t, ca, certified(t, tpm, ca, opts(tpm, build), 0))
 			// An update: another UKI, its own signature - slot 0, no approval.
 			tpm = boot("uki B", "a")
@@ -132,11 +138,12 @@ func TestCreateOnceCA(t *testing.T) {
 			// signature nothing, and the reason says so.
 			tpm = boot("uki B", "a")
 			values, _ = ReadPCRs(tpm, bank, []int{0, 7, 15})
-			only, err := CreateOnceCA(tpm, CAOptions{Type: P256, Bank: bank, Window: 15,
+			only, err := CreateOnceCA(tpm, CAOptions{Type: P256, Bank: bank, WindowHandle: 0x01802916,
 				Slots: []SlotSpec{{Number: 0, PCRs: []int{0, 7, 15}, Signed: signed}}}, values)
 			if err != nil {
 				t.Fatal(err)
 			}
+			tpm = boot("uki B", "a")
 			if m := temporary(t, tpm, only, opts(tpm, other)); m.Error() != "slot 0: PCR 11: no signature of the slot's key for this value" {
 				t.Fatalf("an unsigned value: %v", m)
 			}
