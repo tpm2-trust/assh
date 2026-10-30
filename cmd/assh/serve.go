@@ -20,6 +20,7 @@ import (
 
 	"github.com/tpm2-trust/assh/agent"
 	"github.com/tpm2-trust/assh/hostkey"
+	"github.com/tpm2-trust/assh/sandbox"
 	"github.com/tpm2-trust/assh/server"
 )
 
@@ -58,6 +59,7 @@ func serveCommand(args []string) error {
 	listen := fs.String("listen", cfg.Listen, "the address to listen on")
 	authPath := fs.String("authorized-keys", cfg.AuthorizedKeys, "the keys that may log in (authorized_keys; lines with options are left out)")
 	socket := fs.String("socket", cfg.Socket, "hand each session to the program listening on this Unix socket")
+	childUIDs := fs.String("child-uids", cfg.ChildUIDs.String(), "the range the unprivileged half's uid is chosen from: one no user, group or process has")
 	userName := fs.String("user", cfg.User, "run the command as this user (default: as assh runs)")
 	fs.Parse(args)
 	command := fs.Args()
@@ -108,7 +110,12 @@ func serveCommand(args []string) error {
 			}
 		}()
 	}
+	uids, err := sandbox.ParseUIDRange(*childUIDs)
+	if err != nil {
+		return err
+	}
 	srv, err := server.Start(server.Options{
+		UIDs:           uids,
 		Listener:       ln.(*net.TCPListener),
 		HostKey:        hk.SSH(),
 		AuthorizedKeys: keys,

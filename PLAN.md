@@ -1,216 +1,246 @@
-# PLAN: one SSH CA layout for tpm2-kira and safearch, the CA in an EFI variable
+# PLAN: the window W alone; a window left open for a creation by `--authority-once`
 
-Status: **done** (confirmed 2026-10-25; VM runs 2026-10-26): steps 1-5. Builds on assh `feat/slots`
-(format 3: slots, window, temporary key).
+Status: **aSSH done** (2026-10-30), uncommitted. aSSH first; tpm2-kira and safearch follow after the
+owner is told.
 
 ## Goal
 
-- The same CA layout in both projects:
-
-  | Slot | PCRs | Confidence |
-  |---|---|---|
-  | 0 | 0 (firmware), 2 (option ROMs), 7 (Secure Boot), 11 (the UKI and its phases), 15 (window); on GRUB machines 8 and 9 (GRUB's commands and files) instead of 11 | higher |
-  | 1 | 7, 15 | lower: still certifies after a kernel/image update that was not approved yet, a new option ROM, or a firmware update |
-
-  Window: PCR 15, closed right after the host key is certified.
-- The CA file, approvals included, lives in an **EFI variable**, in both projects, read and
-  written by assh. No copy of it in a boot image. That is what makes PCR 11 possible: an
-  approval carried inside the image it measures can never match (it changes PCR 11 itself).
-- Old builds are no concern (safearch's PCR 11 sealing of the CA file is dropped).
-
-## What an approval is
-
-An approval is the authority's signature over one PCR state of one slot. In the file:
-
-```
-Approval{ Slot int, PCRs map[int][]byte (the slot's PCR values), Generation uint64, Signature }
-```
-
-What is signed (all SHA-256; it is what the TPM computes itself in a policy session):
-
-```
-pcrDigest      = SHA-256( value[p] for each PCR p of the slot, in index order )
-approvedPolicy = PolicyPCR(selection = the slot's PCRs in the CA's bank, pcrDigest)
-                 [ ; PolicyNV(counter index, == Generation) ]   only with a counter (PIN authority)
-                 -- as a policy digest, starting from 32 zero bytes
-ApprovalDigest = SHA-256( approvedPolicy || policyRef )
-Signature      = TPMT_SIGNATURE of the authority over ApprovalDigest
-```
-
-The CA key's own policy is fixed at creation: `PolicyAuthorize(authority Name, policyRef)`.
-It names no PCR. When the CA signs a host certificate, the TPM:
-
-1. `TPM2_VerifySignature(authority, ApprovalDigest, Signature)` → a ticket, only if the
-   signature is the authority's;
-2. `PolicyPCR` in a session: passes only if the PCRs **now** hold the approved values;
-3. `PolicyNV` (with a counter): passes only if the counter is **now** at Generation;
-4. `PolicyAuthorize(approvedPolicy, policyRef, ticket)` turns that into the CA's policy;
-5. `TPM2_Sign` with the CA key.
-
-So an approval is a **public statement** "the CA may sign while slot N's PCRs hold these
-values": it contains nothing secret, and it cannot be forged or altered without the
-authority's key (signing key / the PIN-protected key in the TPM).
-
-| Who signs | tpm2-kira | safearch |
-|---|---|---|
-| authority | the signing key (`seal.key`, or the YubiKey) - the one that reseals | the authority key in the TPM, opened by the PIN |
-| policyRef | `tpm2-kira ssh ca` | `safespace identity` |
-| counter | none | yes: `--next-generation` revokes every older approval |
-
-## Is the EFI variable safe for it?
-
-Yes: whatever is in the variable is checked by the TPM, never trusted.
-
-| Attack on the variable | Result |
-|---|---|
-| read it | nothing: public keys, approvals, and the CA key wrapped by this TPM's storage key (loads in this TPM alone) |
-| forge or edit an approval | the TPM refuses the signature (step 1) or the PCRs don't match (step 2) |
-| copy it to another machine | the CA doesn't load there: temporary key |
-| delete or corrupt it (root, or a firmware reset of the NVRAM) | no certificate (temporary key) - and the CA is gone, as with a TPM clear (see open question 2) |
-| write back an older approval (root) | the CA signs only if the machine actually boots that older state: with a counter (safearch) revoked; **without one (tpm2-kira) it works** for an older, still signed kernel - a downgrade. Same as today with a copied file; listed in tpm2-kira's known limits |
-
-Writing an EFI variable takes root (or the firmware); root can delete the identity in any
-design. Attributes: non-volatile, boot service and runtime access; no authenticated
-variable (nothing would check it that the TPM doesn't already check).
-
-## Design
-
-### assh
-
-- `hostkey`: the CA in an EFI variable. `LoadCA("efi:NAME")`, `(*CA).Save("efi:NAME")`: efivarfs
-  (`/sys/firmware/efi/efivars/<name>-<GUID>`, 4 bytes of attributes, then the file), the
-  immutable flag cleared for a write and set again; the efivarfs directory injectable for
-  tests. One GUID for assh: `24415b90-39be-45c0-a9a3-d547ebe28ea0`.
-- The CLI: `--ca efi:NAME` wherever it takes `--ca FILE`.
-- Size: the variable keeps the approvals of the next boot alone (both slots). Today ≈1.6 KB
-  with one approval; with two ≈2 KB. Firmware limits per variable are usually ≥ 8 KB; if a
-  machine refuses, a compact encoding (CBOR/zstd) is the next step, not now.
-- `ca approve --slot 0,1`: several slots with one PIN entry and one `--next-generation`.
-
-### tpm2-kira
-
-- The CA's home is the EFI variable `KIRAasshCA`. `/etc/tpm2-kira/ssh_ca.json` goes away
-  (the `.pub` beside it stays: what clients trust). The image carries no CA:
-  `/etc/tpm2-kira/ssh/ca.json` is dropped from it, and the SSH part of the boot plan no
-  longer depends on approvals (only: on, network, TPM, a CA, a login key).
-- Values of the next boot's code screen: PCR 0, 2, 7 replayed from the event log; PCR 11
-  predicted from the built UKI with the phase `enter-initrd` (`PredictPCR11FromUKI`, as
-  `seal` does); PCR 15 empty.
-- Approved by **`reseal`**, which the post-build hooks already run after every image
-  rebuild (mkinitcpio post hook, initramfs-tools post-update.d and kernel postinst): it
-  approves both slots with the signing key and writes the variable. `control` does the
-  same at quit, and creates the CA. A rebuild whose reseal is skipped (YubiKey not
-  plugged in): slot 1 still certifies, the console says slot 0 is not approved.
-- `run --ssh-ca efi:KIRAasshCA`: reads the variable in the initrd (efivarfs: mounted
-  by systemd on Arch; mounted by `init-premount/tpm2-kira` on Debian).
-- **GRUB machines:** slot 0 is PCR 0, 2, 7, 8, 9, 15: PCR 8 and 9 predicted from grub.cfg
-  and the files GRUB loads, as `seal`'s slot 0 there. The choice is made when the CA is
-  created, from the event log, as `seal` decides (`DefaultPCRSelection`).
-
-### safearch (its PLAN.md follows this)
-
-- `SAFEasshCA` holds the assh CA file as is: no systemd-creds sealing (old builds
-  dropped).
-- Approved with the PIN: at creation and at a move, both slots.
-- **After an update** only PCR 11 moves (see "What an update changes" below): slot 1
-  certifies after the reboot, and `safespace-seal --approve` approves slot 0 for the
-  recorded state with the PIN.
-- **Later:** the build host predicts the release's PCR 11 (`systemd-measure calculate
-  --phase=enter-initrd:leave-initrd`, as `compose_check` already computes the policy) and
-  the machine approves it before the reboot. That needs a safe distribution channel for
-  the value (signed by the build host, e.g. with the PCR signing key, and checked on the
-  machine) - not now.
-
-### What an update changes (safearch, checked 2026-10-25 against systemd 262 and lib/compose.sh)
-
-The agent starts in the root, `Before=sysinit.target`. By then, of the slot's PCRs:
-
-| PCR | Holds at the agent's start | Changes with an update | Known on the build host |
-|---|---|---|---|
-| 0, 2 | the firmware's measurements + `os-separator` (systemd-pcrosseparator, initrd, extends 0-7, 9, 12-14) | no | no - machine values, read from the machine (the agent's record) |
-| 7 | Secure Boot state, PK/KEK/db/dbx, the db entry that authorized systemd-boot and the UKI + `os-separator` | no (same db key); **yes** after a dbx update or a key rotation | no - machine values, read from the machine |
-| 11 | the UKI's sections (one UKI for every combination) + `enter-initrd` + `leave-initrd` (systemd-pcrphase-initrd's stop at the switch; `sysinit` comes after sysinit.target) | **yes** | **yes**: the UKI alone decides it, the same for every machine and combination |
-| 15 | `safespace-combination:<name>` (select), then nothing (systemd-pcrmachine and -pcrfs masked or ordered after the agent) | no | yes (from the name) |
-
-So PCR 0 and 2 are never calculated: they don't change with an update and are taken from
-the machine. The one value an update needs from outside is PCR 11, and it is fully
-predictable from the release. A firmware update (PCR 0, 2) moves slot 0 only; a dbx
-update (PCR 7) moves both slots: temporary key until approved after the reboot. `systemd-pcrproduct` measures
-into an NvPCR, not PCR 15.
+- W is the window, everywhere: nothing else closes a CA, and no PCR is extended at the
+  close. `--close-pcr` / `ASSH_CLOSE_PCR` go.
+- An opt-in for a CA made where nothing untrusted runs before `agent` closes the window
+  (safearch's initrd): `ca create --window-open` / `ASSH_WINDOW_OPEN=yes` makes W without
+  locking it, so the CA certifies in the boot that made it.
 
 ## Steps
 
-- [x] 1. assh: EFI variable storage (`LoadCA`/`Save` with `efi:NAME`, `--ca efi:NAME`), tests with a
-      fake efivarfs directory; `ca approve --slot 0,1`; README, AGENTS.md.
-- [x] 2. tpm2-kira: slot 0 with PCR 11; the CA in `KIRAasshCA`; `reseal` and `control`
-      approve both slots and write it; the image without the CA; `run` reads the variable;
-      efivarfs on Debian; docs/SSH.md, help, HISTORY.md. Tests: swtpm (prediction matches
-      the replayed boot; slot 1 after an unapproved rebuild; window), unit (plan, fake
-      efivarfs).
-- [x] 3. VM (Arch UKI, Debian GRUB): the variable written by reseal, read at the code
-      screen, certified through slot 0; a rebuild without reseal → slot 1 (Arch).
+- [x] 1. `CAOptions.WindowOpen`: `CreateOnceCA` alone takes it; `CreateCA` and
+       `CreatePINCA` refuse it (their approvals come later, in a running system: an open
+       window would sign for any root process). `defineWindow` locks W unless asked.
+- [x] 2. `ca create --window-open`, `ASSH_WINDOW_OPEN` (refused without
+       `--authority-once`); the message says the window is open until `agent`/`serve`
+       closes it.
+- [x] 3. `--close-pcr`, `ASSH_CLOSE_PCR`, `Config.ClosePCR` and the extend at the close
+       go; `hostkey.ExtendPCR` moves to the tests (`swtpmtest.Extend`).
+- [x] 4. Tests: a once-CA with the window open signs in the creating boot until closed;
+       `CreateCA`/`CreatePINCA` with it refused; `ca create --window-open` without
+       `--authority-once` refused; `ASSH_CLOSE_PCR` an unknown key.
+- [x] 5. README (flag, key table, security), AGENTS.md (the window rule's one exception),
+       HISTORY.md (the close PCR).
+- [x] 6. `go test -count=1 ./...` (passes); then tell the owner what tpm2-kira and safearch need.
 
-## VM test, Arch UKI (2026-10-26)
+## What breaks
 
-QEMU/OVMF, Secure Boot with sbctl, a TPM, LUKS2 + btrfs, systemd 262. tpm2-kira installed
-at the package's paths, set up with `control` (hook, command line, signing key, TOTP
-slots, network DHCP, SSH, CA P-256).
+- `ASSH_CLOSE_PCR` in an assh.conf is an unknown key: tpm2-kira writes it (to be removed
+  there, with PCR 15 dropped from its default slots), safearch does not.
+- `hostkey.ExtendPCR` is gone: tpm2-kira's code screen calls it (removed there).
 
-- `control` created the CA in `KIRAasshCA` (1294 bytes, attributes 7, immutable flag set
-  again); the image build's reseal rewrote it with the predicted PCR 11.
-- Boot: `certified … through slot 0`; OpenSSH accepted the certificate with
-  `StrictHostKeyChecking=yes` and only the `@cert-authority` line; code #0 matched; the
-  disk unlocked from the session; PCR 15 extended afterwards.
-- A rebuild whose reseal did not run (signing key moved away) with a changed command line:
-  TOTP slot 0 failed on PCR 11 as expected, the host key was `certified … through slot 1`.
-  `reseal` afterwards approved slot 0 again; a second reseal: "every slot is approved".
-- assh on real efivarfs: a variable rewritten larger (1321 bytes) and smaller (1294),
-  read back without trailing bytes, immutable flag kept, deleted.
+## Decisions (2026-10-30)
 
-### Learned: the address at boot is not the running system's
+1. The opt-in only with `--authority-once`.
+2. `--close-pcr` removed entirely.
+3. tpm2-kira drops PCR 15 from its default slots (after aSSH, once the owner is told).
 
-The image's systemd-networkd asks DHCP with `ClientIdentifier=mac` (the image has no
-machine-id); the running system's asks with IAID+DUID (from the machine-id). The DHCP
-server sees two clients: the code screen got 172.17.2.100, the system 172.17.2.198. The
-console shows the address, but whoever expects the machine at its usual address finds
-nothing - and a `known_hosts` line that names the hosts must name both.
+---
 
-Done (2026-10-26, decided: the identity from the host, control.conf overrides): the image
-asks as the running system does, read at every build from its DHCP client - systemd-
-networkd (`networkctl --json`: IAID + DUID → `ClientIdentifier=duid`, `IAID=`,
-`DUIDType=`, `DUIDRawData=`), NetworkManager's lease, dhcpcd (its DUID file, the MAC's
-last four bytes as IAID); Debian's image asks with busybox' udhcpc (`-x 0x3d:`), as
-klibc's ipconfig sends no identifier. Verified: Arch .198 at the code screen and after,
-Debian .196 both times. safearch keeps the running system's network, no image network.
+# PLAN (done): security fixes, P1
 
-### VM test, Debian GRUB (2026-10-26)
+Status: **implemented** (2026-10-29); the VM runs are to come. From the security review of
+4f0ddf1; P2, P3 and the info items are in TODO-SEC.md.
 
-Debian 13, GRUB + shim, LUKS2 + LVM, dhcpcd, a TPM, Secure Boot in Setup Mode. The .deb
-built from the working trees: control set the keyscript, the slots, DHCP and SSH; the CA
-slot 0 PCR 0, 2, 7, 8, 9, 15 (GRUB), reseal approved PCR 8/9 predicted from the rebuilt
-initrd. At boot `run` mounted efivarfs, read KIRAasshCA, certified through slot 0, udhcpc
-got .196, the disk unlocked from the SSH session.
-- [x] 4. safearch: PLAN.md updated (done with this plan); its implementation follows its
-      own steps.
-- [x] 5. assh.conf (`config`, decided 2026-10-26): every setting of assh in one KEY=VALUE
-      file (`ASSH_*`), `--config` on every command, a flag wins; `ca sync` makes a CA's
-      slots the file's. tpm2-kira: /etc/tpm2-kira/assh.conf beside control.conf (the CA,
-      its slots, the port, the keys), control writes the slots it works out, reseal
-      follows an edit; control.conf keeps the network, SSH on/off, the hold, and the
-      image's DHCP identity (TPM2_KIRA_NET_DHCP_ID).
+Decided (2026-10-29): new CAs are acceptable; the unprivileged half keeps nobody unless a
+user can be chosen safely that nobody else uses; P1 first, as its own merge.
 
-## What changes / breaks
+## Goal
 
-- tpm2-kira: existing CAs (`/etc/tpm2-kira/ssh_ca.json`) are not read: control creates the
-  CA again, clients need the new `@cert-authority` line. Every rebuild's reseal also writes
-  an EFI variable (≈2 KB, once per rebuild).
-- safearch: no change to anything built yet (plan only).
+Close the five P1 findings, each with a test that fails before the fix:
 
-## Decisions (2026-10-25)
+| # | Finding |
+|---|---|
+| 1 | the window stays open when `agent`/`serve` fail before they close it |
+| 2 | `ca remove` undefines NV indices an untrusted CA file names |
+| 3 | seccomp lets `clone`/`clone3` make namespaces |
+| 4 | the unprivileged half is dumpable, and shares its uid with every other `nobody` |
+| 5 | the authority signs what an untrusted CA file and assh.conf say; the window is only as good as the approval |
 
-1. Variable names `KIRAasshCA` (tpm2-kira), `SAFEasshCA` (safearch), assh's GUID.
-2. The variable is the CA's only copy, in both: a wiped NVRAM loses it, as a TPM clear.
-3. GRUB machines: slot 0 with PCR 8 and 9 instead of 11.
-4. safearch after an update: slot 1 until slot 0 is approved for the recorded state after
-   the reboot. A predicted PCR 11 from the build host over a safe channel: later.
-5. Slot 1 is PCR 7, 15 in both projects: a firmware update costs slot 0 only.
+## How each is fixed
+
+### P1-5: the window and the command in the CA's own policy (a new CA format)
+
+Today the window is a PCR every slot must read: the approval carries it, so an approval of
+a slot without it - made from an edited file - signs after the window. The fix takes the
+window out of the approvals and into the CA's policy, which is fixed at creation and which
+nothing in a file can change.
+
+**W, the window index.** Every CA gets an NV index of its own (default `0x01802915`,
+`ASSH_WINDOW_HANDLE`):
+
+```
+W  NV counter, TPMA_NV_READ_STCLEAR, AuthRead + AuthWrite with an empty authValue, NoDA.
+   Incremented once at ca create: its value v is in the CA file.
+```
+
+```
+CA policy = PolicyAuthorize(A, ref) ; PolicyCommandCode(TPM2_Sign) ; PolicyNV(W == v)
+```
+
+- **Closing** is `TPM2_NV_ReadLock(W)`: from then on PolicyNV fails (`TPM_RC_NV_LOCKED`),
+  whatever an approval says, until `TPM2_Startup(CLEAR)` - the next boot. A resume from
+  S3 (Startup STATE) keeps the lock, as it keeps a PCR.
+- **No clone reopens it.** Undefined and defined again alike, W has its Name back but its
+  first value lands above every value a counter had (the rule P already relies on): never
+  v again. Root can increment or delete W - the CA then signs nothing: a denial of
+  service, never a way in, like deleting the CA.
+- **PolicyCommandCode(Sign)**: in an approved state the CA signs and does nothing else
+  (no Certify, Quote, ...). After PolicyAuthorize, so it is the CA's, not the approval's.
+- **`AdminWithPolicy`** on the CA and on A: the ADMIN role goes through the policy too,
+  not an empty password (an info item, taken with the format change).
+- **Slots no longer need the window PCR.** `ASSH_CA_WINDOW` and the "every slot reads the
+  window" rule go. `--close-pcr`/`ASSH_CLOSE_PCR` stays as an extra: a PCR extended at
+  the close for others that bind to it (tpm2-kira's PCR 15 event; safearch's combination
+  in PCR 15 stays a slot's PCR as before).
+
+**What the owner signs is shown.** The window is now safe from the file; the selection is
+not: root can edit slot 0 to read PCR 7 alone, and an approval of it certifies any OS
+booted under the same Secure Boot keys (before the close).
+
+- `ca approve` prints, before it asks for the PIN or signs: the CA's fingerprint, slot,
+  bank, each PCR and its value, the signed key's fingerprint, the generation - and, on a
+  terminal, asks to confirm (`--yes` for scripts).
+- `--digest` writes a **statement** (JSON: the same fields) beside the digest, and a new
+  `assh ca sign --authority-key KEY --statement FILE --signature OUT` - run where the
+  key is - computes the digest from the statement itself, shows it, and signs. The
+  opaque `d.bin` + `openssl pkeyutl` path stays possible but is no longer the documented
+  one.
+- `ca approve` refuses a slot with signed PCRs whose key is not `ASSH_PCR_KEY`.
+
+A PIN typed into a root-controlled system is lost anyway (README); the statement is the
+defence for a key elsewhere, and a check for the owner at the device.
+
+**API (tpm2-kira follows):** `CAOptions.Window` becomes `WindowHandle`;
+`hostkey.Close(tpm, pcr, event)` becomes `ca.Close(tpm)` (lock W) plus
+`hostkey.ExtendPCR(tpm, pcr, event)` for the extra; `CA.Window` goes;
+`RemoveCA` removes W too. tpm2-kira's `remote_hostkey.go`, `sshscreen/hostkey.go`,
+`remote_assh.go` and their tests change with it.
+
+**Tests (swtpm):** after `Close` the CA signs nothing in an approved state; after a
+reboot (`Startup CLEAR`) it signs again; W undefined and redefined alike: nothing; an
+approval of a slot without PCR 15 still stops at the close; PolicyCommandCode: `Certify`
+with the CA in an approved session fails; `ca sign` and `ca approve --digest` agree.
+
+### P1-1: the window closed on every exit
+
+- `issue` and `noCA` open the TPM first and `defer` the close: whatever returns - a bad
+  key type, an unreadable CA file, a TPM error at ReadPCRs - W is locked (and the extra
+  PCR extended) before the process exits.
+- Which W: the CA file's when it loads; otherwise the one assh.conf names, or the default
+  handle - locked only when it has W's shape (`persist.Shaped`), so a foreign index at
+  that handle is never read-locked.
+- An unparsable assh.conf: the default handle, as above, then the error.
+- **The TPM does not open**: wait for `/dev/tpmrm0` to appear (a state, with an upper
+  bound), then fail. And a new `assh close [--config]` - lock W, extend the extra PCR,
+  nothing else - which the unit runs as `ExecStopPost=`: systemd runs it after every
+  exit of the agent, a failed one included.
+- Window PCR restricted to 0-15 (the DRTM PCRs 17-22 can be reset; info item).
+
+**Tests:** for each error path (bad type, garbage CA file, CA file missing without
+slots, TPM fault injected after open) the CA cannot sign afterwards; `assh close` on a
+machine without a CA does nothing and is no error.
+
+### P1-2: `ca remove` removes only what is provably aSSH's
+
+The NV public areas in the file are no proof: a public area must have aSSH's shape **and**
+the Name the TPM reports.
+
+- **P**: equal to `written(pinIndexPublic(h))` - its policy is a constant.
+- **G**: equal to the counter template whose policy is computed from P's Name and k: so
+  only a counter that belongs to an aSSH PIN index goes. Without a file, k is read from P
+  (`OwnerRead`) after P passed its own check.
+- **W**: equal to W's template.
+- Each with `persist.Shaped(template)` combined with `persist.Named` (a new
+  `persist.All(...)`), so `persist` keeps its rule in one place.
+- **`--force`**, for what a previous installation left at aSSH's handles (an index of
+  another format, a CA file lost): removes the index at each of aSSH's handles - the
+  defaults and those assh.conf or the flags name (P, G, W), never a handle a CA file
+  names - whatever its shape. Each index is shown first (handle, attributes, size,
+  Name) and removed after a confirmation on the terminal (`--yes` for scripts).
+
+**Tests:** a CA file whose PIN entry names a foreign owner index: that index stays; a
+foreign 8-byte counter with the generic attributes at the counter handle, without a file:
+stays; aSSH's own P, G, W: removed.
+
+### P1-3: no namespaces through `clone`
+
+In the seccomp filter, before the deny list:
+
+- `clone3` -> `ENOSYS`: its flags are in memory the filter cannot read; Go's runtime makes
+  threads with `clone` and falls back from `clone3` on ENOSYS.
+- `clone` with any of `CLONE_NEWNS|NEWCGROUP|NEWUTS|NEWIPC|NEWUSER|NEWPID|NEWNET`
+  (mask `0x7E020000`; `CLONE_NEWTIME` exists only for clone3/unshare) -> `EPERM`, by
+  `BPF_JSET` on the low word of args[0] (amd64 and arm64 alike).
+
+**Tests:** after `Apply`, a raw `clone(CLONE_NEWUSER|SIGCHLD)` fails with EPERM, `clone3`
+with ENOSYS, goroutines that need new threads still run. tpm2-kira's `gate-child` suite
+runs against it.
+
+### P1-4: not dumpable, and a uid of its own
+
+- **`PR_SET_DUMPABLE 0`** in `sandbox.Apply` (process-wide): another process of the same
+  uid can no longer ptrace it or read its `/proc/<pid>/mem`, `environ`, `fd` - the attack
+  path. Test: `/proc/self/status` says `0` after Apply; a ptrace attach from a second
+  process of the same uid fails.
+- **A uid nobody else uses**, chosen per start (`server.Options.UID` 0 = choose):
+  1. from a range, `ASSH_CHILD_UIDS` (default `0x7FFE0000-0x7FFEFFFF`: above every range
+     systemd hands out - DynamicUser 61184-65519, containers 524288-1879048191 - and below
+     2^31, so nothing treats it as negative);
+  2. a candidate is taken only when no user database names it (`os/user.LookupId`),
+     no process runs with it (every `/proc/<pid>/status` Uid line), and assh's own lock
+     file for it, `/run/assh/uid/<uid>`, is held with `flock` by this server for the
+     child's life - so two assh servers never share one;
+  3. gid the same number, no supplementary groups, as now;
+  4. no free candidate, no writable `/run/assh`: nobody (65534), logged.
+  The child owns no file and makes none (Landlock), so a uid that no account names is no
+  loss. What sharing nobody left - signals from other nobody processes (SIGSTOP: a denial
+  of service) - is gone with it.
+  Tests: two servers at once get different uids; a uid in the range already used by a
+  process is skipped; a full range falls back to nobody.
+
+## Steps
+
+- [x] 1. P1-3 and P1-4 (sandbox, server): small, independent, tests
+- [x] 2. P1-5: W, the new CA policy, `AdminWithPolicy`, `Close`, statement and `ca sign`,
+       confirmation; format version up (an older CA file: "create the CA again")
+- [x] 3. P1-1 on top of it: deferred close, `assh close`, the unit's `ExecStopPost=`
+- [x] 4. P1-2: P, G, W by their definition (`persist.Defined`); `ca remove --force`
+- [x] 5. README (window, approvals, statement, commands, security), AGENTS.md rules: the
+       window is the CA's policy; nothing returns before the close; persist removes by
+       shape and Name
+- [x] 6. `go test -count=1 ./...`; tpm2-kira adapted to the API (its working tree,
+       uncommitted), its unit and swtpm suites run; `../pin assh`
+- [ ] 7. VM runs (`tools/vmtest.py --target both`, safearch's `tests/vm.sh`): later
+
+## What breaks
+
+- **Every CA is made again** (format and policy): tpm2-kira's `KIRAasshCA`, safearch's
+  `SAFEasshCA`; clients need the new `@cert-authority` line.
+- `ASSH_CA_WINDOW` and `ca create --window` go; `ASSH_WINDOW_HANDLE`,
+  `ASSH_CHILD_UIDS`, `assh close`, `ca sign` come.
+- tpm2-kira: `CAOptions.Window`, `CA.Window`, `hostkey.Close` change (above).
+- The unprivileged half runs as a uid from the range, not nobody.
+
+Found while implementing: W is closed when the CA is made, since before the
+CA exists there is no W to close: a CA signs from the boot after its
+creation. safearch's `--authority-once` in the initrd then certifies from
+its second boot on (open question 1).
+
+## Decisions (2026-10-29)
+
+1. W's default handle `0x01802915`.
+2. The child's uid range `0x7FFE0000-0x7FFEFFFF`.
+3. `ca approve` asks to confirm on a terminal; `--yes` for scripts.
+4. `ca remove --force` for leftovers at aSSH's handles, shown and confirmed.
+
+## Open questions
+
+1. safearch's first boot after `ca create --authority-once` in the initrd serves a
+   temporary key: acceptable, or an explicit opt-in that leaves the window of the
+   creating boot open (only where nothing runs before the agent closes it)?

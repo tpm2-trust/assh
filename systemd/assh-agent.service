@@ -14,6 +14,8 @@ Before=shutdown.target
 [Service]
 Type=notify
 ExecStart=/usr/bin/assh agent --config /etc/assh/assh.conf
+# However the agent ended - a failure included - the window is closed.
+ExecStopPost=/usr/bin/assh close --config /etc/assh/assh.conf
 # A restart gets no certificate: the window is closed until the next boot.
 Restart=no
 

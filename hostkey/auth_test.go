@@ -11,8 +11,7 @@ import (
 )
 
 // A host key signs whatever zero bytes its authorization value holds: the
-// TPM drops only trailing ones, and go-tpm's HMAC sessions must agree
-// (fixed after go-tpm v0.9.8, google/go-tpm#446).
+// TPM drops only trailing ones, and go-tpm's HMAC sessions must agree.
 func TestHostKeysSign(t *testing.T) {
 	sw := swtpmtest.Start(t)
 	tpm := sw.Open(t)

@@ -45,6 +45,21 @@ func Shaped(want tpm2.TPMSNVPublic) Owned {
 	}
 }
 
+// Defined is an index defined exactly as want: Shaped, and the same
+// policy - for an index whose template, policy included, is its owner's
+// alone.
+func Defined(want tpm2.TPMSNVPublic) Owned {
+	shaped := Shaped(want)
+	return func(pub *tpm2.TPMSNVPublic, name tpm2.TPM2BName) bool {
+		return shaped(pub, name) && pub.DataSize == want.DataSize &&
+			string(pub.AuthPolicy.Buffer) == string(want.AuthPolicy.Buffer)
+	}
+}
+
+// Any is every index: only for a removal a person asked for, having seen
+// what is there.
+func Any(*tpm2.TPMSNVPublic, tpm2.TPM2BName) bool { return true }
+
 // stable is a without the attributes the TPM sets on its own.
 func stable(a tpm2.TPMANV) tpm2.TPMANV {
 	a.Written, a.WriteLocked, a.ReadLocked = false, false, false

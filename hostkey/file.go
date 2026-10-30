@@ -10,7 +10,9 @@
 // the CA and the clients' trust in it stay the same for its whole life.
 // The CA's policy names no PCR, so it has up to 16 slots, each a PCR
 // selection with approvals of its own; Issue takes the first slot, from 0
-// up, approved for the PCRs as they are.
+// up, approved for the PCRs as they are. What follows the PolicyAuthorize
+// in the CA's policy is its own, beyond any approval: it signs and does
+// nothing else, and only while its window is open (window.go).
 //
 // The authority is a key elsewhere (a file, a token: CreateCA), whose
 // private key never comes to the TPM, or a key made in this TPM and opened
@@ -27,10 +29,11 @@
 // When none is, the key is temporary: not certified, so a client that
 // trusts the CA asks before it takes it. The host key signs every key
 // exchange of this boot, whatever the PCRs hold later; at the next reboot
-// it is gone for good. Once the window is closed - the CA's window PCR,
-// which every slot reads, extended right after the Issue (Close), or the
-// boot moving on - the CA signs nothing until the next boot, so a server
-// started later, or any other process, gets no certificate.
+// it is gone for good. Once the window is closed - the CA's window index
+// read-locked right after the Issue (Close), which the CA's own policy
+// reads - the CA signs nothing until the next boot, whatever an approval
+// says, so a server started later, or any other process, gets no
+// certificate.
 //
 // Nothing here is a secret outside the TPM, and no secret ever leaves it.
 // So a cleared TPM, or another one, loses the CA: there is no backup of it,
@@ -41,6 +44,7 @@
 package hostkey
 
 import (
+	"bytes"
 	"crypto"
 	"encoding/json"
 	"errors"
@@ -136,7 +140,7 @@ func (b Bank) size() int {
 
 // fileVersion is the one format read; another is an error that says to
 // create the CA again.
-const fileVersion = 3
+const fileVersion = 4
 
 // MaxSlots is how many slots a CA has room for: 0 to MaxSlots-1.
 const MaxSlots = 16
@@ -152,10 +156,9 @@ type CA struct {
 	// Slots are the PCR selections approvals are made for, in the order
 	// Issue scans them: the lowest number first.
 	Slots []Slot `json:"slots"`
-	// Window is the PCR whose extension closes the CA for the rest of the
-	// boot (Close); every slot holds it. 0: none, the boot closes the CA
-	// by itself.
-	Window int `json:"window,omitempty"`
+	// Window is W, the NV index whose read lock closes the CA for the
+	// rest of the boot (Close); the CA's own policy reads it.
+	Window *Window `json:"window"`
 
 	Public  []byte `json:"public"`  // the CA key's TPMT_PUBLIC
 	Private []byte `json:"private"` // its TPM2B_PRIVATE buffer
@@ -250,6 +253,15 @@ func ParseCA(data []byte) (*CA, error) {
 	}
 	if _, err := f.authorityKey(); err != nil {
 		return nil, err
+	}
+	// The key's policy is what the file says the CA is: its authority, its
+	// ref, its window.
+	policy, err := f.caPolicy()
+	if err != nil {
+		return nil, err
+	}
+	if pub, err := tpm2.Unmarshal[tpm2.TPMTPublic](f.Public); err != nil || !bytes.Equal(pub.AuthPolicy.Buffer, policy) {
+		return nil, errors.New("the CA's key does not carry the policy of the authority, reference and window the file names")
 	}
 	return &f, nil
 }
@@ -452,12 +464,12 @@ func (f *CA) SetSigned(n int, s *Signed) error {
 
 // AddSlot gives the CA slot n, reading pcrs. It needs no authority: the
 // slot lets the CA sign nothing until the authority approves a state in
-// it. pcrs must hold the window's PCR, and differ from every other slot's.
+// it. pcrs must differ from every other slot's.
 func (f *CA) AddSlot(n int, pcrs []int) error {
 	if f.Slot(n) != nil {
 		return fmt.Errorf("slot %d is in use", n)
 	}
-	s, err := newSlot(n, pcrs, f.Window)
+	s, err := newSlot(n, pcrs)
 	if err != nil {
 		return err
 	}
@@ -471,7 +483,7 @@ func (f *CA) AddSlot(n int, pcrs []int) error {
 	return nil
 }
 
-func newSlot(n int, pcrs []int, window int) (Slot, error) {
+func newSlot(n int, pcrs []int) (Slot, error) {
 	if n < 0 || n >= MaxSlots {
 		return Slot{}, fmt.Errorf("slot %d: the slots are 0 to %d", n, MaxSlots-1)
 	}
@@ -479,9 +491,6 @@ func newSlot(n int, pcrs []int, window int) (Slot, error) {
 	sort.Ints(pcrs)
 	if err := checkSelection(pcrs); err != nil {
 		return Slot{}, fmt.Errorf("slot %d: %w", n, err)
-	}
-	if window != 0 && !slices.Contains(pcrs, window) {
-		return Slot{}, fmt.Errorf("slot %d does not read PCR %d, the window: the window would not close it", n, window)
 	}
 	return Slot{Number: n, PCRs: pcrs}, nil
 }
@@ -499,22 +508,10 @@ func checkSelection(pcrs []int) error {
 	return nil
 }
 
-// checkWindow makes sure pcr can be the window, the PCR whose extension
-// closes the CA: one no process can reset (16 and 23 can; a reset reopens
-// it). A CA's window 0 means none.
-func checkWindow(pcr int) error {
-	if pcr < 0 || pcr > 23 || pcr == 16 || pcr == 23 {
-		return fmt.Errorf("PCR %d cannot close the CA (0 to 22, not 16: any process can reset 16 and 23)", pcr)
-	}
-	return nil
-}
-
 // checkSlots makes sure the file's slots and approvals fit together.
 func (f *CA) checkSlots() error {
-	if f.Window != 0 {
-		if err := checkWindow(f.Window); err != nil {
-			return err
-		}
+	if _, err := f.window(); err != nil {
+		return err
 	}
 	if len(f.Slots) == 0 {
 		return errors.New("the CA has no slot")
@@ -526,7 +523,7 @@ func (f *CA) checkSlots() error {
 		if err := checkSelection(s.PCRs); err != nil {
 			return fmt.Errorf("slot %d: %w", s.Number, err)
 		}
-		if _, err := newSlot(s.Number, s.PCRs, f.Window); err != nil {
+		if _, err := newSlot(s.Number, s.PCRs); err != nil {
 			return err
 		}
 		if s.Signed != nil {

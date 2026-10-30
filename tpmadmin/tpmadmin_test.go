@@ -49,6 +49,7 @@ func TestChangePIN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sw.Reboot(t) // a CA signs from the boot after its creation
 	if err := approve(t, sw, ca, oldPIN); err != nil {
 		t.Fatal(err)
 	}

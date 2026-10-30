@@ -162,12 +162,26 @@ func objectName(pub tpm2.TPMTPublic) (tpm2.TPM2BName, error) {
 }
 
 // caPolicyFor is the CA key's policy: whatever the authority of this Name
-// approves.
-func caPolicyFor(authority tpm2.TPM2BName, policyRef []byte) []byte {
-	return policyDigest(tpm2.PolicyAuthorize{
+// approves, then Sign alone, while the window index w holds v - not
+// read-locked.
+func caPolicyFor(authority tpm2.TPM2BName, policyRef []byte, w tpm2.TPMSNVPublic, v uint64) []byte {
+	return policyDigest(append([]func(*tpm2.PolicyCalculator) error{tpm2.PolicyAuthorize{
 		PolicyRef: tpm2.TPM2BDigest{Buffer: policyRef},
 		KeySign:   authority,
-	}.Update)
+	}.Update}, windowGate(w, v)...)...)
+}
+
+// caPolicy is this CA's policy, as its key must carry it.
+func (f *CA) caPolicy() ([]byte, error) {
+	name, err := f.authorityName()
+	if err != nil {
+		return nil, err
+	}
+	w, err := f.window()
+	if err != nil {
+		return nil, err
+	}
+	return caPolicyFor(name, f.PolicyRef, w, f.Window.Value), nil
 }
 
 // selection is pcrs of bank as the TPM takes them.

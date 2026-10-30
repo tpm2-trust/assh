@@ -248,19 +248,23 @@ func LockoutAuthSet(t transport.TPM) (bool, error) {
 // removes what it made. The CA has no approval yet; its counter is at
 // generation 1.
 func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
+	if o.WindowOpen {
+		return nil, errOpenWindow
+	}
 	if o.PINHandle == 0 {
 		o.PINHandle = DefaultPINHandle
 	}
 	if o.CounterHandle == 0 {
 		o.CounterHandle = DefaultCounterHandle
 	}
-	for _, h := range []tpm2.TPMHandle{o.PINHandle, o.CounterHandle} {
+	wHandle := windowHandle(o.WindowHandle)
+	for _, h := range []tpm2.TPMHandle{o.PINHandle, o.CounterHandle, wHandle} {
 		if err := ownerNVHandle(h); err != nil {
 			return nil, err
 		}
 	}
-	if o.PINHandle == o.CounterHandle {
-		return nil, errors.New("the PIN index and the counter need two handles")
+	if o.PINHandle == o.CounterHandle || o.PINHandle == wHandle || o.CounterHandle == wHandle {
+		return nil, errors.New("the PIN index, the counter and the window index need three handles")
 	}
 	ca, err = newCA(t, o.CAOptions)
 	if err != nil {
@@ -274,7 +278,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	} else if !set {
 		return nil, errors.New("the TPM has no lockout authorization: anyone could reset its dictionary attack lockout and try PINs without end; set one first")
 	}
-	for _, h := range []tpm2.TPMHandle{o.PINHandle, o.CounterHandle} {
+	for _, h := range []tpm2.TPMHandle{o.PINHandle, o.CounterHandle, wHandle} {
 		if _, _, err := persist.ReadNVPublic(t, h); err == nil {
 			return nil, fmt.Errorf("NV handle 0x%08X is in use", uint32(h))
 		}
@@ -298,7 +302,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	defer func() {
 		if err != nil {
 			for _, pub := range defined {
-				persist.RemoveNV(t, pub.NVIndex, persist.Shaped(pub))
+				persist.RemoveNV(t, pub.NVIndex, persist.Defined(pub))
 			}
 		}
 	}()
@@ -356,6 +360,10 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	if err := ca.Sync(t); err != nil {
 		return nil, err
 	}
+	if ca.Window, err = defineWindow(t, wHandle, false); err != nil {
+		return nil, err
+	}
+	defined = append(defined, windowPublic(wHandle))
 
 	if err := ca.makeKey(t, p); err != nil {
 		return nil, err

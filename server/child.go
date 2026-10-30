@@ -7,10 +7,11 @@ package server
 // login. So it opens the port and starts its own program again - led to
 // ChildMain - handing it the listening socket and one end of a control
 // socket. This process then gives up everything it does not need - it runs
-// as nobody, in network, IPC, PID and mount namespaces of its own, and
-// takes from itself what package sandbox takes, on every thread: new
-// privileges, executable memory, every file (Landlock), the system calls
-// that administer the machine (seccomp) - and only then speaks SSH
+// as a uid nobody else uses (or nobody), in network, IPC, PID, mount and
+// UTS namespaces of its own, and takes from itself what package sandbox
+// takes, on every thread: new privileges, being traced, executable memory,
+// every file (Landlock), the system calls that administer the machine and
+// make namespaces (seccomp) - and only then speaks SSH
 // (golang.org/x/crypto/ssh).
 //
 // It holds no host key: the key exchange is signed by the server, asked
