@@ -24,8 +24,10 @@ permissions:
 jobs:
   strix-security-scan:
     runs-on: ubuntu-latest
-    # Only run when the branch name ends with 'pentest'
-    if: endsWith(github.head_ref, 'pentest')
+    # Manual runs always; pull requests only from a branch ending in 'pentest'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      endsWith(github.head_ref, 'pentest')
 
     steps:
       - name: Checkout code
@@ -33,8 +35,9 @@ jobs:
 
       - name: Install Strix
         run: |
-          # Official Strix installation method from https://strix.ai/install
-          curl -sSL https://strix.ai/install | bash
+          # Official Strix installer, always the latest release
+          curl -fsSL https://strix.ai/install | bash
+          strix --version
 
       - name: Run Strix Security Scan
         env:
@@ -47,12 +50,10 @@ jobs:
               github.event.inputs.scan_mode == 'deep' &&
               'high' || 'medium'
             }}
+          SCAN_MODE: ${{ github.event.inputs.scan_mode || 'standard' }}
         run: |
-          # Determine scan mode (quick, standard, or deep)
-          SCAN_MODE="${{ github.event.inputs.scan_mode || 'quick' }}"
-
           # Run Strix in non-interactive mode
-          strix -n -t ./ --scan-mode ${SCAN_MODE}
+          strix -n -t ./ --scan-mode "$SCAN_MODE"
         continue-on-error: true
 
       - name: Upload Strix Results
