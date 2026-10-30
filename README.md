@@ -732,9 +732,11 @@ without it builds with go-tpm as released.
 
 ### persist: what is kept outside a file
 
-NV indices and EFI variables are written and removed one way, by aSSH and
-by every program built on it (tpm2-kira; safearch's scripts through `assh
-efivar`):
+NV indices and EFI variables are written and removed one way within aSSH;
+tpm2-kira uses it for NV indices, safearch's scripts reach aSSH's variables
+through `assh efivar`. EFI variables go through the workspace's `uefi`
+module (`efivar`: the standard library and x/sys alone; the submodule
+`uefi/`):
 
 - **Only what is provably one's own is removed.** `persist.RemoveNV(tpm,
   handle, ours)` takes an index only when `ours` says so:
@@ -748,7 +750,9 @@ efivar`):
 - **An EFI variable is written in place, in one write, never removed
   first** (`persist.WriteVar`): efivarfs replaces it whole, so a crash
   leaves the old value or the new one, never none. The immutable mark is
-  lifted for a write and put back. `persist.ReadVar`, `persist.RemoveVar`;
+  lifted for a write and put back, whether the write succeeded or not. An
+  empty value is refused (efivarfs would remove the variable).
+  `persist.ReadVar` (whatever the attributes), `persist.RemoveVar`;
   `efi:NAME` is aSSH's GUID, `efi:NAME-GUID` another vendor's.
 
 ### sandbox: confinement on every thread
@@ -827,6 +831,7 @@ Not protected against:
 ## Building and testing
 
 ```bash
+git clone --recurse-submodules https://github.com/tpm2-trust/assh.git   # uefi/ is a submodule
 go build ./cmd/assh
 go test -count=1 ./...
 ```

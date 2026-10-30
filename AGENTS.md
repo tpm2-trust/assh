@@ -71,9 +71,9 @@ name is a change to them: build and test tpm2-kira after one.
   exceptions: `RedefineCounter` replaces what is at the CA's own handle
   after the PIN is proven, and `ca remove --force` removes what a person
   saw and confirmed (`persist.Any`) - absent is not an error, and a
-  variable is written in place, never removed first. Programs built on aSSH use the
-  same package (tpm2-kira) or the `assh efivar` command (safearch's
-  scripts).
+  variable is written in place, never removed first. Inside aSSH, everything
+  goes through it. tpm2-kira uses it for NV indices and keeps EFI variables
+  of its own; safearch's scripts use the `assh efivar` command.
 - **A confinement step covers every thread.** prctl, Landlock and
   seccomp act on the thread that asks, and a Go program has several from
   its start: `sandbox` takes each step on all of them

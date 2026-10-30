@@ -1,3 +1,31 @@
+# PLAN: EFI variables through the workspace's uefi module
+
+Status: **done in aSSH** (2026-10-30), uncommitted. The workspace plan (`../PLAN.md`, "a UEFI
+package of our own") has the module; this is aSSH's part.
+
+## Goal
+
+`persist` keeps its API (`IsVar`, `VarPath`, `ReadVar`, `WriteVar`, `RemoveVar`, `VarDir`,
+`VarPrefix`, `VarGUID`). Underneath, `github.com/tpm2-trust/uefi/efivar` reads, writes and
+removes: the standard library and x/sys alone. go-uefi was tried and left: upstream did not
+take the fork's changes, and it cost 422 KB and three modules.
+
+## Steps
+
+- [x] 1. The uefi module as the submodule `uefi/` (URL github.com/tpm2-trust/uefi), with a
+       `replace` in go.mod; `go.work` uses the workspace's checkout.
+- [x] 2. `persist/efivar.go` on `efivar.Store{Dir: VarDir}`. The name check (letters,
+       digits, _ and -) stays aSSH's.
+       - New: the immutable mark is put back after a failed write.
+       - New: an empty write is refused (TODO-SEC P3-14, both items).
+- [x] 3. Tests:
+       - `TestVars`, plus a firmware variable with other attributes and the empty write
+         refused;
+       - `go test -count=1 ./...` passes, also with `GOWORK=off`.
+- [x] 4. README (persist, clone with submodules), TODO-SEC, HISTORY.
+- [ ] 5. tpm2-kira's suite against it; safearch's `tests/run.sh` after `./pin assh` (its
+       build needs the submodule: `--recurse-submodules`).
+
 # PLAN: the window W alone; a window left open for a creation by `--authority-once`
 
 Status: **aSSH done** (2026-10-30), uncommitted. aSSH first; tpm2-kira and safearch follow after the

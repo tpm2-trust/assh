@@ -13,3 +13,10 @@ require (
 // upstream. A replace does not reach a module that uses assh: only tpmadmin
 // needs them, and hostkey does not import it.
 replace github.com/google/go-tpm => github.com/mrwiora/go-tpm v0.0.0-20261029164022-f241ee1ef546
+
+// EFI variables (efivarfs): the workspace's uefi module, pinned as the
+// submodule uefi/. A replace does not reach a module that uses assh: each
+// pins uefi itself (tpm2-kira as its own submodule).
+require github.com/tpm2-trust/uefi v0.0.0
+
+replace github.com/tpm2-trust/uefi => ./uefi
