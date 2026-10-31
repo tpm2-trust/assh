@@ -131,9 +131,9 @@ SystemCallFilter=@system-service
 ### P3-14: persist edge cases
 
 - [x] An empty value is a delete for efivarfs: `WriteVar` refuses it (2026-10-30, the
-  `uefi` module's `efivar`, `ErrEmpty`).
+  `go-uefi-slim` module's `efivar`, `ErrEmpty`).
 - [x] The immutable mark is not put back when the write fails: put back whether the write
-  succeeded or not (2026-10-30, `uefi/efivar`).
+  succeeded or not (2026-10-30, `go-uefi-slim/efivar`).
 - `persist/nv.go:71-85`: between `NVReadPublic` and `NVUndefineSpace` another owner could
   replace the index. Undefine in an HMAC session with the owner's empty auth: cpHash binds
   the index's Name, the TPM refuses a changed one.

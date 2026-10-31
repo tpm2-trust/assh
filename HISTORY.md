@@ -4,7 +4,7 @@ Reasoning behind aSSH's design that the code and the README no longer
 carry: why it is as it is, what was tried and measured. The README says
 what it is.
 
-## EFI variables in the workspace's uefi module (2026-10-30)
+## EFI variables in the workspace's go-uefi-slim module (2026-10-30)
 
 `persist` wrote efivarfs itself, and did not put the immutable mark back
 when a write failed, nor refuse an empty write, which efivarfs takes as a
@@ -13,7 +13,7 @@ library). Upstream lacked a settable directory, removal, putting the mark
 back and truncation, and its check of the mark created a missing file (an
 empty variable on efivarfs). A fork had them, but upstream did not take
 them, and go-uefi cost aSSH 422 KB and three modules (go-uefi, afero,
-pkg/errors). So the workspace has its own module, `uefi`, with the standard
+pkg/errors). So the workspace has its own module, `go-uefi-slim`, with the standard
 library and x/sys alone; `persist` keeps its API on top of it.
 
 ## A PCR extended at the close (until 2026-10-30)

@@ -1,4 +1,4 @@
-# PLAN: EFI variables through the workspace's uefi module
+# PLAN: EFI variables through the workspace's go-uefi-slim module
 
 Status: **done in aSSH** (2026-10-30), uncommitted. The workspace plan (`../PLAN.md`, "a UEFI
 package of our own") has the module; this is aSSH's part.
@@ -6,13 +6,13 @@ package of our own") has the module; this is aSSH's part.
 ## Goal
 
 `persist` keeps its API (`IsVar`, `VarPath`, `ReadVar`, `WriteVar`, `RemoveVar`, `VarDir`,
-`VarPrefix`, `VarGUID`). Underneath, `github.com/tpm2-trust/uefi/efivar` reads, writes and
+`VarPrefix`, `VarGUID`). Underneath, `github.com/tpm2-trust/go-uefi-slim/efivar` reads, writes and
 removes: the standard library and x/sys alone. go-uefi was tried and left: upstream did not
 take the fork's changes, and it cost 422 KB and three modules.
 
 ## Steps
 
-- [x] 1. The uefi module as the submodule `uefi/` (URL github.com/tpm2-trust/uefi), with a
+- [x] 1. The go-uefi-slim module as the submodule `go-uefi-slim/` (URL github.com/tpm2-trust/go-uefi-slim), with a
        `replace` in go.mod; `go.work` uses the workspace's checkout.
 - [x] 2. `persist/efivar.go` on `efivar.Store{Dir: VarDir}`. The name check (letters,
        digits, _ and -) stays aSSH's.

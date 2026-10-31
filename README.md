@@ -734,9 +734,9 @@ without it builds with go-tpm as released.
 
 NV indices and EFI variables are written and removed one way within aSSH;
 tpm2-kira uses it for NV indices, safearch's scripts reach aSSH's variables
-through `assh efivar`. EFI variables go through the workspace's `uefi`
+through `assh efivar`. EFI variables go through the workspace's `go-uefi-slim`
 module (`efivar`: the standard library and x/sys alone; the submodule
-`uefi/`):
+`go-uefi-slim/`):
 
 - **Only what is provably one's own is removed.** `persist.RemoveNV(tpm,
   handle, ours)` takes an index only when `ours` says so:
@@ -831,7 +831,7 @@ Not protected against:
 ## Building and testing
 
 ```bash
-git clone --recurse-submodules https://github.com/tpm2-trust/assh.git   # uefi/ is a submodule
+git clone --recurse-submodules https://github.com/tpm2-trust/assh.git   # go-uefi-slim/ is a submodule
 go build ./cmd/assh
 go test -count=1 ./...
 ```

@@ -14,7 +14,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/tpm2-trust/uefi/efivar"
+	"github.com/tpm2-trust/go-uefi-slim/efivar"
 )
 
 // VarPrefix names an EFI variable wherever a file's path goes: "efi:NAME"
