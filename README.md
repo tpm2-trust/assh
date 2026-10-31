@@ -727,9 +727,6 @@ ca, _ = hostkey.CreateOnceCA(tpm, opts, values) // every slot approved, the auth
 hostkey.RemoveCA(tpm, "efi:AsshCA", hostkey.Handles{}) // the CA and its indices, where they are aSSH's
 ```
 
-`tpmadmin` needs the go-tpm fork (below); a program that uses `hostkey`
-without it builds with go-tpm as released.
-
 ### persist: what is kept outside a file
 
 NV indices and EFI variables are written and removed one way within aSSH;
@@ -849,14 +846,10 @@ itself is used (tpm2-kira's and safearch's VM runs).
 ## Known limits
 
 - **go-tpm is pinned to an unreleased commit**
-  (`v0.9.9-0.20261001171150-36f205946d7e`): v0.9.8 fails to sign with a
+  (`v0.9.9-0.20261030171821-c395998989d7`): v0.9.8 fails to sign with a
   host key whose random authorization value has a zero byte inside
-  (google/go-tpm#446). Move to the first release with the fix.
-- **assh builds with a fork of go-tpm** (`replace` in go.mod,
-  github.com/mrwiora/go-tpm, the branch of google/go-tpm#452) for
-  TPM2_NV_ChangeAuth and the response check of a command that changes an
-  authorization value. Only `tpmadmin` needs it; a module that uses assh
-  is not reached by the replace. Drop it once upstream has #452.
+  (google/go-tpm#446), and has no TPM2_NV_ChangeAuth (google/go-tpm#452,
+  for `tpmadmin`). Move to the first release with both.
 - **RSA-2048 host keys** sign rsa-sha2-256 in `serve` (many TPMs lack
   SHA-512); the agent's `sshd.conf` offers rsa-sha2-512 only where the TPM
   has it.

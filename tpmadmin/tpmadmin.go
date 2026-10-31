@@ -2,10 +2,6 @@
 // a PIN: the PIN, the dictionary attack parameters, the lockout
 // authorization.
 //
-// It needs TPM2_NV_ChangeAuth and TPM2_DictionaryAttackLockReset, which
-// go-tpm has only in the fork assh's go.mod names. A program that uses
-// hostkey without this package builds with go-tpm as released.
-//
 // The dictionary attack parameters are the TPM's, not assh's: every
 // object in the TPM that is not noDA shares them and the failure count -
 // a volume unlocked with a TPM PIN, say.

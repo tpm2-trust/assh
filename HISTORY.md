@@ -37,9 +37,9 @@ sessions, where the TPM drops only trailing ones. A host key's
 authorization value is random, so about one key in eight failed to sign.
 google/go-tpm#446 fixed it; until a release has it, go.mod requires the
 unreleased commit `36f205946d7e` (`hostkey/auth_test.go` signs with zero
-bytes in every position). The fork (`github.com/mrwiora/go-tpm`, the branch
-of google/go-tpm#452) adds TPM2_NV_ChangeAuth on top, for `tpmadmin`
-alone.
+bytes in every position). TPM2_NV_ChangeAuth for `tpmadmin` came from a
+fork (`github.com/mrwiora/go-tpm`, google/go-tpm#452) until upstream took
+it (`c395998`, 2026-10-30), which go.mod now requires.
 
 ## One CA layout for tpm2-kira and safearch, the CA in an EFI variable (2026-10-25/26)
 

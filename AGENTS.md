@@ -19,9 +19,10 @@ name is a change to them: build and test tpm2-kira after one.
   authority key, the counter and the host keys are noDA, so that a lockout
   after wrong PINs never stops `Issue`. Anything that holds the PIN must
   be counted, and anything else must not be.
-- **hostkey builds with go-tpm as released.** tpm2-kira compiles assh with
-  its own go-tpm; assh's `replace` (the fork) does not reach it. Commands
-  only the fork has are used in `tpmadmin` alone.
+- **go-tpm upstream, one version with its users.** No `replace` of
+  go-tpm: tpm2-kira compiles assh with its own go-tpm, and a replace here
+  would not reach it. A go-tpm move is made in every module of the
+  workspace at once (its AGENTS.md).
 - **The window is the CA's own policy, and it fails closed.** Every CA
   has a window index W that its policy reads (`PolicyAuthorize ;
   PolicyCommandCode(Sign) ; PolicyNV(W == v)`), read-locked to close it: no
