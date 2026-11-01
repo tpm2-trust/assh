@@ -6,6 +6,10 @@ Status: **implemented** (2026-11-01) on `feat/close-pcr15`, the variant chosen o
 - [x] The close is PCR 15 in the CA's policy (below).
 - [x] `openTPM` waits for a TPM that is not there or does not answer yet: at least 3
       attempts within 5 s (`openAttempts`, `openWait`), as tpm2-kira's `tpmdev.Open`.
+- [x] E2. `hostkey.Close` is a ladder, each step read back: PCR 15 twice, the kill switch
+      (`shEnable`, `ehEnable`, `phEnable` last, the platform's authorization random first), PCR 7;
+      `CloseResult` says how, `*CloseError` whether the TPM answers; `assh close` prints it.
+      Tests on swtpm through a wrapper that refuses or redirects commands, `TestCloseAcrossSuspend`.
 - [x] E4. `hostkey.Close` appends systemd-pcrextend's record to
       `/run/log/systemd/tpm2-measure.log` where the directory is there (format captured from
       systemd 262 against swtpm: RS-JSON-LF, one record with every bank's digest - not one
