@@ -55,7 +55,7 @@ reboot
 ```
 
 After that boot the agent serves a temporary key (there is no CA yet),
-has recorded the PCRs of both slots and closed the window. Create the CA
+has recorded the PCRs of both slots and closed the CA (PCR 15). Create the CA
 and approve the recorded state:
 
 ```bash
@@ -163,11 +163,11 @@ sequenceDiagram
   S->>T: policy session: PolicyPCR(the slot's PCRs as they are now)
   S->>T: with a counter: PolicyNV(G == n as it is now)
   S->>T: PolicyAuthorize(approved, policyRef, ticket)
-  S->>T: PolicyCommandCode(Sign) ; PolicyNV(W == v): the window open
-  Note over T: the session's digest is the CA's policy<br/>only if the state is the approved one<br/>and the window is open
+  S->>T: PolicyCommandCode(Sign) ; PolicyPCR(15 == open value): not closed
+  Note over T: the session's digest is the CA's policy<br/>only if the state is the approved one<br/>and PCR 15 was not extended
   S->>T: make the host key (NULL hierarchy)
   S->>T: Sign the host certificate with the CA, in that session
-  S->>T: NV_ReadLock(W): the CA signs nothing more this boot
+  S->>T: PCR_Event(15, "assh-close"): the CA signs nothing more this boot
 ```
 
 An approval edited in the file fails the signature check; one for
@@ -179,42 +179,55 @@ temporary.
 The CA's whole policy, fixed at creation:
 
 ```
-CA policy = PolicyAuthorize(authority, ref) ; PolicyCommandCode(Sign) ; PolicyNV(W == v)
+CA policy = PolicyAuthorize(authority, ref) ; PolicyCommandCode(Sign) ; PolicyPCR(15 == open value)
 ```
 
 The part after PolicyAuthorize is the CA's own: no approval can leave it
 out. In an approved state the CA signs and does nothing else (no Certify,
-no Quote), and only while its window is open. Its ADMIN role goes through
+no Quote), and only while PCR 15 holds its open value. Its ADMIN role goes through
 the policy too (`adminWithPolicy`), so no empty password reaches it.
 
-### The window
+### The close: PCR 15
 
-Every CA has a window index W of its own (`0x01802915` by default,
-`ASSH_WINDOW_HANDLE`, `ca create --window-handle`): an NV counter that can
-be read-locked until the next boot (`TPMA_NV_READ_STCLEAR`), given its one
-value v when the CA is made. The CA's policy reads it, so closing the
-window - `TPM2_NV_ReadLock(W)` - stops the CA in every slot, whatever an
-approval says, until `TPM2_Startup(CLEAR)`: the next boot. A resume from
-suspend keeps the lock.
+PCR 15 is part of the CA's own policy: `PolicyPCR(15 == open value)`,
+after PolicyAuthorize, fixed when the key is made. The open value is zero -
+PCR 15 as every boot starts it. Closing the CA is an extend of PCR 15,
+`TPM2_PCR_Event(15, "assh-close")` (in every bank; the same digest as
+`systemd-pcrextend --pcr=15 assh-close`): from then on the CA signs
+nothing in any slot, whatever an approval says - also an approval of a
+slot that reads PCR 15 as it is after the close - until
+`TPM2_Startup(CLEAR)`: the next boot. A resume from suspend (S3) keeps
+the PCR; a resume from hibernation is a boot, which starts it at zero
+again - whoever resumes must close first.
 
 - `agent` and `serve` close it right after the host key is certified - and
   on every other way out, a failure at any step included. The unit runs
   `assh close` after the agent too (`ExecStopPost=`), which also closes it
-  when the agent could not start, or assh.conf does not parse.
-- **A CA is created with its window closed**: it signs from the next boot
-  on, never in a boot whose window has been open to every process. The
-  one exception is a CA whose authority is made once (below): `ca create
-  --window-open` (`ASSH_WINDOW_OPEN=yes`) leaves the window of its boot
-  open, so that it signs in that boot until `agent` or `serve` closes it -
-  for a creation where nothing untrusted runs before them (an initrd). Any
-  other CA refuses it: its approvals come later, in a running system, where
-  an open window signs for whoever comes first.
-- W defined again alike (root can, with the owner authorization) has W's
-  Name back, but its first value lands above every value a counter had:
-  never v. Deleting or incrementing W stops the CA - a denial of service,
+  when the agent could not start, or assh.conf does not parse. `close`
+  needs no CA file: it extends PCR 15, nothing else. A close that fails
+  (no TPM, a refused extend) is an error, never a success.
+- **A CA is created closed**: `ca create` extends PCR 15, so the CA signs
+  from the next boot on, never in a boot where PCR 15 has been zero to
+  every process (a system that measures nothing into it). The one
+  exception is a CA whose authority is made once (below): `ca create
+  --open-events EVENT,...` (`ASSH_CA_OPEN_EVENTS`) makes its open value
+  what those events, measured from zero, make PCR 15 - what an initrd
+  measures there before the agent (safearch's combination) - and leaves it
+  open in the boot that makes it, until `agent` or `serve` closes it: for
+  a creation where nothing untrusted runs before them. Any other CA
+  refuses it: its approvals come later, in a running system, where an open
+  CA signs for whoever comes first.
+- Nothing is defined for it in the TPM, and nothing can reopen it: a PCR
+  is never set back but by a reset of the TPM (a reboot). PCR 15 is not
+  resettable from software on a PC Client TPM (only 16 and 23 are; 17-22
+  by locality 4 alone). Extending it takes no authorization: any process
+  with the TPM's device can close the CA early - a denial of service,
   never a way in.
-- W is the window alone: closing it extends no PCR. A PCR in a slot (the
-  combination in PCR 15, say) is what the approval says, nothing more.
+- Everything else that measures into PCR 15 before the server closes the
+  CA closes it too (systemd's machine-id, file systems and volume keys,
+  which on systemd run after the initrd or after a volume is opened): a
+  CA open at zero signs only where its server runs before them. An
+  approval of a slot that reads PCR 15 is possible and adds nothing.
 
 ### The temporary key
 
@@ -247,8 +260,8 @@ remove it once the state is approved.
 - **Before the CA exists** - its file or EFI variable not there, and
   assh.conf naming the slots - the PCRs of those slots are recorded. The
   CA is then created and this boot's recorded state approved (the quick
-  start); the next boot certifies. Not in the same boot: a new CA's window
-  is closed, or any process could have it certify.
+  start); the next boot certifies. Not in the same boot: a new CA is
+  closed, or any process could have it certify.
 
 ## The authority
 
@@ -310,8 +323,7 @@ CA, or use the authority in the TPM.
 
 ### In the TPM: a PIN, and revocation
 
-Three things in the TPM besides the window index, none of them secret
-outside it:
+Three things in the TPM, none of them secret outside it:
 
 ```
 P  PIN index   NV counter at 0x01802913, its authorization value = the PIN.
@@ -322,7 +334,6 @@ A  authority   ECDSA P-256 key, made in the TPM, its wrapped copy in the CA
                the PIN, and no PCR condition.
 G  counter     NV counter at 0x01802912, incremented through P - the PIN.
                Every approval names its value: PolicyPCR ; PolicyNV(G == n).
-W  window      as every CA's (above).
 ```
 
 ```bash
@@ -372,9 +383,9 @@ calculated from their events (`--events PCR:EVENT`) - and flushes it; the
 NULL hierarchy's seed is new at the next boot anyway. Nobody can approve
 another state after: no PIN to guess, no key to steal, nothing root can
 do. What the approvals do not cover gets a temporary key until the CA is
-made again; with signed PCRs, updates need nothing. With `--window-open`
-(`ASSH_WINDOW_OPEN=yes`) it certifies in the boot that made it as well
-(see [The window](#the-window)).
+made again; with signed PCRs, updates need nothing. With `--open-events`
+(`ASSH_CA_OPEN_EVENTS`) it certifies in the boot that made it as well
+(see [The close: PCR 15](#the-close-pcr-15)).
 
 ### PCRs a build signs
 
@@ -407,20 +418,20 @@ a temporary key until the authority approves the new state. The CA and
 the clients' trust in it stay as they are.
 
 1. **Boot the new state.** `agent` and `serve` record the values of every
-   PCR a slot reads before they close the window, also when the CA does
+   PCR a slot reads before they close the CA, also when the CA does
    not sign (`--state`; `/run/assh/agent.pcrs.json`,
    `/run/assh/serve.pcrs.json`). The file holds the boot's first start: a
-   restart keeps it (it would find the window closed).
+   restart keeps it (it would find the CA closed).
 2. **The authority approves that file** for the slots that should hold it
    (`ca approve --values FILE --slot N`).
-3. **Reboot.** The window was closed at this boot; the approval takes
+3. **Reboot.** The CA was closed at this boot; the approval takes
    effect at the next.
 
 The values may come from elsewhere: a program that knows the next boot's
 PCRs - tpm2-kira replays the firmware's event log and predicts PCR 11 -
 approves them with the library (`CA.Approve`, `CA.AddApproval`) before the
 reboot. `ca approve --events PCR:EVENT` calculates a PCR from zero with
-the events given (a move ahead: PCR 15 as another combination's boot
+the events given (a move ahead: a PCR as another combination's boot
 leaves it). Approve only a state you trust: in it, the CA signs.
 
 ### The slots follow assh.conf
@@ -430,8 +441,8 @@ takes the file's slots as they are - `agent` and `serve` at their next
 start, nothing to run. A slot added signs nothing until approved; one
 taken away, or whose PCRs changed, loses its approvals. The CA file keeps
 what it has until a command saves the CA (`ca approve`), so an edit undone
-brings the approvals back. The window index, the key type, the bank and
-the ref are the CA's for good: a file that differs in them is not applied (the
+brings the approvals back. The key type, the bank, the ref and the open
+value of PCR 15 are the CA's for good: a file that differs in them is not applied (the
 CA's own slots, and a warning).
 
 ### When the TPM is cleared, the CA is lost
@@ -439,7 +450,7 @@ CA's own slots, and a warning).
 TPM2_Clear (`tpm2_clear`, "Clear TPM" in the firmware's setup, a firmware
 update that resets a firmware TPM) gives the owner hierarchy a new storage
 seed, and another TPM (a new mainboard) has one of its own. The wrapped
-copies of the CA and of A then load nowhere, and P, G and W are gone
+copies of the CA and of A then load nowhere, and P and G are gone
 with the clear. Nothing brings the CA back, by design: a CA that could be
 restored would be a secret kept outside the TPM.
 
@@ -449,8 +460,8 @@ lets you log in - after checking its fingerprint - to do it.
 
 ### Removing a CA
 
-`ca remove --ca FILE` removes the CA file, its window index and, for the
-authority in the TPM, its PIN index and counter. An index goes only where
+`ca remove --ca FILE` removes the CA file and, for the authority in the
+TPM, its PIN index and counter. An index goes only where
 the TPM holds one defined exactly as aSSH defines it at that handle -
 attributes, size, policy; the counter's policy names the PIN index the TPM
 holds and its value, read there. What the file says is no proof: a file
@@ -513,7 +524,7 @@ images and Secure Boot variables, not from them.
 ## Serving
 
 At its start a server has the TPM make a new host key and the CA certify
-it (`hostkey.Issue`), then closes the window. The host key's authorization
+it (`hostkey.Issue`), then closes the CA (PCR 15). The host key's authorization
 value is in that process's memory alone (the process is not dumpable); the
 key signs every key exchange of this boot, whatever the PCRs hold later.
 
@@ -533,7 +544,7 @@ Include /run/assh/sshd.conf
 `systemd/assh-agent.service` starts it early (`Before=sysinit.target
 sshd.service ssh.service`, `Type=notify`), ahead of anything else that
 could ask the CA, and never restarts it: a restart within a boot would
-find the window closed. sshd can be restarted. It writes into its
+find the CA closed. sshd can be restarted. It writes into its
 directory (`--dir`, `ASSH_AGENT_DIR`, `/run/assh`):
 
 | File | What it is |
@@ -634,9 +645,9 @@ ASSH_PRINCIPALS=host.example,192.0.2.10
 | `ASSH_CA_SLOT_<N>` | `ca create --pcrs` (slot 0) | slot 0 `0,7` |
 | `ASSH_CA_REF` | `ca create --ref` | `assh` |
 | `ASSH_AUTHORITY`, `ASSH_AUTHORITY_TPM`, `ASSH_AUTHORITY_ONCE` | `ca create --authority`, `--authority-tpm`, `--authority-once` (`yes`/`no`) | - |
-| `ASSH_WINDOW_OPEN` | `ca create --window-open` (`yes`/`no`; with `--authority-once` alone): the window of the creating boot left open | `no` |
+| `ASSH_CA_OPEN_EVENTS` | `ca create --open-events` (comma-separated; with `--authority-once` alone): the CA open at what these events make PCR 15 from zero, left open in the creating boot | none: open at zero, closed at the creation |
 | `ASSH_CA_SLOT_<N>_SIGNED`, `ASSH_PCR_KEY`, `ASSH_PCR_SIGNATURE` | PCRs of slot N a key signs, `ca create --pcr-key` (PEM), its signatures (systemd's JSON) | - |
-| `ASSH_WINDOW_HANDLE`, `ASSH_PIN_HANDLE`, `ASSH_COUNTER_HANDLE` | `--window-handle`, `--pin-handle`, `--counter-handle` | `0x01802915`, `0x01802913`, `0x01802912` |
+| `ASSH_PIN_HANDLE`, `ASSH_COUNTER_HANDLE` | `--pin-handle`, `--counter-handle` | `0x01802913`, `0x01802912` |
 | `ASSH_HOSTKEY_TYPE`, `ASSH_PRINCIPALS`, `ASSH_KEY_ID` | `--key-type` (as `ASSH_CA_TYPE`, a list too), `--principals`, `--key-id` | `p256`, `*`, `assh` |
 | `ASSH_STATE` | `--state` | the command's own |
 | `ASSH_LISTEN`, `ASSH_AUTHORIZED_KEYS`, `ASSH_USER`, `ASSH_SOCKET` | `serve --listen`, `--authorized-keys`, `--user`, `--socket` | `:22` |
@@ -657,18 +668,18 @@ server's settings in one.
 
 | Command | What it does |
 |---|---|
-| `ca create` | makes the CA in the TPM with its slots, its window index (closed in this boot; `--window-open` with `--authority-once`), and its authority: `--authority PUB`, `--authority-tpm` (asks for the new PIN), `--authority-once`; prints the known_hosts line |
-| `ca show` | the CA, its slots and approvals, the known_hosts line; with the TPM: the counter's generation, whether the window is open and the CA signs now, the dictionary attack state |
+| `ca create` | makes the CA in the TPM with its slots, its open value of PCR 15 (PCR 15 extended in this boot; `--open-events` with `--authority-once`), and its authority: `--authority PUB`, `--authority-tpm` (asks for the new PIN), `--authority-once`; prints the known_hosts line |
+| `ca show` | the CA, its slots and approvals, the known_hosts line; with the TPM: the counter's generation, whether the CA is open (PCR 15) and signs now, the dictionary attack state |
 | `ca approve` | approves a state for slots (`--slot N[,N...]`, default every slot): the TPM's now, `--values FILE`, `--events PCR:EVENT`; with the PIN (`--next-generation`, `--redefine-counter`), or a key elsewhere (`--authority-key`, `--digest`, `--signature`); shows the statement and asks (`--yes`) |
 | `ca sign` | where the key is: signs what a statement says (`--authority-key`, `--statement`, `--signature`) |
 | `ca pin` | changes the PIN (`--pin-fd`, `--new-pin-fd`) |
-| `ca remove` | the CA and its window index, PIN index and counter; `--force` for leftovers at aSSH's handles |
+| `ca remove` | the CA and its PIN index and counter; `--force` for leftovers at aSSH's handles |
 | `tpm da` | the TPM's dictionary attack parameters, `--reset`, the lockout authorization (`--new-lockout-auth`, `--ask-lockout-auth`, `--lockout-auth-fd`) |
 | `tpm sha1` | the active banks; `--allow`, `--forbid` |
 | `efivar get NAME`, `set NAME VALUE` / `set --file FILE NAME`, `rm NAME` | an EFI variable, aSSH's (`NAME`) or another vendor's (`NAME-GUID`), the way `persist` does it |
 | `serve` | an SSH server of its own (above) |
 | `agent` | an ssh-agent for sshd (above) |
-| `close` | closes the window, nothing else: the unit's `ExecStopPost=` |
+| `close` | extends PCR 15 (`assh-close`), nothing else: every CA closed until the next boot; the unit's `ExecStopPost=` |
 
 `ASSH_EFIVARS` in the environment points every command at another
 directory than efivarfs (tests).
@@ -687,7 +698,7 @@ hk, err := hostkey.Issue(tpm, ca, hostkey.IssueOptions{
 if hk.Temporary != nil {                    // no slot certified
 	log.Printf("temporary host key %s: %v", hk.Fingerprint(), hk.Temporary)
 }
-ca.Close(tpm)                               // the window: no certificate after this, until the next boot
+hostkey.Close(tpm)                          // PCR 15: no certificate after this, until the next boot
 
 ln, _ := net.Listen("tcp", ":2222")
 srv, err := server.Start(server.Options{
@@ -706,8 +717,8 @@ the build's key:
 ```go
 signed, _ := hostkey.NewSigned([]int{11}, buildKey)
 ca, _ := hostkey.CreateCA(tpm, authorityPub, hostkey.CAOptions{Type: hostkey.P256, Bank: hostkey.SHA256,
-	Slots: []hostkey.SlotSpec{{Number: 0, PCRs: []int{0, 7, 11, 15}, Signed: signed}, {Number: 1, PCRs: []int{7, 15}}},
-	PolicyRef: []byte("myapp")})                // its window closed: it signs from the next boot on
+	Slots: []hostkey.SlotSpec{{Number: 0, PCRs: []int{0, 7, 11}, Signed: signed}, {Number: 1, PCRs: []int{7}}},
+	PolicyRef: []byte("myapp")})                // PCR 15 extended: it signs from the next boot on
 d, _ := ca.ApprovalDigest(0, values)        // sign d elsewhere, then:
 ca.AddApproval(0, values, sig)              // or ca.Approve(signer, 0, values) with the key at hand
 ca.Save("efi:AsshCA")
@@ -783,8 +794,9 @@ one.
 What it protects against, with any authority: a copy of the disk or the
 boot image (no key in it), another machine (the CA loads in this TPM
 alone), another PCR state (the CA does not sign), a process after the
-window closed - or in the boot that created the CA, or after the agent
-failed - (no certificate: the TPM enforces the window, not an approval), a
+close - or in the boot that created the CA, or after the agent failed -
+(no certificate: the TPM enforces PCR 15 in the CA's own policy, not an
+approval), a
 CA file or assh.conf edited by root (the TPM checks the CA; the owner reads
 what is approved; `ca remove` removes nothing that is not aSSH's), a
 compromise of the SSH code (no key in that process; no namespace it could
@@ -809,7 +821,7 @@ authorization empty, as on most machines:
 | undefining G and defining it again alike | until it is incremented its Name differs and the CA signs nothing; it cannot be incremented without the PIN; the owner's next `--next-generation` lands above every old value |
 | replacing G with another index | the CA signs nothing; `ca approve --redefine-counter`, with the PIN, puts G back |
 | copying the CA file to another TPM | neither the CA nor A loads there |
-| undefining W and defining it again alike, to reopen the window | its first value lands above v: the CA signs nothing |
+| setting PCR 15 back after the close | no command does but a reset of the TPM: a reboot, which runs the boot's code before anything of root's |
 
 Not protected against:
 

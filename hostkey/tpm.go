@@ -14,8 +14,6 @@ import (
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 	"golang.org/x/crypto/ssh"
-
-	"github.com/tpm2-trust/assh/persist"
 )
 
 // primaryTemplate is the storage key the keys here are children of: the
@@ -158,14 +156,15 @@ type CAOptions struct {
 	PCRs []int
 	// Slots are every slot of the CA, with their signed PCRs.
 	Slots []SlotSpec
-	// WindowHandle is W's NV handle (window.go); 0: DefaultWindowHandle.
-	WindowHandle tpm2.TPMHandle
-	// WindowOpen leaves the window of the boot that makes the CA open, so
-	// that it signs in it until Close. CreateOnceCA alone takes it, for a
-	// creation where nothing untrusted runs before the window is closed (an
-	// initrd): its approvals exist from the start. CreateCA and CreatePINCA
-	// refuse it.
-	WindowOpen bool
+	// OpenEvents make the CA open while PCR 15 holds what these events,
+	// measured from zero, make it (EventChain) - what an initrd measures
+	// there before the agent (safearch's combination) - and leave it open
+	// in the boot that makes it, so that it signs in it until Close.
+	// CreateOnceCA alone takes them, for a creation where nothing untrusted
+	// runs before the close (an initrd): its approvals exist from the start.
+	// CreateCA and CreatePINCA refuse them. Without them the CA is open at
+	// zero, PCR 15 as a boot starts it, and closed at its creation.
+	OpenEvents []string
 	// PolicyRef ties the authority's signatures to this CA's use ("assh
 	// boot", say): an approval made for a CA with another reference does
 	// not let this one sign. At most 32 bytes.
@@ -198,7 +197,12 @@ func newCA(t transport.TPM, o CAOptions) (*CA, error) {
 	if len(o.PolicyRef) > 32 {
 		return nil, errors.New("a policy reference of more than 32 bytes")
 	}
-	ca := &CA{Version: fileVersion, Type: o.Type, Bank: o.Bank, PolicyRef: append([]byte(nil), o.PolicyRef...)}
+	ca := &CA{Version: fileVersion, Type: o.Type, Bank: o.Bank, PolicyRef: append([]byte(nil), o.PolicyRef...), OpenValue: make([]byte, o.Bank.size())}
+	if len(o.OpenEvents) > 0 {
+		if ca.OpenValue, err = EventChain(o.Bank, o.OpenEvents); err != nil {
+			return nil, err
+		}
+	}
 	slots := o.Slots
 	if slots == nil {
 		slots = []SlotSpec{{Number: 0, PCRs: o.PCRs}}
@@ -244,15 +248,15 @@ func (f *CA) makeKey(t transport.TPM, p *primary) error {
 // has no approval yet: Approve adds them. Its approvals are never revoked;
 // CreatePINCA makes a CA whose are.
 func CreateCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, error) {
-	if o.WindowOpen {
-		return nil, errOpenWindow
+	if len(o.OpenEvents) > 0 {
+		return nil, errOpenEvents
 	}
 	return createCA(t, authority, o)
 }
 
-// errOpenWindow refuses an open window for a CA whose approvals come later,
+// errOpenEvents refuses a CA left open for a CA whose approvals come later,
 // in a running system: it would sign for whoever runs first.
-var errOpenWindow = errors.New("a window left open is for a CA whose authority is made once (--authority-once)")
+var errOpenEvents = errors.New("a CA open at events of PCR 15, left open in the boot of its creation, is for a CA whose authority is made once (--authority-once)")
 
 func createCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, error) {
 	ca, err := newCA(t, o)
@@ -278,28 +282,23 @@ func createCA(t transport.TPM, authority crypto.PublicKey, o CAOptions) (*CA, er
 		return nil, err
 	}
 	defer flush(t, p.handle)
-	if ca.Window, err = defineWindow(t, windowHandle(o.WindowHandle), o.WindowOpen); err != nil {
+	if err := ca.makeKey(t, p); err != nil {
 		return nil, err
 	}
-	if err := ca.makeKey(t, p); err != nil {
-		ca.removeWindow(t)
+	if err := ca.closeAtCreation(t, o); err != nil {
 		return nil, err
 	}
 	return ca, nil
 }
 
-func windowHandle(h tpm2.TPMHandle) tpm2.TPMHandle {
-	if h == 0 {
-		return DefaultWindowHandle
+// closeAtCreation closes a CA open at zero in the boot that makes it: it
+// signs from the next boot on, not in one where PCR 15 may have been zero
+// to every process all along (a system that measures nothing into it).
+func (f *CA) closeAtCreation(t transport.TPM, o CAOptions) error {
+	if len(o.OpenEvents) > 0 {
+		return nil
 	}
-	return h
-}
-
-// removeWindow takes W away again, when the CA could not be made.
-func (f *CA) removeWindow(t transport.TPM) {
-	if w, err := f.window(); err == nil {
-		persist.RemoveNV(t, w.NVIndex, persist.Defined(w))
-	}
+	return Close(t)
 }
 
 // ReadPCRs reads the PCRs any slot reads as the TPM holds them now.
@@ -440,7 +439,7 @@ func (s *caSigner) Public() crypto.PublicKey { return s.pub }
 func (s *caSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
 	f, t := s.ca, s.t
 	key, session, done, err := s.open()
-	if errors.Is(err, ErrWindowClosed) {
+	if errors.Is(err, ErrClosed) {
 		return nil, err
 	}
 	var out []byte
@@ -518,7 +517,7 @@ func (s *caSigner) open() (key *tpm2.LoadResponse, session tpm2.Session, done fu
 	}
 	key, err = loadKey(t, p, f.Public, f.Private)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("the CA does not load in this TPM: %w", err)
+		return nil, nil, nil, fmt.Errorf("the CA does not load: it is not in this TPM (another TPM, or a cleared one): %w", err)
 	}
 	kh := key.ObjectHandle
 	cleanup = append(cleanup, func() { flush(t, kh) })
@@ -572,24 +571,19 @@ func (s *caSigner) open() (key *tpm2.LoadResponse, session tpm2.Session, done fu
 		}).Execute(t); err != nil {
 			return err
 		}
-		// The CA's own part: it signs, and only while W is not read-locked.
+		// The CA's own part: it signs, and only while PCR 15 holds the
+		// open value. The TPM compares at once: a moved PCR 15 is
+		// TPM_RC_VALUE here.
 		if _, err := (tpm2.PolicyCommandCode{PolicySession: h, Code: tpm2.TPMCCSign}).Execute(t); err != nil {
 			return err
 		}
-		w, err := f.window()
-		if err != nil {
-			return err
-		}
-		wName := nvName(w)
-		_, err = tpm2.PolicyNV{
-			AuthHandle:    tpm2.AuthHandle{Handle: w.NVIndex, Name: wName, Auth: tpm2.PasswordAuth(nil)},
-			NVIndex:       tpm2.NamedHandle{Handle: w.NVIndex, Name: wName},
+		_, err := tpm2.PolicyPCR{
 			PolicySession: h,
-			OperandB:      tpm2.TPM2BOperand{Buffer: binary.BigEndian.AppendUint64(nil, f.Window.Value)},
-			Operation:     tpm2.TPMEOEq,
+			PcrDigest:     tpm2.TPM2BDigest{Buffer: openDigest(f.OpenValue)},
+			Pcrs:          selection(f.Bank, []int{ClosePCR}),
 		}.Execute(t)
-		if errors.Is(err, tpm2.TPMRCNVLocked) {
-			return ErrWindowClosed
+		if errors.Is(err, tpm2.TPMRCValue) {
+			return ErrClosed
 		}
 		return err
 	}()
@@ -790,10 +784,10 @@ func keyID(id string, s *Slot) string {
 // certify has the CA certify the key through the first slot approved for
 // now, or says why it does not.
 func (h *HostKey) certify(t transport.TPM, ca *CA, now map[int][]byte, o IssueOptions) error {
-	if open, err := ca.WindowOpen(t); err != nil {
+	if open, err := ca.IsOpen(t); err != nil {
 		return err
 	} else if !open {
-		return ErrWindowClosed
+		return ErrClosed
 	}
 	gen, err := ca.tpmGeneration(t)
 	if err != nil {
@@ -853,9 +847,7 @@ func (f *CA) Describe() string {
 		}
 		fmt.Fprintf(&b, "slot %d: signs while %s (%s) hold an approved state; %d approved\n", s.Number, PCRList(s.PCRs), f.Bank, n)
 	}
-	if w, err := f.window(); err == nil {
-		fmt.Fprintf(&b, "window: NV index 0x%08X; closed (read-locked) after the host key is certified, until the next boot\n", uint32(w.NVIndex))
-	}
+	fmt.Fprintf(&b, "open while PCR %d (%s) holds %x; closed (PCR %d extended) after the host key is certified, until the next boot\n", ClosePCR, f.Bank, f.OpenValue, ClosePCR)
 	if f.AuthorityTPM != nil {
 		pPub, _, _ := f.pinIndex()
 		gPub, _ := f.counter()

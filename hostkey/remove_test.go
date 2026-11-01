@@ -21,9 +21,9 @@ func TestRemoveCA(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.WriteFile(path+".pub", []byte("x"), 0o644)
-	all := []tpm2.TPMHandle{DefaultPINHandle, DefaultCounterHandle, DefaultWindowHandle}
+	all := []tpm2.TPMHandle{DefaultPINHandle, DefaultCounterHandle}
 	removed, err := RemoveCA(tpm, path, Handles{})
-	if err != nil || len(removed) != 5 {
+	if err != nil || len(removed) != 4 {
 		t.Fatalf("removed %v: %v", removed, err)
 	}
 	for _, p := range []string{path, path + ".pub"} {
@@ -46,13 +46,13 @@ func TestRemoveCA(t *testing.T) {
 	if _, err = CreatePINCA(tpm, PINCAOptions{CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 15}}, PIN: pinOf(testPIN)}); err != nil {
 		t.Fatal(err)
 	}
-	if removed, err := RemoveCA(tpm, path, Handles{}); err != nil || len(removed) != 3 {
+	if removed, err := RemoveCA(tpm, path, Handles{}); err != nil || len(removed) != 2 {
 		t.Fatalf("by definition: %v %v", removed, err)
 	}
 }
 
 // What a CA file names is no proof: a file edited to name another owner
-// index as its PIN index, counter or window leaves that index; and without
+// index as its PIN index or counter leaves that index; and without
 // a file, an index of the counter's generic attributes stays.
 func TestRemoveCAForeign(t *testing.T) {
 	_, tpm, ca := pinCA(t)

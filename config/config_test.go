@@ -16,7 +16,6 @@ func TestParse(t *testing.T) {
 ASSH_CA=efi:AsshCA
 ASSH_CA_SLOT_0=0,2,7,15
 ASSH_CA_SLOT_1="7,15"
-ASSH_WINDOW_HANDLE=0x01802920
 ASSH_CA_REF='my ref'
 ASSH_CA_BANK=auto
 ASSH_LISTEN=:2222
@@ -25,7 +24,7 @@ ASSH_PRINCIPALS=host.example, 192.0.2.1
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.CA != "efi:AsshCA" || c.WindowHdl != 0x01802920 || c.PolicyRef != "my ref" || c.Listen != ":2222" || c.TPM != "/dev/tpmrm0" || c.KeyID != "assh" || c.Bank != hostkey.Auto {
+	if c.CA != "efi:AsshCA" || c.PolicyRef != "my ref" || c.Listen != ":2222" || c.TPM != "/dev/tpmrm0" || c.KeyID != "assh" || c.Bank != hostkey.Auto {
 		t.Fatalf("%+v", c)
 	}
 	if !slices.Equal(c.Slots[0], []int{0, 2, 7, 15}) || !slices.Equal(c.Slots[1], []int{7, 15}) || !slices.Equal(c.SlotNumbers(), []int{0, 1}) {
@@ -48,8 +47,10 @@ func TestParseRefuses(t *testing.T) {
 		"ASSH_CA_WINDOW=15",
 		"ASSH_CLOSE_PCR=15",
 		"ASSH_WINDOW_OPEN=yes",
-		"ASSH_WINDOW_OPEN=yes\nASSH_AUTHORITY_TPM=yes",
-		"ASSH_WINDOW_HANDLE=window",
+		"ASSH_WINDOW_HANDLE=0x01802915",
+		"ASSH_CA_OPEN_EVENTS=combination:a",
+		"ASSH_CA_OPEN_EVENTS=combination:a\nASSH_AUTHORITY_TPM=yes",
+		"ASSH_CA_OPEN_EVENTS=\nASSH_AUTHORITY_ONCE=yes",
 		"ASSH_CA=a\nASSH_CA=b",
 		"ASSH_AUTHORITY=a.pem\nASSH_AUTHORITY_TPM=yes",
 		"ASSH_CA_REF=" + strings.Repeat("x", 33),
@@ -71,13 +72,13 @@ func TestWrite(t *testing.T) {
 	c := Default()
 	c.CA = "efi:AsshCA"
 	c.Slots = map[int][]int{0: {0, 2, 7, 15}, 1: {7, 15}}
-	c.WindowHdl = 0x01802920
+	c.OpenEvents, c.AuthOnce = []string{"combination:a", "sealed"}, true
 	c.KeyID = "my host"
 	if err := Write(path, c, "assh's settings"); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(path)
-	want := "# assh's settings\n\nASSH_CA=efi:AsshCA\nASSH_CA_SLOT_0=0,2,7,15\nASSH_CA_SLOT_1=7,15\nASSH_WINDOW_HANDLE=0x01802920\nASSH_KEY_ID=\"my host\"\n"
+	want := "# assh's settings\n\nASSH_CA=efi:AsshCA\nASSH_CA_SLOT_0=0,2,7,15\nASSH_CA_SLOT_1=7,15\nASSH_AUTHORITY_ONCE=yes\nASSH_CA_OPEN_EVENTS=combination:a,sealed\nASSH_KEY_ID=\"my host\"\n"
 	if string(data) != want {
 		t.Fatalf("got\n%s\nwant\n%s", data, want)
 	}
@@ -92,7 +93,7 @@ func TestWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, _ = os.ReadFile(path)
-	want = "# assh's settings\n\nASSH_CA=efi:AsshCA\nASSH_CA_SLOT_0=0,7,15\nASSH_WINDOW_HANDLE=0x01802920\nASSH_KEY_ID=\"my host\"\n# mine\nASSH_LISTEN=:2222\n"
+	want = "# assh's settings\n\nASSH_CA=efi:AsshCA\nASSH_CA_SLOT_0=0,7,15\nASSH_AUTHORITY_ONCE=yes\nASSH_CA_OPEN_EVENTS=combination:a,sealed\nASSH_KEY_ID=\"my host\"\n# mine\nASSH_LISTEN=:2222\n"
 	if string(data) != want {
 		t.Fatalf("got\n%s\nwant\n%s", data, want)
 	}
@@ -144,7 +145,6 @@ func TestMatch(t *testing.T) {
 		t.Fatalf("two slots on the same PCRs: %v, the CA %v", err, ca.Slots)
 	}
 	for _, f := range []func(*Config){
-		func(c *Config) { c.WindowHdl = 0x01802920; c.Set = map[string]bool{"ASSH_WINDOW_HANDLE": true} },
 		func(c *Config) { c.CAType = hostkey.RSA2048 },
 		func(c *Config) { c.Bank = hostkey.SHA1 },
 		func(c *Config) { c.PolicyRef = "other" },

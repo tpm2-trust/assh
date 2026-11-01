@@ -16,8 +16,8 @@ import (
 // seed is new at the next boot. Nothing can approve another state later: not
 // root, not anyone who knows something, since there is nothing to know. A
 // slot with signed PCRs still follows what their key signs (an update).
-// With o.WindowOpen the CA signs in this boot too, until its window is
-// closed.
+// With o.OpenEvents the CA signs in this boot too, once PCR 15 holds what
+// they make it, until it is closed.
 func CreateOnceCA(t transport.TPM, o CAOptions, values map[int][]byte) (*CA, error) {
 	// The authority: made, its public part kept, nothing left loaded while
 	// the CA is made (a TPM holds few objects at once).
@@ -51,12 +51,6 @@ func CreateOnceCA(t transport.TPM, o CAOptions, values map[int][]byte) (*CA, err
 	if err != nil {
 		return nil, err
 	}
-	ok := false
-	defer func() {
-		if !ok {
-			ca.removeWindow(t)
-		}
-	}()
 	// The approvals, by the authority loaded once more (the NULL hierarchy's
 	// seed is the same until the boot ends), then flushed for good.
 	p, err = createPrimary(t, tpm2.TPMRHNull)
@@ -82,6 +76,5 @@ func CreateOnceCA(t transport.TPM, o CAOptions, values map[int][]byte) (*CA, err
 			return nil, err
 		}
 	}
-	ok = true
 	return ca, nil
 }

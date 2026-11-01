@@ -12,7 +12,7 @@ own, and `ca show` / `CA.KnownHosts` print a `known_hosts` line for it; an admin
 who enrols a client from that line trusts root's key.
 
 - `ParseCA` requires `Public` to equal the CA's template - type, attributes, the policy
-  `caPolicyFor(A's Name, ref, W's Name, v)` from P1-5 - except `Unique`, as
+  `caPolicyFor(A's Name, ref, bank, open value)` - except `Unique`, as
   `checkTPMAuthority` already does for A.
 - `ca show` with a TPM at hand also `Load`s `Public`/`Private`: a fixedTPM key that loads
   was made in this TPM. Without a TPM it says the line is unverified.

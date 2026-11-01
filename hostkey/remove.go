@@ -13,7 +13,7 @@ import (
 )
 
 // Handles are the NV handles of a CA's indices; 0 is the default handle.
-type Handles struct{ PIN, Counter, Window tpm2.TPMHandle }
+type Handles struct{ PIN, Counter tpm2.TPMHandle }
 
 // Defaults is h with the default handle wherever it has 0.
 func (h Handles) Defaults() Handles {
@@ -23,7 +23,6 @@ func (h Handles) Defaults() Handles {
 	if h.Counter == 0 {
 		h.Counter = DefaultCounterHandle
 	}
-	h.Window = windowHandle(h.Window)
 	return h
 }
 
@@ -31,8 +30,8 @@ func (h Handles) Defaults() Handles {
 // not defined as aSSH defines it, or what it depends on is gone.
 var ErrLeft = errors.New("left in the TPM")
 
-// RemoveCA removes the CA at path and what it holds in the TPM: its window
-// index, and with an authority in the TPM its PIN index and counter. An
+// RemoveCA removes the CA at path and what it holds in the TPM: with an
+// authority in the TPM its PIN index and counter. An
 // index goes only where the TPM holds one defined exactly as aSSH defines
 // it at that handle - attributes, size, policy (persist.Defined); the
 // counter's policy names the PIN index the TPM holds and its value, read
@@ -45,7 +44,7 @@ func RemoveCA(t transport.TPM, path string, h Handles) ([]string, error) {
 	ca, err := LoadCA(path)
 	switch {
 	case err == nil:
-		h = Handles{Window: ca.WindowHandle()}
+		h = Handles{}
 		if ca.AuthorityTPM != nil {
 			if p, _, err := ca.pinIndex(); err == nil {
 				h.PIN = p.NVIndex
@@ -77,8 +76,7 @@ func RemoveCA(t transport.TPM, path string, h Handles) ([]string, error) {
 
 // removeIndices removes those of h's indices that are aSSH's: the PIN
 // index P (its template is constant), the counter G (its policy names P
-// and P's value, read from the P the TPM holds), the window index W. A
-// handle of 0 is skipped.
+// and P's value, read from the P the TPM holds). A handle of 0 is skipped.
 func removeIndices(t transport.TPM, h Handles) (removed, left []string) {
 	take := func(handle tpm2.TPMHandle, what string, want *tpm2.TPMSNVPublic) {
 		if handle == 0 {
@@ -116,8 +114,6 @@ func removeIndices(t transport.TPM, h Handles) (removed, left []string) {
 		p := pinIndexPublic(h.PIN)
 		take(h.PIN, "PIN index", &p)
 	}
-	w := windowPublic(h.Window)
-	take(h.Window, "window index", &w)
 	return removed, left
 }
 

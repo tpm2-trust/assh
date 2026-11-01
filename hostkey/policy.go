@@ -20,7 +20,8 @@ import (
 // The policies, computed here as the TPM computes them in a SHA-256
 // session:
 //
-//	CA key:   PolicyAuthorize(authority, policyRef)
+//	CA key:   PolicyAuthorize(authority, policyRef) ; PolicyCommandCode(Sign)
+//	          ; PolicyPCR(15 == the open value)    (close.go)
 //	approved: PolicyPCR(a slot's PCRs, H(values in index order))
 //	          ; PolicyNV(counter == generation)    with a counter
 //
@@ -28,8 +29,9 @@ import (
 // the CA signs (caSigner.Sign), the TPM checks that signature
 // (VerifySignature, a ticket), a session runs PolicyPCR and PolicyNV over
 // the TPM's state as it is, and PolicyAuthorize with the ticket turns the
-// approved digest into the CA's policy. No PCR value is in the CA's policy:
-// a new state needs a new approval, never a new CA.
+// approved digest into the CA's policy. No PCR value but PCR 15's open
+// value is in the CA's policy: a new state needs a new approval, never a
+// new CA.
 
 // authorityTemplate is an authority's public key elsewhere as the TPM loads
 // it to check a signature. Its Name - a hash of exactly this - is part of the
@@ -162,13 +164,13 @@ func objectName(pub tpm2.TPMTPublic) (tpm2.TPM2BName, error) {
 }
 
 // caPolicyFor is the CA key's policy: whatever the authority of this Name
-// approves, then Sign alone, while the window index w holds v - not
-// read-locked.
-func caPolicyFor(authority tpm2.TPM2BName, policyRef []byte, w tpm2.TPMSNVPublic, v uint64) []byte {
+// approves, then Sign alone, while PCR 15 of bank holds open - not
+// extended since.
+func caPolicyFor(authority tpm2.TPM2BName, policyRef []byte, bank Bank, open []byte) []byte {
 	return policyDigest(append([]func(*tpm2.PolicyCalculator) error{tpm2.PolicyAuthorize{
 		PolicyRef: tpm2.TPM2BDigest{Buffer: policyRef},
 		KeySign:   authority,
-	}.Update}, windowGate(w, v)...)...)
+	}.Update}, closeGate(bank, open)...)...)
 }
 
 // caPolicy is this CA's policy, as its key must carry it.
@@ -177,11 +179,10 @@ func (f *CA) caPolicy() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	w, err := f.window()
-	if err != nil {
+	if err := f.checkOpenValue(); err != nil {
 		return nil, err
 	}
-	return caPolicyFor(name, f.PolicyRef, w, f.Window.Value), nil
+	return caPolicyFor(name, f.PolicyRef, f.Bank, f.OpenValue), nil
 }
 
 // selection is pcrs of bank as the TPM takes them.

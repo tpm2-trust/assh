@@ -30,11 +30,11 @@ func authorityFiles(t *testing.T, dir string) (key, pub string) {
 	return key, pub
 }
 
-// The window closes however the agent ends: a host key type it does not
-// know, a CA file it cannot read - and 'assh close', which the unit runs
-// after the agent, closes it on its own, with no CA there or an assh.conf
-// that does not parse.
-func TestWindowClosedOnError(t *testing.T) {
+// The CA closes however the agent ends: a host key type it does not know,
+// a CA file it cannot read - and 'assh close', which the unit runs after
+// the agent, closes it on its own, with no CA there or an assh.conf that
+// does not parse. A close that cannot extend PCR 15 is a failure.
+func TestClosedOnError(t *testing.T) {
 	sw := swtpmtest.Start(t)
 	dir := t.TempDir()
 	key, pub := authorityFiles(t, dir)
@@ -47,43 +47,56 @@ func TestWindowClosedOnError(t *testing.T) {
 	open := func() bool {
 		t.Helper()
 		out := run(t, "ca", "show", "--config", conf)
-		return strings.Contains(out, "the window is open: the CA signs")
+		return strings.Contains(out, "the CA is open: it signs")
+	}
+	if open() {
+		t.Fatal("the CA is open in the boot of its creation")
 	}
 
 	sw.Reboot(t)
 	if !open() {
-		t.Fatal("the window is not open in the boot after the creation")
+		t.Fatal("the CA is not open in the boot after the creation")
 	}
-	if out, err := assh("agent", "--config", conf, "--key-type", "nonsense").CombinedOutput(); err == nil || !strings.Contains(string(out), "the window is closed") {
+	if out, err := assh("agent", "--config", conf, "--key-type", "nonsense").CombinedOutput(); err == nil || !strings.Contains(string(out), "PCR 15 extended") {
 		t.Fatalf("an agent that fails: %v\n%s", err, out)
 	}
 	if open() {
-		t.Fatal("an agent that failed left the window open")
+		t.Fatal("an agent that failed left the CA open")
 	}
 
 	sw.Reboot(t)
 	good, _ := os.ReadFile(ca)
 	os.WriteFile(ca, []byte("{not a CA"), 0o600)
-	if out, err := assh("agent", "--config", conf).CombinedOutput(); err == nil || !strings.Contains(string(out), "the window is closed") {
+	if out, err := assh("agent", "--config", conf).CombinedOutput(); err == nil || !strings.Contains(string(out), "PCR 15 extended") {
 		t.Fatalf("an agent with an unreadable CA file: %v\n%s", err, out)
 	}
 	os.WriteFile(ca, good, 0o600)
 	if open() {
-		t.Fatal("an unreadable CA file left the window open")
+		t.Fatal("an unreadable CA file left the CA open")
 	}
 
 	sw.Reboot(t)
 	os.WriteFile(filepath.Join(dir, "broken.conf"), []byte("ASSH_NOPE=1\n"), 0o644)
-	if out, err := assh("close", "--tpm", sw.Sock, "--config", filepath.Join(dir, "broken.conf")).CombinedOutput(); err == nil || !strings.Contains(string(out), "closing the default window index") {
+	if out, err := assh("close", "--tpm", sw.Sock, "--config", filepath.Join(dir, "broken.conf")).CombinedOutput(); err == nil || !strings.Contains(string(out), "closing all the same") {
 		t.Fatalf("close with an assh.conf that does not parse: %v\n%s", err, out)
 	}
 	if open() {
-		t.Fatal("close left the window open")
+		t.Fatal("close left the CA open")
 	}
 	if out := run(t, "close", "--config", conf); strings.Contains(out, "error") {
 		t.Fatalf("close twice:\n%s", out)
 	}
-	run(t, "close", "--tpm", sw.Sock, "--ca", filepath.Join(dir, "none.json"))
+
+	// No TPM behind the path: the close fails, and says so.
+	sw.Reboot(t)
+	notTPM := filepath.Join(dir, "not-a-tpm")
+	os.WriteFile(notTPM, nil, 0o600)
+	if out, err := assh("close", "--tpm", notTPM, "--config", "").CombinedOutput(); err == nil {
+		t.Fatalf("close without a TPM succeeded:\n%s", out)
+	}
+	if !open() {
+		t.Fatal("the TPM elsewhere was touched")
+	}
 }
 
 // An approval made where the key is: 'ca approve --digest' writes the

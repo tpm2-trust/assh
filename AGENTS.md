@@ -23,21 +23,23 @@ name is a change to them: build and test tpm2-kira after one.
   go-tpm: tpm2-kira compiles assh with its own go-tpm, and a replace here
   would not reach it. A go-tpm move is made in every module of the
   workspace at once (its AGENTS.md).
-- **The window is the CA's own policy, and it fails closed.** Every CA
-  has a window index W that its policy reads (`PolicyAuthorize ;
-  PolicyCommandCode(Sign) ; PolicyNV(W == v)`), read-locked to close it: no
-  approval can leave it out. A CA is created with its window closed, and
-  every way out of `agent`/`serve` - a failure at any step - closes it
-  (`assh close` after the unit, too). Never add a path that returns before
-  the close, or a CA that signs in the boot that made it - but a CA made
-  once with `--window-open`, whose approvals exist at its creation, made
-  where nothing untrusted runs before the agent (an initrd). Nothing but W
-  closes a CA: no PCR is extended at the close.
+- **The close is PCR 15 in the CA's own policy, and it fails closed.**
+  Every CA's policy reads PCR 15 after the approval (`PolicyAuthorize ;
+  PolicyCommandCode(Sign) ; PolicyPCR(15 == open value)`), so no approval
+  can leave it out; the close is `TPM2_PCR_Event(15, "assh-close")`
+  (`hostkey.Close`), which needs no CA file. A CA is created closed (PCR
+  15 extended), and every way out of `agent`/`serve` - a failure at any
+  step - closes it (`assh close` after the unit, too); a close that fails
+  is an error, never ignored. Never add a path that returns before the
+  close, or a CA that signs in the boot that made it - but a CA made once
+  with `--open-events`, whose approvals exist at its creation, made where
+  nothing untrusted runs before the agent (an initrd). No NV index holds
+  the close: nothing to define, remove or reopen.
 - **A temporary key is a host key like the others**: made in the TPM
   under the NULL hierarchy, never in software, and never certified. It is
   what a server serves when no slot certifies, and before the CA exists
   (assh.conf naming its slots: their PCRs recorded); an unreadable CA file
-  or a TPM that does not open stays an error - with the window closed.
+  or a TPM that does not open stays an error - with the CA closed.
 - **SHA-1 only where the TPM allows it.** `auto` reads SHA-1 only on a
   TPM without an active SHA-256 bank and while `hostkey.SHA1Handle` is
   there; others (safearch's initrd) read that index at its handle, so it

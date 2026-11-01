@@ -4,6 +4,34 @@ Reasoning behind aSSH's design that the code and the README no longer
 carry: why it is as it is, what was tried and measured. The README says
 what it is.
 
+## The window index W replaced by PCR 15 in the CA's policy (2026-11-01, experiment)
+
+W (an NV counter, read-locked at the close; 2026-10-29 to 2026-11-01) was
+replaced by PCR 15 in the CA's own policy (`PolicyPCR(15 == open value)`
+after PolicyAuthorize), closed by an extend. Why the PCR 15 window of
+before W was left, and what answers each reason now:
+
+- *An approval could leave PCR 15 out* (a slot read it only if its approval
+  said so). Now the CA's policy reads it, fixed at creation: no approval,
+  of any slot, signed or not, can leave it out.
+- *A PCR extended at the close broke what was bound to it afterwards* (a
+  volume enrolled with `--tpm2-pcrs=15`). Still true for a binding to PCR
+  15 as it is after the close; the close happens at fixed points of the
+  boot (before systemd measures volume keys, the machine-id and file
+  systems), so a binding made on the running system meets the same value
+  at every boot of the same setup. A binding to PCR 15 at zero after the
+  close cannot hold, as it cannot with systemd's own measurements.
+- *W closed at creation made safearch's identity certify from its second
+  boot*; `--window-open` gave the first back. Now `--open-events`: the open
+  value is what the initrd measures, and only a CA made once is left open.
+
+What W had that PCR 15 does not: it was the CA's alone, so nothing else
+could close it early; PCR 15 is systemd's too, and anything that measures
+into it before the server closes the CA (and any process with the TPM's
+device) stops the CA for the boot - a denial of service, never a way in.
+What PCR 15 has that W did not: nothing in the TPM to define, remove or
+clone, no handle to configure, and the close needs no CA file.
+
 ## EFI variables in the workspace's go-uefi-slim module (2026-10-30)
 
 `persist` wrote efivarfs itself, and did not put the immutable mark back

@@ -12,7 +12,7 @@
 // selection with approvals of its own; Issue takes the first slot, from 0
 // up, approved for the PCRs as they are. What follows the PolicyAuthorize
 // in the CA's policy is its own, beyond any approval: it signs and does
-// nothing else, and only while its window is open (window.go).
+// nothing else, and only while PCR 15 holds its open value (close.go).
 //
 // The authority is a key elsewhere (a file, a token: CreateCA), whose
 // private key never comes to the TPM, or a key made in this TPM and opened
@@ -29,11 +29,10 @@
 // When none is, the key is temporary: not certified, so a client that
 // trusts the CA asks before it takes it. The host key signs every key
 // exchange of this boot, whatever the PCRs hold later; at the next reboot
-// it is gone for good. Once the window is closed - the CA's window index
-// read-locked right after the Issue (Close), which the CA's own policy
-// reads - the CA signs nothing until the next boot, whatever an approval
-// says, so a server started later, or any other process, gets no
-// certificate.
+// it is gone for good. Once the CA is closed - PCR 15 extended right after
+// the Issue (Close), which the CA's own policy reads - the CA signs nothing
+// until the next boot, whatever an approval says, so a server started
+// later, or any other process, gets no certificate.
 //
 // Nothing here is a secret outside the TPM, and no secret ever leaves it.
 // So a cleared TPM, or another one, loses the CA: there is no backup of it,
@@ -140,7 +139,7 @@ func (b Bank) size() int {
 
 // fileVersion is the one format read; another is an error that says to
 // create the CA again.
-const fileVersion = 4
+const fileVersion = 5
 
 // MaxSlots is how many slots a CA has room for: 0 to MaxSlots-1.
 const MaxSlots = 16
@@ -156,9 +155,10 @@ type CA struct {
 	// Slots are the PCR selections approvals are made for, in the order
 	// Issue scans them: the lowest number first.
 	Slots []Slot `json:"slots"`
-	// Window is W, the NV index whose read lock closes the CA for the
-	// rest of the boot (Close); the CA's own policy reads it.
-	Window *Window `json:"window"`
+	// OpenValue is what PCR 15 of Bank holds while the CA is open; an
+	// extend (Close) closes it for the rest of the boot. The CA's own
+	// policy reads it.
+	OpenValue []byte `json:"open_value"`
 
 	Public  []byte `json:"public"`  // the CA key's TPMT_PUBLIC
 	Private []byte `json:"private"` // its TPM2B_PRIVATE buffer
@@ -255,13 +255,13 @@ func ParseCA(data []byte) (*CA, error) {
 		return nil, err
 	}
 	// The key's policy is what the file says the CA is: its authority, its
-	// ref, its window.
+	// ref, its open value of PCR 15.
 	policy, err := f.caPolicy()
 	if err != nil {
 		return nil, err
 	}
 	if pub, err := tpm2.Unmarshal[tpm2.TPMTPublic](f.Public); err != nil || !bytes.Equal(pub.AuthPolicy.Buffer, policy) {
-		return nil, errors.New("the CA's key does not carry the policy of the authority, reference and window the file names")
+		return nil, errors.New("the CA's key does not carry the policy of the authority, reference and open value of PCR 15 the file names")
 	}
 	return &f, nil
 }
@@ -510,7 +510,7 @@ func checkSelection(pcrs []int) error {
 
 // checkSlots makes sure the file's slots and approvals fit together.
 func (f *CA) checkSlots() error {
-	if _, err := f.window(); err != nil {
+	if err := f.checkOpenValue(); err != nil {
 		return err
 	}
 	if len(f.Slots) == 0 {

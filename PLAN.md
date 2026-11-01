@@ -1,3 +1,48 @@
+# PLAN: the close is PCR 15 in the CA's own policy; no window index (experiment v2, exp/close-pcr15)
+
+Status: **implemented** (2026-11-01) on the branch `exp/close-pcr15`; VM runs by the
+coordinator. One of three variants of how a CA closes; tpm2-kira's side is in its PLAN.md.
+
+## Goal
+
+The CA closes by an extend of PCR 15, and the CA's own policy - not an approval - reads it:
+
+```
+CA policy = PolicyAuthorize(authority, ref) ; PolicyCommandCode(Sign) ; PolicyPCR(15 == open value)
+close     = TPM2_PCR_Event(15, "assh-close")        (systemd-pcrextend's digest of the word)
+```
+
+W (the window index), `--window-handle`, `--window-open`, `ASSH_WINDOW_HANDLE`,
+`ASSH_WINDOW_OPEN` go. The open value is zero; a CA made once may take it from events
+(`--open-events`, `ASSH_CA_OPEN_EVENTS`: what an initrd measures into PCR 15 before the
+agent), and only that CA is left open in the boot of its creation.
+
+## Steps
+
+- [x] 1. `hostkey/close.go`: `ClosePCR`, `CloseEvent`, `Close(tpm)` (PCR_Event, every bank),
+       `CA.OpenValue` (file format 5), `CA.IsOpen`, `ErrClosed`; the gate in `caPolicyFor`
+       and in the signing session (`PolicyPCR` with the digest: TPM_RC_VALUE is `ErrClosed`).
+- [x] 2. Creation: `CreateCA`/`CreatePINCA` extend PCR 15 (closed at creation);
+       `CAOptions.OpenEvents` for `CreateOnceCA` alone; W, its definition and removal gone
+       (`Handles.Window`, `RemoveCA`, `ca remove --force`).
+- [x] 3. Command: `close` extends PCR 15 and needs no CA file or assh.conf; `agent`/`serve`
+       close on every way out; `ca create --open-events`; `ca show` reads PCR 15.
+- [x] 4. Tests: closed at creation; after `Close` no signature for a slot without PCR 15
+       nor for one approved for PCR 15 after the close (the TPM refuses, past the
+       software's check); the close event's value; SHA-1 bank; a failing close is an error
+       (no TPM, a refused extend); open events; the file's open value checked against the
+       key's policy; the command's close on every error path and without a TPM.
+- [x] 5. README, AGENTS.md, HISTORY.md, the unit's comments.
+
+## What breaks
+
+- Every CA is made again (format 5, another policy); clients need the new line.
+- `ASSH_WINDOW_HANDLE`, `ASSH_WINDOW_OPEN`, `--window-handle`, `--window-open`, `close --ca`
+  are gone. The index W at 0x01802915 stays in TPMs that had one: `ca remove --force` no
+  longer knows it (NV handle; remove it by hand: `tpm2_nvundefine 0x01802915`).
+- A slot that reads PCR 15 is approved for what PCR 15 holds at the server's start (zero);
+  `ca approve` without `--values` in the boot of the creation reads it after the close.
+
 # PLAN: EFI variables through the workspace's go-uefi-slim module
 
 Status: **done in aSSH** (2026-10-30), uncommitted. The workspace plan (`../PLAN.md`, "a UEFI
