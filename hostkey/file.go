@@ -57,6 +57,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/tpm2-trust/assh/persist"
+	"github.com/tpm2-trust/go-uefi-slim/uki"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -387,12 +388,12 @@ func (f *CA) FileGeneration() uint64 {
 // values, at the file's generation: the first slot's that has one, nil
 // when there is none. A slot with signed PCRs counts only where sigs has
 // the signature of their values.
-func (f *CA) Approved(values map[int][]byte, sigs PCRSignatures) *Approval {
+func (f *CA) Approved(values map[int][]byte, sigs uki.PCRSignatures) *Approval {
 	return f.approvedAt(values, f.FileGeneration(), sigs)
 }
 
 // approvedAt scans the slots from the lowest number up.
-func (f *CA) approvedAt(values map[int][]byte, gen uint64, sigs PCRSignatures) *Approval {
+func (f *CA) approvedAt(values map[int][]byte, gen uint64, sigs uki.PCRSignatures) *Approval {
 	for _, s := range f.Slots {
 		if !f.signedMet(&s, values, sigs) {
 			continue
