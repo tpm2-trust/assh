@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -43,11 +44,21 @@ var ErrClosed = errors.New("the CA is closed until the next boot (PCR 15 extende
 // Close extends PCR 15 with CloseEvent in every bank the TPM has: every
 // CA open at the value PCR 15 had signs nothing more until the next boot.
 // It needs no CA file: a CA that could not be read is closed all the same.
+// Where systemd keeps its measurement log, the extend gets a record in it;
+// the log's trouble is said on stderr and is never the close's.
 func Close(t transport.TPM) error {
-	if _, err := (tpm2.PCREvent{
+	log, logErr := openMeasureLog(t, ClosePCR, CloseEvent)
+	_, err := (tpm2.PCREvent{
 		PCRHandle: tpm2.AuthHandle{Handle: tpm2.TPMHandle(ClosePCR), Auth: tpm2.PasswordAuth(nil)},
 		EventData: tpm2.TPM2BEvent{Buffer: []byte(CloseEvent)},
-	}).Execute(t); err != nil {
+	}).Execute(t)
+	if logErr == nil {
+		logErr = log.done(err == nil)
+	}
+	if logErr != nil {
+		fmt.Fprintf(os.Stderr, "the measurement log has no record of the close: %v\n", logErr)
+	}
+	if err != nil {
 		return fmt.Errorf("closing the CA (extending PCR %d): %w", ClosePCR, err)
 	}
 	return nil

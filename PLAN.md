@@ -6,6 +6,13 @@ Status: **implemented** (2026-11-01) on `feat/close-pcr15`, the variant chosen o
 - [x] The close is PCR 15 in the CA's policy (below).
 - [x] `openTPM` waits for a TPM that is not there or does not answer yet: at least 3
       attempts within 5 s (`openAttempts`, `openWait`), as tpm2-kira's `tpmdev.Open`.
+- [x] E4. `hostkey.Close` appends systemd-pcrextend's record to
+      `/run/log/systemd/tpm2-measure.log` where the directory is there (format captured from
+      systemd 262 against swtpm: RS-JSON-LF, one record with every bank's digest - not one
+      line per bank; flock, sticky bit during the extend). Tests: replaying the records
+      gives the register in each bank; the record's bytes; no directory; a refused extend;
+      a symlink.
+- [ ] F1. README examples: `0,2,4,7+11` / `7+11` and the GRUB pair.
 
 ## Goal
 

@@ -6,7 +6,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -272,4 +277,153 @@ func TestOpenValueInPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = tpm2.TPMAlgSHA256
+}
+
+// The close's record in systemd's measurement log: in systemd-pcrextend's
+// format, and its digests are what the extend put into every bank.
+func TestCloseMeasureLog(t *testing.T) {
+	dir := t.TempDir()
+	measureLogDir = dir
+	t.Cleanup(func() { measureLogDir = "/run/log/systemd" })
+	sw := swtpmtest.Start(t)
+	tpm := sw.Open(t)
+	path := filepath.Join(dir, measureLogName)
+
+	for range 2 {
+		if err := Close(tpm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode()&os.ModeSticky != 0 || st.Mode().Perm() != 0o600 {
+		t.Fatalf("the log's mode after the close: %v", st.Mode())
+	}
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("%d records, want one per extend:\n%s", len(lines), data)
+	}
+	replay := map[string][]byte{}
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "\x1e{\"pcr\":15,\"digests\":[{\"hashAlg\":\"") ||
+			!regexp.MustCompile(`"content_type":"systemd","content":\{"string":"assh-close","bootId":"[0-9a-f]{32}","timestamp":[0-9]+,"eventType":"phase"\}\}$`).MatchString(line) {
+			t.Fatalf("not systemd-pcrextend's record: %q", line)
+		}
+		var r measureRecord
+		if err := json.Unmarshal([]byte(line[1:]), &r); err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range r.Digests {
+			var h crypto.Hash
+			for _, b := range measureBanks {
+				if b.name == d.HashAlg {
+					h = b.hash
+				}
+			}
+			if h == 0 {
+				t.Fatalf("bank %q", d.HashAlg)
+			}
+			digest, err := hex.DecodeString(d.Digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replay[d.HashAlg] == nil {
+				replay[d.HashAlg] = make([]byte, h.Size())
+			}
+			next := h.New()
+			next.Write(replay[d.HashAlg])
+			next.Write(digest)
+			replay[d.HashAlg] = next.Sum(nil)
+		}
+	}
+	// The log replayed is the register, bank by bank.
+	for alg, b := range measureBanks {
+		want, ok := replay[b.name]
+		if !ok {
+			continue
+		}
+		got, err := tpm2.PCRRead{PCRSelectionIn: tpm2.TPMLPCRSelection{PCRSelections: []tpm2.TPMSPCRSelection{{
+			Hash: alg, PCRSelect: tpm2.PCClientCompatible.PCRs(ClosePCR),
+		}}}}.Execute(tpm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.PCRValues.Digests[0].Buffer, want) {
+			t.Fatalf("%s: the log replays to %x, the register holds %x", b.name, want, got.PCRValues.Digests[0].Buffer)
+		}
+	}
+	if replay["sha256"] == nil {
+		t.Fatal("no sha256 digest in the record")
+	}
+}
+
+// No directory: the close happens, nothing is made. An extend that fails
+// leaves no record and no sticky bit. A log that cannot be written is not the
+// close's failure.
+func TestCloseMeasureLogAbsentOrBroken(t *testing.T) {
+	t.Cleanup(func() { measureLogDir = "/run/log/systemd" })
+	sw := swtpmtest.Start(t)
+	tpm := sw.Open(t)
+
+	dir := t.TempDir()
+	measureLogDir = filepath.Join(dir, "absent")
+	if err := Close(tpm); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(measureLogDir); !os.IsNotExist(err) {
+		t.Fatalf("the directory was made: %v", err)
+	}
+
+	measureLogDir = dir
+	if err := Close(refusing{tpm}); err == nil {
+		t.Fatal("a refused extend closed")
+	}
+	st, err := os.Stat(filepath.Join(dir, measureLogName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != 0 || st.Mode()&os.ModeSticky != 0 {
+		t.Fatalf("after a refused extend: size %d, mode %v", st.Size(), st.Mode())
+	}
+
+	// A symlink where the log should be is not followed.
+	link := t.TempDir()
+	measureLogDir = link
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(link, measureLogName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Close(tpm); err != nil {
+		t.Fatalf("the log's trouble failed the close: %v", err)
+	}
+	if st, err := os.Stat(target); err != nil || st.Size() != 0 {
+		t.Fatalf("the symlink was followed: %v %v", st, err)
+	}
+}
+
+// The bytes of systemd-pcrextend's record (systemd 262, captured against a
+// software TPM with --tpm2-device=swtpm:), field for field.
+func TestMeasureRecordKeyOrder(t *testing.T) {
+	line, err := measureRecord{
+		PCR:         15,
+		Digests:     []measureDigest{{HashAlg: "sha256", Digest: "00"}},
+		ContentType: "systemd",
+		Content:     measureContent{String: "assh-close", BootID: "ab", Timestamp: 1, EventType: "phase"},
+	}.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\x1e{\"pcr\":15,\"digests\":[{\"hashAlg\":\"sha256\",\"digest\":\"00\"}],\"content_type\":\"systemd\",\"content\":{\"string\":\"assh-close\",\"bootId\":\"ab\",\"timestamp\":1,\"eventType\":\"phase\"}}\n"
+	if string(line) != want {
+		t.Fatalf("%q", line)
+	}
 }

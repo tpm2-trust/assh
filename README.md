@@ -206,6 +206,10 @@ again - whoever resumes must close first.
   when the agent could not start, or assh.conf does not parse. `close`
   needs no CA file: it extends PCR 15, nothing else. A close that fails
   (no TPM, a refused extend) is an error, never a success.
+- Where systemd's `/run/log/systemd` is there, the close appends
+  systemd-pcrextend's own record to `tpm2-measure.log` (one JSON text sequence
+  record, every bank's digest), for whoever replays PCR 15; its trouble is said
+  on stderr, and changes nothing of the close.
 - **A CA is created closed**: `ca create` extends PCR 15, so the CA signs
   from the next boot on, never in a boot where PCR 15 has been zero to
   every process (a system that measures nothing into it). The one
