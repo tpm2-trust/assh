@@ -44,8 +44,8 @@ mkdir -p /etc/assh
 cat >/etc/assh/assh.conf <<'EOF'
 ASSH_CA=efi:AsshCA
 ASSH_AUTHORITY_TPM=yes
-ASSH_CA_SLOT_0=0,2,7,11,15
-ASSH_CA_SLOT_1=7,15
+ASSH_CA_SLOT_0=0,2,7,11
+ASSH_CA_SLOT_1=7
 EOF
 
 # 3. sshd takes its host key from the agent
@@ -129,8 +129,8 @@ kernel image) or 14 (what an OS measures) to bind the OS, or only the
 firmware and the Secure Boot state. Put the narrow selections first:
 
 ```
-slot 0   PCR 0,7,11,15   the firmware, Secure Boot, this OS's kernel image   -> certified
-slot 1   PCR 0,7,15      the firmware and Secure Boot, whatever the OS        -> certified
+slot 0   PCR 0,7,11      the firmware, Secure Boot, this OS's kernel image   -> certified
+slot 1   PCR 0,7         the firmware and Secure Boot, whatever the OS        -> certified
 none                                                                          -> temporary key
 ```
 
@@ -292,7 +292,7 @@ openssl ecparam -name prime256v1 -genkey -noout -out authority.key
 openssl ec -in authority.key -pubout -out authority.pub
 
 # 2. On the machine: the CA (slots from assh.conf, or flags)
-assh ca create --out /etc/assh/os-ca.json --authority authority.pub --pcrs 0,7,11,15
+assh ca create --out /etc/assh/os-ca.json --authority authority.pub --pcrs 0,7,11
 # -> /etc/assh/os-ca.json.pub, and the known_hosts line
 
 # 3. The statement of a state of a slot: the TPM's now (no --values), or one a server recorded
@@ -338,7 +338,7 @@ G  counter     NV counter at 0x01802912, incremented through P - the PIN.
 
 ```bash
 assh tpm da --new-lockout-auth --max-tries 3 --recovery 1800 --lockout-recovery 1800
-assh ca create --out /etc/assh/os-ca.json --authority-tpm --pcrs 7,14,15   # the PIN twice
+assh ca create --out /etc/assh/os-ca.json --authority-tpm --pcrs 7,14   # the PIN twice
 assh ca approve --ca /etc/assh/os-ca.json --slot 0,1      # this state, both slots; the PIN once
 assh ca approve --ca /etc/assh/os-ca.json --slot 0,1 --values /run/assh/agent.pcrs.json --next-generation
 assh ca pin --ca /etc/assh/os-ca.json                     # change the PIN
@@ -562,7 +562,7 @@ SHA-512 (never SHA-1's ssh-rsa): sshd asks the agent for the algorithm a
 client picks, and a signature the TPM cannot make drops the connection.
 
 A certificate's key ID names the slot it was certified through and that
-slot's PCRs (`assh slot=1 pcrs=7,15`, `assh slot=0 pcrs=0,2,7,15
+slot's PCRs (`assh slot=1 pcrs=7`, `assh slot=0 pcrs=0,2,7
 signed=11`): a person sees in `ssh -v` ("Server host certificate")
 whether the boot was approved exactly or through a looser slot. It is
 information, signed with the rest; whoever must rely on the state checks
@@ -631,8 +631,8 @@ a flag given on the command line wins over the file.
 ```
 # /etc/assh/assh.conf
 ASSH_CA=efi:AsshOSCA
-ASSH_CA_SLOT_0=0,2,7,11,15
-ASSH_CA_SLOT_1=7,15
+ASSH_CA_SLOT_0=0,2,7,11
+ASSH_CA_SLOT_1=7
 ASSH_AUTHORITY=/etc/assh/authority.pub
 ASSH_PRINCIPALS=host.example,192.0.2.10
 ```
