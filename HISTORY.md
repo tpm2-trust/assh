@@ -4,7 +4,7 @@ Reasoning behind aSSH's design that the code and the README no longer
 carry: why it is as it is, what was tried and measured. The README says
 what it is.
 
-## The window index W replaced by PCR 15 in the CA's policy (2026-11-01, experiment)
+## The window index W replaced by PCR 15 in the CA's policy (2026-11-01)
 
 W (an NV counter, read-locked at the close; 2026-10-29 to 2026-11-01) was
 replaced by PCR 15 in the CA's own policy (`PolicyPCR(15 == open value)`
@@ -31,6 +31,25 @@ into it before the server closes the CA (and any process with the TPM's
 device) stops the CA for the boot - a denial of service, never a way in.
 What PCR 15 has that W did not: nothing in the TPM to define, remove or
 clone, no handle to configure, and the close needs no CA file.
+
+Three ways to close were tried side by side on the VMs (tpm2-trust's
+branches `exp/close-counter`, `exp/close-pcr15`, `exp/debian-uki`). The
+other two, and why not:
+
+- *A window on another project's counter* (`--window-external`: tpm2-kira's
+  slot 0 generation index, one read-lock for its codes and the CA). It
+  tied the CA to a user's index - no such index, no CA; the index
+  deleted, the CA stopped - and kept the window open as long as the user
+  needed the index, not until the certificate. Root with the empty owner
+  password could delete the read-locked index and define it again with
+  the same Name, and whoever held the index's write key could reopen the
+  CA in the same boot: an aSSH window, a counter, cannot be made again
+  alike. It also showed that a window index that counts towards the
+  dictionary attack cannot be read-locked in a lockout - one more reason
+  for the rule that only the PIN index is DA-protected.
+- *No new close at all, the boot made like Arch's on Debian* (systemd-boot
+  and a UKI, so that systemd-pcrosseparator closes). Debian 13's systemd
+  (257) has no separator; the close was needed there anyway.
 
 ## EFI variables in the workspace's go-uefi-slim module (2026-10-30)
 

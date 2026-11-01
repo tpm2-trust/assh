@@ -1,7 +1,11 @@
-# PLAN: the close is PCR 15 in the CA's own policy; no window index (experiment v2, exp/close-pcr15)
+# PLAN: the close is PCR 15 in the CA's own policy; no window index
 
-Status: **implemented** (2026-11-01) on the branch `exp/close-pcr15`; VM runs by the
-coordinator. One of three variants of how a CA closes; tpm2-kira's side is in its PLAN.md.
+Status: **implemented** (2026-11-01) on `feat/close-pcr15`, the variant chosen of three
+(the workspace's PLAN.md); VM test PASS on Arch and Debian. tpm2-kira's side is in its PLAN.md.
+
+- [x] The close is PCR 15 in the CA's policy (below).
+- [x] `openTPM` waits for a TPM that is not there or does not answer yet: at least 3
+      attempts within 5 s (`openAttempts`, `openWait`), as tpm2-kira's `tpmdev.Open`.
 
 ## Goal
 

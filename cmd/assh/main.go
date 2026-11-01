@@ -143,15 +143,40 @@ func main() {
 	}
 }
 
+// openTPM opens the TPM at path, asked again while it is not there or does
+// not answer (openAttempts, openWait).
 func openTPM(path string) func() (transport.TPMCloser, error) {
 	return func() (transport.TPMCloser, error) {
-		t, err := transport.OpenTPM(path)
-		if err != nil {
-			return nil, fmt.Errorf("opening the TPM at %s: %w", path, err)
+		deadline := time.Now().Add(openWait)
+		for attempt := 1; ; attempt++ {
+			t, err := transport.OpenTPM(path)
+			if err == nil {
+				if _, err = (tpm2.GetCapability{
+					Capability:    tpm2.TPMCapTPMProperties,
+					Property:      uint32(tpm2.TPMPTManufacturer),
+					PropertyCount: 1,
+				}).Execute(t); err == nil {
+					return t, nil
+				}
+				t.Close()
+			}
+			if attempt >= openAttempts && !time.Now().Before(deadline) {
+				return nil, fmt.Errorf("opening the TPM at %s (%d attempts in %s): %w", path, attempt, openWait, err)
+			}
+			time.Sleep(openRetry)
 		}
-		return t, nil
 	}
 }
+
+// A TPM is asked again when it is not there or does not answer: at boot the
+// driver can still be probing, or the TPM busy with its self-test, when the
+// agent starts. It is asked at least openAttempts times and for openWait;
+// vars, for the tests.
+var (
+	openAttempts = 3
+	openWait     = 5 * time.Second
+	openRetry    = 200 * time.Millisecond
+)
 
 // commandConfig is assh.conf for a command's arguments: the file --config
 // names, else config.DefaultPath when it is there, else the defaults. The
