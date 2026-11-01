@@ -44,8 +44,12 @@ mkdir -p /etc/assh
 cat >/etc/assh/assh.conf <<'EOF'
 ASSH_CA=efi:AsshCA
 ASSH_AUTHORITY_TPM=yes
-ASSH_CA_SLOT_0=0,2,7,11
+ASSH_CA_SLOT_0=0,2,4,7
+ASSH_CA_SLOT_0_SIGNED=11
 ASSH_CA_SLOT_1=7
+ASSH_CA_SLOT_1_SIGNED=11
+ASSH_PCR_KEY=/etc/assh/pcr.pem
+ASSH_PCR_SIGNATURE=/run/systemd/tpm2-pcr-signature.json
 EOF
 
 # 3. sshd takes its host key from the agent
@@ -129,10 +133,16 @@ kernel image) or 14 (what an OS measures) to bind the OS, or only the
 firmware and the Secure Boot state. Put the narrow selections first:
 
 ```
-slot 0   PCR 0,7,11      the firmware, Secure Boot, this OS's kernel image   -> certified
-slot 1   PCR 0,7         the firmware and Secure Boot, whatever the OS        -> certified
+slot 0   PCR 0,2,4,7+11  the firmware, option ROMs, the loaded images, Secure Boot,
+                         a unified kernel image signed for PCR 11             -> certified
+slot 1   PCR 7+11        Secure Boot and that image; firmware may have changed -> certified
 none                                                                          -> temporary key
 ```
+
+(`+11`: PCR 11 signed; `ASSH_CA_SLOT_<N>_SIGNED`.) Every slot reads PCR 7 and
+the image. Where nothing signs the image and Secure Boot does not check the
+command line and the initrd (GRUB) that is `0,2,4,7,8,9` and `7,8,9`, approved
+after every rebuild.
 
 An OS that went wrong still gets a certificate through slot 1, and from
 that session its new state is approved for slot 0.
@@ -566,7 +576,7 @@ SHA-512 (never SHA-1's ssh-rsa): sshd asks the agent for the algorithm a
 client picks, and a signature the TPM cannot make drops the connection.
 
 A certificate's key ID names the slot it was certified through and that
-slot's PCRs (`assh slot=1 pcrs=7`, `assh slot=0 pcrs=0,2,7
+slot's PCRs (`assh slot=1 pcrs=7 signed=11`, `assh slot=0 pcrs=0,2,4,7
 signed=11`): a person sees in `ssh -v` ("Server host certificate")
 whether the boot was approved exactly or through a looser slot. It is
 information, signed with the rest; whoever must rely on the state checks
@@ -635,8 +645,8 @@ a flag given on the command line wins over the file.
 ```
 # /etc/assh/assh.conf
 ASSH_CA=efi:AsshOSCA
-ASSH_CA_SLOT_0=0,2,7,11
-ASSH_CA_SLOT_1=7
+ASSH_CA_SLOT_0=0,2,4,7,8,9
+ASSH_CA_SLOT_1=7,8,9
 ASSH_AUTHORITY=/etc/assh/authority.pub
 ASSH_PRINCIPALS=host.example,192.0.2.10
 ```
@@ -721,7 +731,7 @@ the build's key:
 ```go
 signed, _ := hostkey.NewSigned([]int{11}, buildKey)
 ca, _ := hostkey.CreateCA(tpm, authorityPub, hostkey.CAOptions{Type: hostkey.P256, Bank: hostkey.SHA256,
-	Slots: []hostkey.SlotSpec{{Number: 0, PCRs: []int{0, 7, 11}, Signed: signed}, {Number: 1, PCRs: []int{7}}},
+	Slots: []hostkey.SlotSpec{{Number: 0, PCRs: []int{0, 2, 4, 7}, Signed: signed}, {Number: 1, PCRs: []int{7}, Signed: signed}},
 	PolicyRef: []byte("myapp")})                // PCR 15 extended: it signs from the next boot on
 d, _ := ca.ApprovalDigest(0, values)        // sign d elsewhere, then:
 ca.AddApproval(0, values, sig)              // or ca.Approve(signer, 0, values) with the key at hand

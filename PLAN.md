@@ -12,7 +12,7 @@ Status: **implemented** (2026-11-01) on `feat/close-pcr15`, the variant chosen o
       line per bank; flock, sticky bit during the extend). Tests: replaying the records
       gives the register in each bank; the record's bytes; no directory; a refused extend;
       a symlink.
-- [ ] F1. README examples: `0,2,4,7+11` / `7+11` and the GRUB pair.
+- [x] F1. README examples: `0,2,4,7+11` / `7+11` and the GRUB pair.
 
 ## Goal
 
