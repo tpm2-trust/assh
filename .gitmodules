@@ -1,0 +1,3 @@
+[submodule "go-uefi-slim"]
+	path = go-uefi-slim
+	url = https://github.com/tpm2-trust/go-uefi-slim.git

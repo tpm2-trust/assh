@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -55,12 +56,43 @@ func confinedChecks(dir string) int {
 	if err := unix.Unshare(unix.CLONE_NEWUTS); !errors.Is(err, unix.EPERM) {
 		return fail("unshare: %v, want EPERM", err)
 	}
+	if d, err := unix.PrctlRetInt(unix.PR_GET_DUMPABLE, 0, 0, 0, 0); err != nil || d != 0 {
+		return fail("dumpable: %d %v, want 0", d, err)
+	}
+	if strings.Contains(desc, "refused") {
+		// A fork into a new user namespace; should it ever succeed, the
+		// copy exits at once.
+		r, _, errno := unix.RawSyscall6(unix.SYS_CLONE, uintptr(unix.CLONE_NEWUSER|unix.SIGCHLD), 0, 0, 0, 0, 0)
+		if errno == 0 && r == 0 {
+			unix.RawSyscall(unix.SYS_EXIT_GROUP, 0, 0, 0)
+		}
+		if errno != unix.EPERM {
+			return fail("clone(CLONE_NEWUSER): %v, want EPERM", errno)
+		}
+		if _, _, errno := unix.RawSyscall(unix.SYS_CLONE3, 0, 0, 0); errno != unix.ENOSYS {
+			return fail("clone3: %v, want ENOSYS", errno)
+		}
+		// New threads still come: clone without a namespace is allowed.
+		done := make(chan int)
+		for i := 0; i < 4; i++ {
+			go func() {
+				runtime.LockOSThread()
+				done <- unix.Gettid()
+			}()
+		}
+		for i := 0; i < 4; i++ {
+			<-done
+		}
+	}
 	tasks, _ := filepath.Glob("/proc/self/task/*/status")
 	if len(tasks) < 2 {
 		return fail("only %d thread(s): the test checks nothing", len(tasks))
 	}
 	for _, t := range tasks {
 		b, err := os.ReadFile(t)
+		if errors.Is(err, os.ErrNotExist) {
+			continue // the thread ended since the listing
+		}
 		if err != nil {
 			return fail("%s: %v", t, err)
 		}

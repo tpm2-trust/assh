@@ -248,6 +248,9 @@ func LockoutAuthSet(t transport.TPM) (bool, error) {
 // removes what it made. The CA has no approval yet; its counter is at
 // generation 1.
 func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
+	if len(o.OpenEvents) > 0 {
+		return nil, errOpenEvents
+	}
 	if o.PINHandle == 0 {
 		o.PINHandle = DefaultPINHandle
 	}
@@ -298,7 +301,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	defer func() {
 		if err != nil {
 			for _, pub := range defined {
-				persist.RemoveNV(t, pub.NVIndex, persist.Shaped(pub))
+				persist.RemoveNV(t, pub.NVIndex, persist.Defined(pub))
 			}
 		}
 	}()
@@ -356,8 +359,10 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	if err := ca.Sync(t); err != nil {
 		return nil, err
 	}
-
 	if err := ca.makeKey(t, p); err != nil {
+		return nil, err
+	}
+	if err := ca.closeAtCreation(t, o.CAOptions); err != nil {
 		return nil, err
 	}
 	return ca, nil

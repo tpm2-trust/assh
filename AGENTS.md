@@ -19,17 +19,32 @@ name is a change to them: build and test tpm2-kira after one.
   authority key, the counter and the host keys are noDA, so that a lockout
   after wrong PINs never stops `Issue`. Anything that holds the PIN must
   be counted, and anything else must not be.
-- **hostkey builds with go-tpm as released.** tpm2-kira compiles assh with
-  its own go-tpm; assh's `replace` (the fork) does not reach it. Commands
-  only the fork has are used in `tpmadmin` alone.
-- **The window closes every slot.** A CA with a window has every slot
-  read that PCR; a slot that does not would sign after the window closed.
+- **go-tpm upstream, one version with its users.** No `replace` of
+  go-tpm: tpm2-kira compiles assh with its own go-tpm, and a replace here
+  would not reach it. A go-tpm move is made in every module of the
+  workspace at once (its AGENTS.md).
+- **The close is PCR 15 in the CA's own policy, and it fails closed.**
+  Every CA's policy reads PCR 15 after the approval (`PolicyAuthorize ;
+  PolicyCommandCode(Sign) ; PolicyPCR(15 == open value)`), so no approval
+  can leave it out; the close is `TPM2_PCR_Event(15, "assh-close")`
+  (`hostkey.Close`), which needs no CA file. A CA is created closed (PCR
+  15 extended), and every way out of `agent`/`serve` - a failure at any
+  step - closes it (`assh close` after the unit, too). `hostkey.Close` is a
+  ladder, each step read back: PCR 15, tried once more; the kill switch
+  (`TPM2_HierarchyControl`: `shEnable`, then `ehEnable`, `phEnable` last, the
+  platform's authorization random first: S3 sets `phEnable` again); PCR 7. The
+  last two are a success that says so (`CloseResult`), and what the boot does
+  with each outcome is the caller's; all failed is a `*CloseError`, never
+  ignored. Never add a path that returns before the
+  close, or a CA that signs in the boot that made it - but a CA made once
+  with `--open-events`, whose approvals exist at its creation, made where
+  nothing untrusted runs before the agent (an initrd). No NV index holds
+  the close: nothing to define, remove or reopen.
 - **A temporary key is a host key like the others**: made in the TPM
   under the NULL hierarchy, never in software, and never certified. It is
   what a server serves when no slot certifies, and before the CA exists
-  (assh.conf naming its slots: their PCRs recorded, the window closed all
-  the same); an unreadable CA file or a TPM that does not open stays an
-  error.
+  (assh.conf naming its slots: their PCRs recorded); an unreadable CA file
+  or a TPM that does not open stays an error - with the CA closed.
 - **SHA-1 only where the TPM allows it.** `auto` reads SHA-1 only on a
   TPM without an active SHA-256 bank and while `hostkey.SHA1Handle` is
   there; others (safearch's initrd) read that index at its handle, so it
@@ -49,17 +64,24 @@ name is a change to them: build and test tpm2-kira after one.
   (`hostkey.fileVersion`); another version is an error that says to
   create the CA again. No migrations.
 - **The side that speaks SSH holds nothing.** `server`'s unprivileged half
-  runs as nobody, in namespaces of its own, confined by `sandbox`, and asks for
-  every signature; it never gets the key or a session's other end before
-  a login. Keep it that way.
+  runs as a uid no one else has (`sandbox.ClaimUID`; nobody only when none
+  is free), in namespaces of its own, confined by `sandbox` - not dumpable,
+  no namespace it could make - and asks for every signature; it never gets
+  the key or a session's other end before a login. Keep it that way.
+- **Whoever approves reads what is approved.** `ca approve` shows the
+  statement and asks; a key elsewhere signs a statement (`ca sign`), not
+  bytes it cannot read. Nothing from the CA file or assh.conf is taken as
+  what the owner meant.
 - **NV indices and EFI variables go through `persist`.** Nothing calls
   NVUndefineSpace or writes efivarfs by itself: an index is removed only
-  when it is provably ours (`persist.Shaped`, `persist.Named`) - the one
-  exception, `RedefineCounter`, replaces what is at the CA's own handle
-  after the PIN is proven - absent is not an error, and a variable is
-  written in place, never removed first. Programs built on aSSH use the
-  same package (tpm2-kira) or the `assh efivar` command (safearch's
-  scripts).
+  when it is provably ours - defined exactly as aSSH defines it at that
+  handle (`persist.Defined`), never because a CA file names it; the
+  exceptions: `RedefineCounter` replaces what is at the CA's own handle
+  after the PIN is proven, and `ca remove --force` removes what a person
+  saw and confirmed (`persist.Any`) - absent is not an error, and a
+  variable is written in place, never removed first. Inside aSSH, everything
+  goes through it. tpm2-kira uses it for NV indices and keeps EFI variables
+  of its own; safearch's scripts use the `assh efivar` command.
 - **A confinement step covers every thread.** prctl, Landlock and
   seccomp act on the thread that asks, and a Go program has several from
   its start: `sandbox` takes each step on all of them

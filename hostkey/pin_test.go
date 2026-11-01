@@ -30,11 +30,12 @@ func pinCA(t *testing.T) (*swtpmtest.SWTPM, transport.TPM, *CA) {
 	sw := swtpmtest.Start(t)
 	sw.SetLockout(t, 3, 1800, 1800)
 	tpm := sw.Open(t)
-	ca, err := CreatePINCA(tpm, PINCAOptions{CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 15}, PolicyRef: []byte("assh test")}, PIN: pinOf(testPIN)})
+	ca, err := CreatePINCA(tpm, PINCAOptions{CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 14}, PolicyRef: []byte("assh test")}, PIN: pinOf(testPIN)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	swtpmtest.NoneLeft(t, tpm, "CreatePINCA")
+	sw.Reboot(t) // a CA signs from the boot after its creation
 	return sw, tpm, ca
 }
 
@@ -119,7 +120,7 @@ func TestPINAuthority(t *testing.T) {
 	flush(tpm, a.ObjectHandle)
 	name, _ := ca.authorityName()
 	caPub, _ := tpm2.Unmarshal[tpm2.TPMTPublic](ca.Public)
-	if !bytes.Equal(name.Buffer, a.Name.Buffer) || !bytes.Equal(caPub.AuthPolicy.Buffer, caPolicyFor(a.Name, ca.PolicyRef)) {
+	if !bytes.Equal(name.Buffer, a.Name.Buffer) || !bytes.Equal(caPub.AuthPolicy.Buffer, caPolicyFor(a.Name, ca.PolicyRef, ca.Bank, ca.OpenValue)) {
 		t.Fatal("the CA's policy does not name the authority's key")
 	}
 
@@ -253,10 +254,8 @@ func TestMove(t *testing.T) {
 	}
 	swtpmtest.NoneLeft(t, tpm, "refused signature")
 
-	// The new state Y: PCR 15 moves on, approved at generation 2.
-	if err := Close(tpm, 15, "combination Y"); err != nil {
-		t.Fatal(err)
-	}
+	// The new state Y: PCR 14 moves on, approved at generation 2.
+	swtpmtest.Extend(t, tpm, 14, "combination Y")
 	if err := approveNow(t, tpm, ca, testPIN); err != nil {
 		t.Fatal(err)
 	}
@@ -428,6 +427,7 @@ func TestPINs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", pin, err)
 		}
+		sw.Reboot(t)
 		if err := ca.NextGeneration(tpm, pinOf(pin)); err != nil {
 			t.Errorf("%q: next generation: %v", pin, err)
 		}
@@ -509,7 +509,8 @@ func TestPINCAFileChecked(t *testing.T) {
 		"no slot":                              func(c *CA) { c.Slots = nil },
 		"approval of a slot it does not have":  func(c *CA) { c.Approvals[0].Slot = 9 },
 		"slot of other PCRs than its approval": func(c *CA) { c.Slots[0].PCRs = []int{7} },
-		"window no slot reads":                 func(c *CA) { c.Window = 14 },
+		"no open value":                        func(c *CA) { c.OpenValue = nil },
+		"another open value":                   func(c *CA) { c.OpenValue = bytes.Repeat([]byte{1}, 32) },
 		"slot 16":                              func(c *CA) { c.Slots[0].Number = 16 },
 	} {
 		if err := edit(change); err == nil {
@@ -517,9 +518,9 @@ func TestPINCAFileChecked(t *testing.T) {
 		}
 	}
 	b, _ := ca.Marshal()
-	b = bytes.Replace(b, []byte(`"version": 3`), []byte(`"version": 2`), 1)
+	b = bytes.Replace(b, []byte(`"version": 5`), []byte(`"version": 4`), 1)
 	if _, err := ParseCA(b); err == nil || !strings.Contains(err.Error(), "create the CA again") {
-		t.Fatalf("version 2: %v", err)
+		t.Fatalf("version 4: %v", err)
 	}
 }
 

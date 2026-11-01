@@ -1,0 +1,114 @@
+---
+name: Strix AI Penetration Test
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+"on":
+  pull_request:
+    branches: ["*"]
+  workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: 'Scan mode (quick, standard, or deep)'
+        required: false
+        default: 'standard'
+        type: choice
+        options:
+          - quick
+          - standard
+          - deep
+
+jobs:
+  strix-security-scan:
+    runs-on: ubuntu-latest
+    # Manual runs always; pull requests only from a branch ending in 'pentest'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      endsWith(github.head_ref, 'pentest')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          # Strix resolves a pull request's changed files against the base
+          fetch-depth: 0
+
+      - name: Install Strix
+        run: |
+          # Official Strix installer, always the latest release
+          curl -fsSL https://strix.ai/install | bash
+          # $GITHUB_PATH takes effect from the next step on
+          "$HOME/.strix/bin/strix" --version
+
+      - name: Run Strix Security Scan
+        id: scan
+        env:
+          STRIX_LLM: ${{ secrets.STRIX_LLM }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          STRIX_TELEMETRY: '0'
+          STRIX_REASONING_EFFORT: >-
+            ${{
+              github.event_name == 'workflow_dispatch' &&
+              github.event.inputs.scan_mode == 'deep' &&
+              'high' || 'medium'
+            }}
+          # Pull requests: quick, which Strix scopes to the changed files;
+          # manual runs: the chosen mode
+          SCAN_MODE: ${{ github.event.inputs.scan_mode || 'quick' }}
+        # Exit 0: no vulnerabilities, 1: error, 2: vulnerabilities found;
+        # anything but 0 fails the job
+        run: |
+          code=0
+          strix -n -t ./ --scan-mode "$SCAN_MODE" || code=$?
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Upload Strix Results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: strix-security-report
+          path: strix_runs/
+          retention-days: 30
+
+      - name: Comment on PR with Results
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        env:
+          SCAN_EXIT: ${{ steps.scan.outputs.exit }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            let comment = '## 🔒 Strix AI Penetration Test Results\n\n';
+
+            switch (process.env.SCAN_EXIT) {
+              case '0':
+                comment += '✅ No vulnerabilities found.\n';
+                break;
+              case '2':
+                comment += '❌ Vulnerabilities found. ';
+                comment += 'Review the report in the workflow artifacts.\n';
+                break;
+              default:
+                comment += '⚠️ The scan did not complete. ';
+                comment += 'Check the workflow logs.\n';
+            }
+            if (!fs.existsSync('strix_runs')) {
+              comment += '\nNo results directory was written.\n';
+            }
+
+            comment += '\n---\n';
+            comment += '*Automated security testing powered by ';
+            comment += '[Strix AI](https://strix.ai)*';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

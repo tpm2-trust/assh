@@ -96,6 +96,25 @@ func TestVars(t *testing.T) {
 			t.Fatalf("%s removed twice: %v %v", c.location, ok, err)
 		}
 	}
+	// The firmware's own: other attributes (boot service and runtime, not
+	// non-volatile), read all the same.
+	sb := "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+	if err := os.WriteFile(filepath.Join(VarDir, sb), []byte{0x06, 0, 0, 0, 1}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadVar(VarPrefix + sb); err != nil || string(got) != "\x01" {
+		t.Fatalf("%s read: %q %v", sb, got, err)
+	}
+	// Empty is a removal to efivarfs: refused, the variable left.
+	if err := WriteVar("efi:AsshTest", []byte("kept")); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteVar("efi:AsshTest", nil); err == nil {
+		t.Fatal("an empty write taken")
+	}
+	if got, err := ReadVar("efi:AsshTest"); err != nil || string(got) != "kept" {
+		t.Fatalf("after an empty write: %q %v", got, err)
+	}
 	for _, bad := range []string{"efi:", "efi:../x", "efi:a/b", "efi:a b"} {
 		if _, err := VarPath(bad); err == nil {
 			t.Errorf("%q taken", bad)

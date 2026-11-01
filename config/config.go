@@ -1,6 +1,6 @@
 // Package config is assh.conf: every setting of assh in one file, KEY=VALUE
 // lines (ASSH_*), so that a command needs no more than --config. The CA
-// (where it is kept, its key, its slots and their PCRs, the window), the
+// (where it is kept, its key, its slots and their PCRs), the
 // host key and the server. A flag given on the command line wins over the
 // file. Projects that use assh as a library read the same file through this
 // package and take the settings they use.
@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/tpm2-trust/assh/hostkey"
+	"github.com/tpm2-trust/assh/sandbox"
 )
 
 // DefaultPath is where the assh command looks when no --config is given.
@@ -38,24 +39,25 @@ type Config struct {
 	Signed     map[int][]int // ASSH_CA_SLOT_<N>_SIGNED: PCRs of slot N that ASSH_PCR_KEY signs
 	PCRKey     string        // ASSH_PCR_KEY: the public key (PEM) whose signatures of PCRs a slot takes
 	PCRSigs    string        // ASSH_PCR_SIGNATURE: its signatures as systemd writes them (JSON)
-	Window     int           // ASSH_CA_WINDOW: 0 none
 	PolicyRef  string        // ASSH_CA_REF
 	Authority  string        // ASSH_AUTHORITY: the authority's public key (PEM), a key elsewhere
 	AuthTPM    bool          // ASSH_AUTHORITY_TPM: the authority in the TPM, opened by a PIN
 	AuthOnce   bool          // ASSH_AUTHORITY_ONCE: an authority for the creation alone
+	OpenEvents []string      // ASSH_CA_OPEN_EVENTS: with AuthOnce, open at what these events make PCR 15, left open in the creation's boot
 	PINHandle  uint32        // ASSH_PIN_HANDLE
 	CounterHdl uint32        // ASSH_COUNTER_HANDLE
 
 	HostKeyType hostkey.Type // ASSH_HOSTKEY_TYPE
 	Principals  []string     // ASSH_PRINCIPALS: comma-separated; * any
 	KeyID       string       // ASSH_KEY_ID
-	ClosePCR    int          // ASSH_CLOSE_PCR: -1 the CA's window
 	State       string       // ASSH_STATE: "" the command's own
 
 	Listen         string // ASSH_LISTEN
 	AuthorizedKeys string // ASSH_AUTHORIZED_KEYS
 	User           string // ASSH_USER
 	Socket         string // ASSH_SOCKET
+	// ASSH_CHILD_UIDS: where the unprivileged half's uid is chosen from
+	ChildUIDs sandbox.UIDRange
 
 	AgentDir string // ASSH_AGENT_DIR
 	AgentUID int    // ASSH_AGENT_UID
@@ -79,8 +81,8 @@ func Default() Config {
 		HostKeyType: hostkey.P256,
 		Principals:  []string{"*"},
 		KeyID:       "assh",
-		ClosePCR:    -1,
 		Listen:      ":22",
+		ChildUIDs:   sandbox.DefaultUIDs,
 		AgentDir:    "/run/assh",
 		Set:         map[string]bool{},
 	}
@@ -167,8 +169,6 @@ func (c *Config) set(key, val string) error {
 		c.CAType, err = hostkey.ParseType(val)
 	case "ASSH_CA_BANK":
 		c.Bank, err = hostkey.ParseBank(val)
-	case "ASSH_CA_WINDOW":
-		c.Window, err = pcr(val, 0)
 	case "ASSH_CA_REF":
 		if len(val) > 32 {
 			return errors.New("at most 32 bytes")
@@ -197,8 +197,11 @@ func (c *Config) set(key, val string) error {
 		}
 	case "ASSH_KEY_ID":
 		c.KeyID, err = nonEmpty(val)
-	case "ASSH_CLOSE_PCR":
-		c.ClosePCR, err = pcr(val, -1)
+	case "ASSH_CA_OPEN_EVENTS":
+		c.OpenEvents = SplitList(val)
+		if len(c.OpenEvents) == 0 {
+			return errors.New("events measured into PCR 15 from zero, comma-separated")
+		}
 	case "ASSH_STATE":
 		c.State = val
 	case "ASSH_LISTEN":
@@ -209,6 +212,8 @@ func (c *Config) set(key, val string) error {
 		c.User = val
 	case "ASSH_SOCKET":
 		c.Socket = val
+	case "ASSH_CHILD_UIDS":
+		c.ChildUIDs, err = sandbox.ParseUIDRange(val)
 	case "ASSH_AGENT_DIR":
 		c.AgentDir, err = nonEmpty(val)
 	case "ASSH_AGENT_UID":
@@ -222,17 +227,13 @@ func (c *Config) set(key, val string) error {
 	return err
 }
 
-// check is what one line cannot tell: the slots fit the window.
+// check is what one line cannot tell.
 func (c *Config) check() error {
-	if c.Window != 0 {
-		for _, n := range c.SlotNumbers() {
-			if !slices.Contains(c.Slots[n], c.Window) {
-				return fmt.Errorf("%s does not read PCR %d, ASSH_CA_WINDOW: the window would not close it", slotKey(n), c.Window)
-			}
-		}
-	}
 	if n := btoi(c.Authority != "") + btoi(c.AuthTPM) + btoi(c.AuthOnce); n > 1 {
 		return errors.New("ASSH_AUTHORITY, ASSH_AUTHORITY_TPM=yes and ASSH_AUTHORITY_ONCE=yes: the authority is one of them")
+	}
+	if len(c.OpenEvents) > 0 && !c.AuthOnce {
+		return errors.New("ASSH_CA_OPEN_EVENTS is for ASSH_AUTHORITY_ONCE=yes alone")
 	}
 	for n, p := range c.Signed {
 		base, ok := c.Slots[n]
@@ -271,14 +272,6 @@ func yesNo(v string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("yes or no, not %q", v)
-}
-
-func pcr(v string, none int) (int, error) {
-	p, err := strconv.Atoi(v)
-	if err != nil || p < none || p > 23 {
-		return 0, fmt.Errorf("a PCR number, not %q", v)
-	}
-	return p, nil
 }
 
 func handle(v string) (uint32, error) {
@@ -330,22 +323,22 @@ func (c Config) Lines() [][2]string {
 	}
 	add("ASSH_PCR_KEY", c.PCRKey, "", false)
 	add("ASSH_PCR_SIGNATURE", c.PCRSigs, "", false)
-	add("ASSH_CA_WINDOW", strconv.Itoa(c.Window), "0", false)
 	add("ASSH_CA_REF", c.PolicyRef, d.PolicyRef, false)
 	add("ASSH_AUTHORITY", c.Authority, "", false)
 	add("ASSH_AUTHORITY_TPM", map[bool]string{true: "yes", false: "no"}[c.AuthTPM], "no", false)
 	add("ASSH_AUTHORITY_ONCE", map[bool]string{true: "yes", false: "no"}[c.AuthOnce], "no", false)
+	add("ASSH_CA_OPEN_EVENTS", strings.Join(c.OpenEvents, ","), "", false)
 	add("ASSH_PIN_HANDLE", fmt.Sprintf("0x%08X", c.PINHandle), fmt.Sprintf("0x%08X", d.PINHandle), false)
 	add("ASSH_COUNTER_HANDLE", fmt.Sprintf("0x%08X", c.CounterHdl), fmt.Sprintf("0x%08X", d.CounterHdl), false)
 	add("ASSH_HOSTKEY_TYPE", string(c.HostKeyType), string(d.HostKeyType), false)
 	add("ASSH_PRINCIPALS", strings.Join(c.Principals, ","), "*", false)
 	add("ASSH_KEY_ID", c.KeyID, d.KeyID, false)
-	add("ASSH_CLOSE_PCR", strconv.Itoa(c.ClosePCR), "-1", false)
 	add("ASSH_STATE", c.State, "", false)
 	add("ASSH_LISTEN", c.Listen, d.Listen, false)
 	add("ASSH_AUTHORIZED_KEYS", c.AuthorizedKeys, "", false)
 	add("ASSH_USER", c.User, "", false)
 	add("ASSH_SOCKET", c.Socket, "", false)
+	add("ASSH_CHILD_UIDS", c.ChildUIDs.String(), d.ChildUIDs.String(), false)
 	add("ASSH_AGENT_DIR", c.AgentDir, d.AgentDir, false)
 	add("ASSH_AGENT_UID", strconv.Itoa(c.AgentUID), "0", false)
 	return out
@@ -435,14 +428,12 @@ func quote(v string) string {
 
 // Match makes the CA's slots the file's: a slot the file adds is added, one
 // it leaves out is taken away with its approvals, one whose PCRs changed is
-// replaced (its approvals go). The file's window, key type, bank and policy
-// ref are the CA's for good: a difference is an error that says to create
+// replaced (its approvals go). The file's key type, bank and
+// policy ref are the CA's for good: a difference is an error that says to create
 // the CA again. changed says whether the CA is different now; a file
 // without slots changes nothing.
 func (c Config) Match(ca *hostkey.CA) (changed bool, err error) {
 	switch {
-	case c.Window != ca.Window:
-		return false, fmt.Errorf("ASSH_CA_WINDOW is %d, the CA's window %d: a window is the CA's for good, create the CA again", c.Window, ca.Window)
 	case !slices.Contains(c.CAType.Choices(), ca.Type):
 		return false, fmt.Errorf("ASSH_CA_TYPE is %s, the CA's key %s: create the CA again", c.CAType, ca.Type)
 	case c.Bank != hostkey.Auto && c.Bank != ca.Bank:

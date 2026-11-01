@@ -54,11 +54,16 @@ func StartBanks(t *testing.T, banks ...string) *SWTPM {
 
 func (s *SWTPM) start(t *testing.T) {
 	t.Helper()
+	s.startFlags(t, "not-need-init,startup-clear")
+}
+
+func (s *SWTPM) startFlags(t *testing.T, flags string) {
+	t.Helper()
 	s.cmd = exec.Command("swtpm", "socket", "--tpm2",
 		"--tpmstate", "dir="+s.dir,
 		"--server", "type=unixio,path="+s.Sock,
 		"--ctrl", "type=unixio,path="+s.Sock+".ctrl",
-		"--flags", "not-need-init,startup-clear")
+		"--flags", flags)
 	if err := s.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +108,22 @@ func (s *SWTPM) Reboot(t *testing.T) {
 	c.Close()
 	s.stop()
 	s.start(t)
+}
+
+// Suspend is a suspend to RAM and the resume: TPM2_Shutdown(STATE), the TPM
+// started again with TPM2_Startup(STATE) (swtpm sends it).
+func (s *SWTPM) Suspend(t *testing.T) {
+	t.Helper()
+	c, err := transport.OpenTPM(s.Sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (tpm2.Shutdown{ShutdownType: tpm2.TPMSUState}).Execute(c); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	s.stop()
+	s.startFlags(t, "not-need-init,startup-state")
 }
 
 // Open opens the TPM, closed with the test.
@@ -182,4 +203,16 @@ func (r *Recorder) Send(cmd []byte) ([]byte, error) {
 	rsp, err := r.TPM.Send(cmd)
 	r.Bytes = append(r.Bytes, rsp...)
 	return rsp, err
+}
+
+// Extend extends pcr with event in every bank (TPM2_PCR_Event): a boot
+// that measured something else.
+func Extend(t *testing.T, c transport.TPM, pcr int, event string) {
+	t.Helper()
+	if _, err := (tpm2.PCREvent{
+		PCRHandle: tpm2.AuthHandle{Handle: tpm2.TPMHandle(pcr), Auth: tpm2.PasswordAuth(nil)},
+		EventData: tpm2.TPM2BEvent{Buffer: []byte(event)},
+	}).Execute(c); err != nil {
+		t.Fatalf("extending PCR %d: %v", pcr, err)
+	}
 }

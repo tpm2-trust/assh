@@ -32,10 +32,11 @@ func TestCAInEFIVariable(t *testing.T) {
 	sw := swtpmtest.Start(t)
 	tpm := sw.Open(t)
 	auth := authority(t)
-	ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{0, 2, 7, 15}, Window: 15, PolicyRef: []byte("assh test")})
+	ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{0, 2, 7, 15}, PolicyRef: []byte("assh test")})
 	if err != nil {
 		t.Fatal(err)
 	}
+	sw.Reboot(t) // a CA signs from the boot after its creation
 	if err := ca.AddSlot(1, []int{7, 15}); err != nil {
 		t.Fatal(err)
 	}
