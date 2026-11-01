@@ -214,8 +214,28 @@ again - whoever resumes must close first.
   on every other way out, a failure at any step included. The unit runs
   `assh close` after the agent too (`ExecStopPost=`), which also closes it
   when the agent could not start, or assh.conf does not parse. `close`
-  needs no CA file: it extends PCR 15, nothing else. A close that fails
-  (no TPM, a refused extend) is an error, never a success.
+  needs no CA file.
+- The close is a ladder (`hostkey.Close`; `assh close` says which way it went):
+  1. PCR 15 extended, tried once more, read back in every bank: a register that
+     holds what it held is a failure.
+  2. Not moved and the TPM answers: the kill switch. `shEnable` cleared with the
+     owner's empty authorization (the platform's if that refuses), then `ehEnable`
+     and, last, `phEnable` with the platform's, whose authorization goes random
+     first: every `TPM2_Startup` sets `phEnable` again, also a resume from S3,
+     which keeps the rest. A firmware that locked the platform refuses those, which
+     is said and is no failure. With `shEnable` clear no key and no owner NV index
+     answers; keys under the NULL hierarchy (the temporary host key) and extends
+     still work. `TPM2_Startup(CLEAR)` sets them again: the next boot.
+  3. Refused too: PCR 7 extended, read back. It closes a CA only through slots that
+     read PCR 7.
+
+  2 and 3 are a success that says so (`CloseResult.Degraded`): the caller's boot
+  may go on, without a CA. All three failed is an error (`*CloseError`, which says
+  whether the TPM still answers), never a success.
+
+  **NOTE for owners with an owner password:** step 2 is not available unless the
+  platform's authorization is empty, which firmware rarely leaves it; such a
+  machine has step 3 alone, which covers slots that read PCR 7.
 - Where systemd's `/run/log/systemd` is there, the close appends
   systemd-pcrextend's own record to `tpm2-measure.log` (one JSON text sequence
   record, every bank's digest), for whoever replays PCR 15; its trouble is said

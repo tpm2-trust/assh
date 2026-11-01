@@ -52,7 +52,7 @@ func TestClose(t *testing.T) {
 	}
 	sw.Reboot(t)
 	certified(t, tpm, ca, opts, 0)
-	if err := Close(tpm); err != nil {
+	if _, err := Close(tpm); err != nil {
 		t.Fatal(err)
 	}
 	// systemd-pcrextend's measurement of the word: SHA-256 of it, extended.
@@ -93,7 +93,7 @@ func TestClose(t *testing.T) {
 		}
 	}
 	swtpmtest.NoneLeft(t, tpm, "refused signatures")
-	if err := Close(tpm); err != nil {
+	if _, err := Close(tpm); err != nil {
 		t.Fatalf("closed twice: %v", err)
 	}
 
@@ -105,15 +105,8 @@ func TestClose(t *testing.T) {
 // A close that does not happen is an error, never a silent open CA: a TPM
 // that does not answer.
 func TestCloseFails(t *testing.T) {
-	if err := Close(failingTPM{}); err == nil {
+	if _, err := Close(failingTPM{}); err == nil {
 		t.Fatal("Close on a TPM that fails succeeded")
-	}
-	// A PCR the TPM refuses to extend from here (PCR 15 is resettable on
-	// no PC Client TPM; a policy or an auth value could guard it).
-	sw := swtpmtest.Start(t)
-	tpm := sw.Open(t)
-	if err := Close(refusing{tpm}); err == nil || !strings.Contains(err.Error(), "PCR 15") {
-		t.Fatalf("a refused extend: %v", err)
 	}
 }
 
@@ -152,7 +145,7 @@ func TestCloseSHA1(t *testing.T) {
 	}
 	opts := IssueOptions{Principals: []string{"host.example"}, Open: sw.Opener()}
 	certified(t, tpm, ca, opts, 0)
-	if err := Close(tpm); err != nil {
+	if _, err := Close(tpm); err != nil {
 		t.Fatal(err)
 	}
 	if hk, err := Issue(tpm, ca, opts); err != nil || !errors.Is(hk.Temporary, ErrClosed) {
@@ -221,7 +214,7 @@ func TestOpenEvents(t *testing.T) {
 		t.Fatalf("a CA open at the events: open %v, %v", open, err)
 	}
 	certified(t, tpm, ca, opts, 0)
-	if err := Close(tpm); err != nil {
+	if _, err := Close(tpm); err != nil {
 		t.Fatal(err)
 	}
 	if hk, err := Issue(tpm, ca, opts); err != nil || !errors.Is(hk.Temporary, ErrClosed) {
@@ -290,7 +283,7 @@ func TestCloseMeasureLog(t *testing.T) {
 	path := filepath.Join(dir, measureLogName)
 
 	for range 2 {
-		if err := Close(tpm); err != nil {
+		if _, err := Close(tpm); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -373,7 +366,7 @@ func TestCloseMeasureLogAbsentOrBroken(t *testing.T) {
 
 	dir := t.TempDir()
 	measureLogDir = filepath.Join(dir, "absent")
-	if err := Close(tpm); err != nil {
+	if _, err := Close(tpm); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(measureLogDir); !os.IsNotExist(err) {
@@ -381,8 +374,8 @@ func TestCloseMeasureLogAbsentOrBroken(t *testing.T) {
 	}
 
 	measureLogDir = dir
-	if err := Close(refusing{tpm}); err == nil {
-		t.Fatal("a refused extend closed")
+	if res, err := Close(refusing{tpm}); err != nil || res.How != ClosedHierarchies {
+		t.Fatalf("a refused extend: %+v %v", res, err)
 	}
 	st, err := os.Stat(filepath.Join(dir, measureLogName))
 	if err != nil {
@@ -402,7 +395,7 @@ func TestCloseMeasureLogAbsentOrBroken(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(link, measureLogName)); err != nil {
 		t.Fatal(err)
 	}
-	if err := Close(tpm); err != nil {
+	if _, err := Close(tpm); err != nil {
 		t.Fatalf("the log's trouble failed the close: %v", err)
 	}
 	if st, err := os.Stat(target); err != nil || st.Size() != 0 {

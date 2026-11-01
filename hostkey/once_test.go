@@ -104,7 +104,7 @@ func TestCreateOnceCA(t *testing.T) {
 
 			// In the boot it was made in, until the close.
 			certified(t, tpm, ca, opts(tpm, build), 0)
-			if err := Close(tpm); err != nil {
+			if _, err := Close(tpm); err != nil {
 				t.Fatal(err)
 			}
 			if hk, err := Issue(tpm, ca, opts(tpm, build)); err != nil || !errors.Is(hk.Temporary, ErrClosed) {
@@ -125,7 +125,7 @@ func TestCreateOnceCA(t *testing.T) {
 			tpm = boot("uki B", "a")
 			certified(t, tpm, ca, opts(tpm, other), 1)
 			tpm = boot("uki B", "a")
-			if err := Close(tpm); err != nil {
+			if _, err := Close(tpm); err != nil {
 				t.Fatal(err)
 			}
 			closed(t, tpm, ca, opts(tpm, build))

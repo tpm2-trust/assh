@@ -1233,10 +1233,11 @@ func (h *hostKeyFlags) temporary(hk *hostkey.HostKey, err error, log ...func(str
 // closeCA extends PCR 15: whatever CA there is - read or not - signs
 // nothing more until the next boot.
 func closeCA(tpm transport.TPM, log func(string)) error {
-	if err := hostkey.Close(tpm); err != nil {
+	res, err := hostkey.Close(tpm)
+	if err != nil {
 		return err
 	}
-	log(fmt.Sprintf("PCR %d extended (%s): the CA signs nothing more until the next boot", hostkey.ClosePCR, hostkey.CloseEvent))
+	log(res.String() + ": the CA signs nothing more until the next boot")
 	return nil
 }
 

@@ -298,7 +298,8 @@ func (f *CA) closeAtCreation(t transport.TPM, o CAOptions) error {
 	if len(o.OpenEvents) > 0 {
 		return nil
 	}
-	return Close(t)
+	_, err := Close(t)
+	return err
 }
 
 // ReadPCRs reads the PCRs any slot reads as the TPM holds them now.

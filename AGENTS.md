@@ -29,8 +29,13 @@ name is a change to them: build and test tpm2-kira after one.
   can leave it out; the close is `TPM2_PCR_Event(15, "assh-close")`
   (`hostkey.Close`), which needs no CA file. A CA is created closed (PCR
   15 extended), and every way out of `agent`/`serve` - a failure at any
-  step - closes it (`assh close` after the unit, too); a close that fails
-  is an error, never ignored. Never add a path that returns before the
+  step - closes it (`assh close` after the unit, too). `hostkey.Close` is a
+  ladder, each step read back: PCR 15, tried once more; the kill switch
+  (`TPM2_HierarchyControl`: `shEnable`, then `ehEnable`, `phEnable` last, the
+  platform's authorization random first: S3 sets `phEnable` again); PCR 7. The
+  last two are a success that says so (`CloseResult`), and what the boot does
+  with each outcome is the caller's; all failed is a `*CloseError`, never
+  ignored. Never add a path that returns before the
   close, or a CA that signs in the boot that made it - but a CA made once
   with `--open-events`, whose approvals exist at its creation, made where
   nothing untrusted runs before the agent (an initrd). No NV index holds

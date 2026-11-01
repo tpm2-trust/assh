@@ -70,7 +70,7 @@ func TestCertifiedHostKey(t *testing.T) {
 			}
 			checkTrusted(t, ca, hk)
 
-			if err := Close(tpm); err != nil {
+			if _, err := Close(tpm); err != nil {
 				t.Fatal(err)
 			}
 			closed(t, tpm, ca, opts)
@@ -215,7 +215,7 @@ func TestSlots(t *testing.T) {
 	swtpmtest.Extend(t, tpm, 14, "another OS")
 	checkTrusted(t, ca, certified(t, tpm, ca, opts, 1))
 	// The close stops every slot.
-	if err := Close(tpm); err != nil {
+	if _, err := Close(tpm); err != nil {
 		t.Fatal(err)
 	}
 	closed(t, tpm, ca, opts)
