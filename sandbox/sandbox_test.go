@@ -20,6 +20,9 @@ func TestMain(m *testing.M) {
 	if dir := os.Getenv("SANDBOX_TEST_DIR"); dir != "" {
 		os.Exit(confinedChecks(dir))
 	}
+	if mode := os.Getenv("SANDBOX_TEST_LOCK"); mode != "" {
+		os.Exit(lockChecks(mode))
+	}
 	os.Exit(m.Run())
 }
 
