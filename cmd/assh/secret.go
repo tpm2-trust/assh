@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/tpm2-trust/assh/hostkey"
+	"github.com/tpm2-trust/assh/sandbox"
 )
 
 // A secret - a PIN, a lockout authorization - comes from a file descriptor
@@ -18,24 +20,44 @@ import (
 
 const maxSecret = 1024
 
+// lockForSecret keeps the process out of swap and core files before the first
+// secret is read: nothing is locked for a command that never reads one. Root
+// is stopped by a lock it cannot take. A user with a limit on locked memory, the
+// usual case (and the tests'), goes on: it is said, and it is theirs to raise.
+var lockForSecret = sync.OnceValue(func() error {
+	err := sandbox.LockMemory()
+	if err != nil && os.Geteuid() != 0 {
+		fmt.Fprintf(os.Stderr, "assh: this secret can reach swap: %v\n", err)
+		return nil
+	}
+	return err
+})
+
 // readSecret reads a secret from fd, every byte to its end and nothing
 // stripped (printf '%s' "$PIN", not echo); with fd < 0 from the terminal,
 // without echo, one line. confirm asks the terminal twice.
 func readSecret(fd int, prompt string, confirm bool) ([]byte, error) {
+	if err := lockForSecret(); err != nil {
+		return nil, fmt.Errorf("not reading the %s: %w", prompt, err)
+	}
 	if fd >= 0 {
 		f := os.NewFile(uintptr(fd), fmt.Sprintf("fd %d", fd))
 		if f == nil {
 			return nil, fmt.Errorf("no file descriptor %d", fd)
 		}
 		defer f.Close()
-		b, err := io.ReadAll(io.LimitReader(f, maxSecret+1))
-		if err != nil {
+		// One buffer of the final size: no growing slice leaves earlier copies.
+		b := make([]byte, maxSecret+1)
+		n, err := io.ReadFull(f, b)
+		switch {
+		case n > maxSecret:
+			clear(b)
+			return nil, fmt.Errorf("fd %d: more than %d bytes", fd, maxSecret)
+		case err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF):
+			clear(b)
 			return nil, fmt.Errorf("reading the %s from fd %d: %w", prompt, fd, err)
 		}
-		if len(b) > maxSecret {
-			return nil, fmt.Errorf("fd %d: more than %d bytes", fd, maxSecret)
-		}
-		return b, nil
+		return b[:n], nil
 	}
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
@@ -76,7 +98,7 @@ func askTerminal(tty *os.File, prompt string) ([]byte, error) {
 	if _, err := tty.WriteString(prompt); err != nil {
 		return nil, err
 	}
-	var line []byte
+	line := make([]byte, 0, maxSecret)
 	buf := make([]byte, 1)
 	defer clear(buf)
 	for {
@@ -85,11 +107,11 @@ func askTerminal(tty *os.File, prompt string) ([]byte, error) {
 			if buf[0] == '\n' {
 				return line, nil
 			}
-			line = append(line, buf[0])
-			if len(line) > maxSecret {
+			if len(line) == maxSecret {
 				clear(line)
 				return nil, fmt.Errorf("more than %d bytes", maxSecret)
 			}
+			line = append(line, buf[0])
 		}
 		if err != nil {
 			clear(line)
