@@ -37,6 +37,19 @@ var guidSuffix = regexp.MustCompile(`-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 // IsVar reports whether location names an EFI variable ("efi:...").
 func IsVar(location string) bool { return strings.HasPrefix(location, VarPrefix) }
 
+// IsOwnVar reports whether location names a variable of aSSH's vendor GUID.
+func IsOwnVar(location string) bool {
+	if !IsVar(location) {
+		return false
+	}
+	_, guid, err := variable(location)
+	if err != nil {
+		return false
+	}
+	own, err := efivar.ParseGUID(VarGUID)
+	return err == nil && guid == own
+}
+
 // variable is location's variable: "efi:NAME" with aSSH's GUID,
 // "efi:NAME-GUID" with that one. Names are narrower than efivarfs takes:
 // letters, digits, _ and -.

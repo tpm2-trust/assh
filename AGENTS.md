@@ -13,8 +13,11 @@ name is a change to them: build and test tpm2-kira after one.
   mode that writes a key, or a secret that unlocks one, to a file. A
   cleared TPM loses the CA, and that is accepted: no backup, no export.
 - **The PIN is never stored, logged or passed in argv or the environment.**
-  It comes from the terminal or a file descriptor; whatever proves it to
-  the TPM runs in a salted session, whatever carries it is encrypted.
+  It comes from the terminal or a file descriptor, into one buffer of the final
+  size, and no further than a process that took `sandbox.LockMemory` first (out
+  of swap and core files; root stops if it cannot, a user goes on and is told).
+  Whatever proves it to the TPM runs in a salted session, whatever carries it
+  is encrypted.
 - **Only the PIN index is DA-protected.** The storage primary, the CA, the
   authority key, the counter and the host keys are noDA, so that a lockout
   after wrong PINs never stops `Issue`. Anything that holds the PIN must
@@ -86,7 +89,8 @@ name is a change to them: build and test tpm2-kira after one.
   seccomp act on the thread that asks, and a Go program has several from
   its start: `sandbox` takes each step on all of them
   (`syscall.AllThreadsSyscall`, seccomp's TSYNC). Never confine with a
-  plain `unix.Prctl` or `unix.Syscall`.
+  plain `unix.Prctl` or `unix.Syscall`. What is the address space's, not a thread's
+  (`PR_SET_DUMPABLE`, `mlockall`), takes one call, and says so.
 - **Tests run with `-count=1` and wait for a state, never for a time.**
   TPM tests use swtpm (`internal/swtpmtest`) and are skipped without it.
 - **Comments and docs say what it is**, not what it was.

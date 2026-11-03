@@ -36,32 +36,40 @@ var ErrLeft = errors.New("left in the TPM")
 // it at that handle - attributes, size, policy (persist.Defined); the
 // counter's policy names the PIN index the TPM holds and its value, read
 // there, never what the file says. The file names the handles; with no
-// file at path, h does. What is left is named in an error that wraps
-// ErrLeft; the rest is removed all the same. It gives what it removed;
-// absent is no error.
+// file at path, h does. A variable of aSSH's vendor GUID that does not parse
+// (another version of the format, damaged) goes too, and h names the handles:
+// it cannot be used, and nothing else could remove it. Anything else that does
+// not parse stays, an error: the path may not be a CA at all. What is left is
+// named in an error that wraps ErrLeft; the rest is removed all the same. It
+// gives what it removed; absent is no error.
 func RemoveCA(t transport.TPM, path string, h Handles) ([]string, error) {
 	h = h.Defaults()
-	ca, err := LoadCA(path)
-	switch {
-	case err == nil:
-		h = Handles{}
-		if ca.AuthorityTPM != nil {
-			if p, _, err := ca.pinIndex(); err == nil {
-				h.PIN = p.NVIndex
-			}
-		}
-		if ca.Counter != nil {
-			if g, err := ca.counter(); err == nil {
-				h.Counter = g.NVIndex
-			}
-		}
-	case os.IsNotExist(err):
-		ca = nil
-	default:
+	data, err := readCA(path)
+	there := err == nil
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
+	if there {
+		ca, err := ParseCA(data)
+		switch {
+		case err == nil:
+			h = Handles{}
+			if ca.AuthorityTPM != nil {
+				if p, _, err := ca.pinIndex(); err == nil {
+					h.PIN = p.NVIndex
+				}
+			}
+			if ca.Counter != nil {
+				if g, err := ca.counter(); err == nil {
+					h.Counter = g.NVIndex
+				}
+			}
+		case !persist.IsOwnVar(path):
+			return nil, fmt.Errorf("%s: %w; not removed, it may not be aSSH's: if it is, delete it and run ca remove again", path, err)
+		}
+	}
 	removed, left := removeIndices(t, h)
-	if ca != nil {
+	if there {
 		gone, err := removeFile(path)
 		removed = append(removed, gone...)
 		if err != nil {

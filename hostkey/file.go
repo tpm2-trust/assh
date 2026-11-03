@@ -57,6 +57,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/tpm2-trust/assh/persist"
+	"github.com/tpm2-trust/go-uefi-slim/uki"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -210,13 +211,7 @@ func (a Approval) Equal(b *Approval) bool {
 
 // LoadCA reads a CA file, or the EFI variable "efi:NAME".
 func LoadCA(path string) (*CA, error) {
-	var data []byte
-	var err error
-	if persist.IsVar(path) {
-		data, err = persist.ReadVar(path)
-	} else {
-		data, err = os.ReadFile(path)
-	}
+	data, err := readCA(path)
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +220,14 @@ func LoadCA(path string) (*CA, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return f, nil
+}
+
+// readCA is the contents of a CA file, or of the EFI variable "efi:NAME".
+func readCA(path string) ([]byte, error) {
+	if persist.IsVar(path) {
+		return persist.ReadVar(path)
+	}
+	return os.ReadFile(path)
 }
 
 // ParseCA reads a CA file's contents.
@@ -387,12 +390,12 @@ func (f *CA) FileGeneration() uint64 {
 // values, at the file's generation: the first slot's that has one, nil
 // when there is none. A slot with signed PCRs counts only where sigs has
 // the signature of their values.
-func (f *CA) Approved(values map[int][]byte, sigs PCRSignatures) *Approval {
+func (f *CA) Approved(values map[int][]byte, sigs uki.PCRSignatures) *Approval {
 	return f.approvedAt(values, f.FileGeneration(), sigs)
 }
 
 // approvedAt scans the slots from the lowest number up.
-func (f *CA) approvedAt(values map[int][]byte, gen uint64, sigs PCRSignatures) *Approval {
+func (f *CA) approvedAt(values map[int][]byte, gen uint64, sigs uki.PCRSignatures) *Approval {
 	for _, s := range f.Slots {
 		if !f.signedMet(&s, values, sigs) {
 			continue

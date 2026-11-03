@@ -391,8 +391,11 @@ assh tpm da --ask-lockout-auth --reset                    # end a lockout
   hashing, no normalization. It is read from the terminal without echo, or
   from a file descriptor (`--pin-fd N`, every byte as it is: `printf
   '%s'`, not `echo`) - never from argv or the environment, never stored,
-  never logged. Whatever proves it runs in a salted HMAC session,
-  whatever carries it is encrypted.
+  never logged. The process locks its memory first and is not dumpable
+  (`sandbox.LockMemory`): nothing of the PIN or the lockout authorization reaches swap or a core file. Root
+  stops if it cannot lock (a limit on locked memory without `CAP_IPC_LOCK`); a
+  user, with the usual limit, goes on and is told. Whatever proves it runs in a salted HMAC
+  session, whatever carries it is encrypted.
 - **Wrong PINs** are counted by the TPM's dictionary attack protection, P
   being the only object here that is not noDA: guessed through A or
   through G, it is one counter. With `--max-tries 3 --recovery 1800`
@@ -503,6 +506,12 @@ edited to name another program's index leaves that index. With no file,
 the handles of assh.conf or the flags are taken by the same rule. No PIN:
 the owner authorization is enough. Clients then need a new line for the
 next CA.
+
+A CA in a variable of aSSH's vendor GUID that does not parse (another version
+of the format, damaged) is removed too, with the indices at the handles of
+assh.conf or the flags, by the same rule. A plain file or another GUID's
+variable that does not parse stays, and the error says so: `--ca` may not name
+a CA at all.
 
 What is left is named, and `--force` removes it - for what a previous
 installation left at aSSH's handles (an index of another format, a CA file

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"github.com/tpm2-trust/go-uefi-slim/uki"
 	"strings"
 	"testing"
 
@@ -18,7 +19,7 @@ import (
 
 // signPCRs is what systemd-measure sign writes for values of pcrs in bank:
 // the PolicyPCR digest and key's signature over it.
-func signPCRs(t *testing.T, key *rsa.PrivateKey, bank Bank, pcrs []int, values map[int][]byte) PCRSignatures {
+func signPCRs(t *testing.T, key *rsa.PrivateKey, bank Bank, pcrs []int, values map[int][]byte) uki.PCRSignatures {
 	t.Helper()
 	pol, err := PCRPolicy(bank, pcrs, values)
 	if err != nil {
@@ -29,12 +30,8 @@ func signPCRs(t *testing.T, key *rsa.PrivateKey, bank Bank, pcrs []int, values m
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := PCRSignatures{}
-	p[string(bank)] = append(p[string(bank)], struct {
-		PCRs []int  `json:"pcrs"`
-		Pol  string `json:"pol"`
-		Sig  string `json:"sig"`
-	}{pcrs, hex.EncodeToString(pol), base64.StdEncoding.EncodeToString(sig)})
+	p := uki.PCRSignatures{}
+	p[string(bank)] = append(p[string(bank)], uki.PCRSignature{PCRs: pcrs, Pol: hex.EncodeToString(pol), Sig: base64.StdEncoding.EncodeToString(sig)})
 	return p
 }
 
@@ -87,7 +84,7 @@ func TestCreateOnceCA(t *testing.T) {
 			if ca, err = ParseCA(b); err != nil {
 				t.Fatal(err)
 			}
-			sigsOf := func(tpm transport.TPM, key *rsa.PrivateKey) PCRSignatures {
+			sigsOf := func(tpm transport.TPM, key *rsa.PrivateKey) uki.PCRSignatures {
 				now, err := ReadPCRs(tpm, bank, []int{11})
 				if err != nil {
 					t.Fatal(err)

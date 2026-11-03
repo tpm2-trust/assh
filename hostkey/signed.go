@@ -5,15 +5,13 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/tpm2-trust/go-uefi-slim/uki"
 )
 
 // Signed are PCRs a slot takes from a key elsewhere instead of from an
@@ -92,65 +90,28 @@ func PCRPolicy(bank Bank, pcrs []int, values map[int][]byte) ([]byte, error) {
 	}.Update), nil
 }
 
-// PCRSignatures are signatures of PCR policies as systemd writes them
-// (systemd-measure sign --json, a UKI's .pcrsig):
-//
-//	{"sha256": [{"pcrs": [11], "pkfp": "...", "pol": "<hex>", "sig": "<base64>"}, ...], "sha1": [...]}
-//
-// "sig" is RSA PKCS #1 v1.5 over SHA-256 of "pol" (no policy reference).
-type PCRSignatures map[string][]struct {
-	PCRs []int  `json:"pcrs"`
-	Pol  string `json:"pol"`
-	Sig  string `json:"sig"`
-}
-
-// ParsePCRSignatures reads systemd's JSON (trailing NULs allowed, as a
-// section has them).
-func ParsePCRSignatures(b []byte) (PCRSignatures, error) {
-	for len(b) > 0 && b[len(b)-1] == 0 {
-		b = b[:len(b)-1]
-	}
-	var p PCRSignatures
-	if err := json.Unmarshal(b, &p); err != nil {
-		return nil, fmt.Errorf("not systemd's PCR signatures: %w", err)
-	}
-	return p, nil
-}
-
-// find is the signature by s's key over pol in bank, checked here; nil for
-// none.
-func (p PCRSignatures) find(s *Signed, bank Bank, pol []byte) []byte {
+// signatureOf is the signature by s's key over pol in bank, checked here; nil
+// for none. The signatures are systemd's (systemd-measure sign --json, a UKI's
+// .pcrsig): RSA PKCS #1 v1.5 over SHA-256 of pol, no policy reference.
+func signatureOf(p uki.PCRSignatures, s *Signed, bank Bank, pol []byte) []byte {
 	k, err := s.key()
 	if err != nil {
 		return nil
 	}
 	digest := sha256.Sum256(pol)
-	for _, e := range p[string(bank)] {
-		if !slices.Equal(e.PCRs, s.PCRs) {
-			continue
-		}
-		if got, err := hex.DecodeString(e.Pol); err != nil || string(got) != string(pol) {
-			continue
-		}
-		sig, err := base64.StdEncoding.DecodeString(e.Sig)
-		if err != nil {
-			continue
-		}
-		if rsa.VerifyPKCS1v15(k, crypto.SHA256, digest[:], sig) == nil {
-			return sig
-		}
-	}
-	return nil
+	return p.Find(string(bank), s.PCRs, pol, func(sig []byte) error {
+		return rsa.VerifyPKCS1v15(k, crypto.SHA256, digest[:], sig)
+	})
 }
 
 // signedTicket has the TPM check the signature of s's key over the policy
 // of now's values of the signed PCRs, and gives what PolicyAuthorize takes.
-func (f *CA) signedTicket(t transport.TPM, s *Signed, now map[int][]byte, sigs PCRSignatures) (pol []byte, name tpm2.TPM2BName, ticket tpm2.TPMTTKVerified, err error) {
+func (f *CA) signedTicket(t transport.TPM, s *Signed, now map[int][]byte, sigs uki.PCRSignatures) (pol []byte, name tpm2.TPM2BName, ticket tpm2.TPMTTKVerified, err error) {
 	pol, err = PCRPolicy(f.Bank, s.PCRs, now)
 	if err != nil {
 		return nil, name, ticket, err
 	}
-	sig := sigs.find(s, f.Bank, pol)
+	sig := signatureOf(sigs, s, f.Bank, pol)
 	if sig == nil {
 		return nil, name, ticket, fmt.Errorf("PCR %s: no signature of its key for this value", PCRList(s.PCRs))
 	}

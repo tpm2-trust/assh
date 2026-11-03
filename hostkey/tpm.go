@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/tpm2-trust/go-uefi-slim/uki"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -385,12 +386,12 @@ func (f *CA) mismatch(now map[int][]byte, gen uint64) error {
 
 // signedMet is whether slot s needs no signature, or sigs has one of its
 // key for now's values of its signed PCRs.
-func (f *CA) signedMet(s *Slot, now map[int][]byte, sigs PCRSignatures) bool {
+func (f *CA) signedMet(s *Slot, now map[int][]byte, sigs uki.PCRSignatures) bool {
 	if s.Signed == nil {
 		return true
 	}
 	pol, err := PCRPolicy(f.Bank, s.Signed.PCRs, now)
-	return err == nil && sigs.find(s.Signed, f.Bank, pol) != nil
+	return err == nil && signatureOf(sigs, s.Signed, f.Bank, pol) != nil
 }
 
 func (f *CA) slotMismatch(s Slot, now map[int][]byte, gen uint64) SlotMismatch {
@@ -432,7 +433,7 @@ type caSigner struct {
 	approval *Approval
 	pub      crypto.PublicKey
 	now      map[int][]byte // the PCRs as read for the approval: the signed ones' values
-	sigs     PCRSignatures
+	sigs     uki.PCRSignatures
 }
 
 func (s *caSigner) Public() crypto.PublicKey { return s.pub }
@@ -657,7 +658,7 @@ type IssueOptions struct {
 	// PCRSignatures are the signatures a slot with signed PCRs needs (the
 	// booted UKI's, /run/systemd/tpm2-pcr-signature.json); without them
 	// such a slot is not met.
-	PCRSignatures PCRSignatures
+	PCRSignatures uki.PCRSignatures
 }
 
 // HostKey is a host key of this boot: certified by the CA, or temporary.

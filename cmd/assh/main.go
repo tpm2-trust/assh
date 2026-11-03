@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/tpm2-trust/go-uefi-slim/uki"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/tpm2-trust/assh/config"
@@ -968,7 +969,7 @@ func slotSpecs(cfg config.Config) ([]hostkey.SlotSpec, error) {
 
 // pcrSignatures are ASSH_PCR_SIGNATURE's signatures; none where the file is
 // not there (a slot with signed PCRs then is not met).
-func pcrSignatures(path string, log func(string)) hostkey.PCRSignatures {
+func pcrSignatures(path string, log func(string)) uki.PCRSignatures {
 	if path == "" {
 		return nil
 	}
@@ -977,7 +978,7 @@ func pcrSignatures(path string, log func(string)) hostkey.PCRSignatures {
 		log(fmt.Sprintf("no signatures of PCRs (%v): a slot with signed PCRs is not met", err))
 		return nil
 	}
-	p, err := hostkey.ParsePCRSignatures(b)
+	p, err := uki.ParsePCRSignatures(b)
 	if err != nil {
 		log(fmt.Sprintf("%s: %v", path, err))
 		return nil
