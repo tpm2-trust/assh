@@ -1,3 +1,31 @@
+# PLAN: `ca remove` removes a CA variable it cannot read
+
+Status: **done**, `go test ./...` passes.
+
+## Goal
+
+`RemoveCA` parses the CA before removing it, so a CA of another file version or a damaged one
+can't be removed: `ca remove`, and with it safespace's `identity clear`, fail with "create the
+CA again".
+
+## Steps
+
+- [x] 1. `hostkey.RemoveCA`: a read failure stays an error. Content that does not parse, in a
+      variable of aSSH's vendor GUID: remove the variable, and the indices at the handles given
+      (or the defaults), by their definition, as with no file.
+- [x] 2. A plain file, or a variable of another GUID, that does not parse: still refused, the
+      error says what to do. The path may not be a CA at all (`--ca /etc/passwd`, `efi:PK-...`).
+- [x] 3. Tests in `hostkey/remove_test.go`: another version and damaged content in a variable
+      removed, indices too; a plain file and another GUID left; a foreign index left.
+- [x] 4. README `ca remove`; `../pin assh`; safearch's `tests/run.sh` and tpm2-kira's
+      `make test-all` against it.
+
+## What breaks
+
+Nothing to redo. `ca remove` now removes an unreadable aSSH variable where it refused before.
+
+---
+
 # PLAN: the close is PCR 15 in the CA's own policy; no window index
 
 Status: **implemented** (2026-11-01) on `feat/close-pcr15`, the variant chosen of three

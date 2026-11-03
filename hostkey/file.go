@@ -211,13 +211,7 @@ func (a Approval) Equal(b *Approval) bool {
 
 // LoadCA reads a CA file, or the EFI variable "efi:NAME".
 func LoadCA(path string) (*CA, error) {
-	var data []byte
-	var err error
-	if persist.IsVar(path) {
-		data, err = persist.ReadVar(path)
-	} else {
-		data, err = os.ReadFile(path)
-	}
+	data, err := readCA(path)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +220,14 @@ func LoadCA(path string) (*CA, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return f, nil
+}
+
+// readCA is the contents of a CA file, or of the EFI variable "efi:NAME".
+func readCA(path string) ([]byte, error) {
+	if persist.IsVar(path) {
+		return persist.ReadVar(path)
+	}
+	return os.ReadFile(path)
 }
 
 // ParseCA reads a CA file's contents.

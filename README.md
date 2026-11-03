@@ -507,6 +507,12 @@ the handles of assh.conf or the flags are taken by the same rule. No PIN:
 the owner authorization is enough. Clients then need a new line for the
 next CA.
 
+A CA in a variable of aSSH's vendor GUID that does not parse (another version
+of the format, damaged) is removed too, with the indices at the handles of
+assh.conf or the flags, by the same rule. A plain file or another GUID's
+variable that does not parse stays, and the error says so: `--ca` may not name
+a CA at all.
+
 What is left is named, and `--force` removes it - for what a previous
 installation left at aSSH's handles (an index of another format, a CA file
 lost): every index at the handles of assh.conf or the flags, never one a

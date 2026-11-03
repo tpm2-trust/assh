@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/tpm2-trust/assh/persist"
+	"github.com/tpm2-trust/go-uefi-slim/efivar"
 )
 
 // RemoveCA removes the CA's file and its indices; without a file the
@@ -49,6 +50,91 @@ func TestRemoveCA(t *testing.T) {
 	if removed, err := RemoveCA(tpm, path, Handles{}); err != nil || len(removed) != 2 {
 		t.Fatalf("by definition: %v %v", removed, err)
 	}
+}
+
+// A variable of aSSH's that does not parse goes, with the indices at the
+// handles given, by their definition: nothing else could remove it. Anything
+// else that does not parse stays: the path may not be a CA.
+func TestRemoveCAUnreadable(t *testing.T) {
+	persist.VarDir = t.TempDir()
+	t.Cleanup(func() { persist.VarDir = efivar.DefaultDir })
+	const own = "efi:SAFEasshCA"
+	for name, content := range map[string]string{
+		"another version": `{"version": 3}`,
+		"damaged":         `{broken`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, tpm, _ := pinCA(t)
+			if err := persist.WriteVar(own, []byte(content)); err != nil {
+				t.Fatal(err)
+			}
+			removed, err := RemoveCA(tpm, own, Handles{})
+			if err != nil || len(removed) != 3 {
+				t.Fatalf("removed %v: %v", removed, err)
+			}
+			if _, err := persist.ReadVar(own); !os.IsNotExist(err) {
+				t.Errorf("the variable is still there: %v", err)
+			}
+			for _, h := range []tpm2.TPMHandle{DefaultPINHandle, DefaultCounterHandle} {
+				if _, _, err := persist.ReadNVPublic(tpm, h); err == nil {
+					t.Errorf("0x%08X still there", uint32(h))
+				}
+			}
+		})
+	}
+
+	t.Run("a foreign index at the handle stays", func(t *testing.T) {
+		_, tpm, _ := pinCA(t)
+		if _, err := RemoveCA(tpm, filepath.Join(t.TempDir(), "none"), Handles{}); err != nil {
+			t.Fatal(err)
+		}
+		foreign := sha1Public()
+		foreign.NVIndex = DefaultPINHandle
+		owner := tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)}
+		if _, err := (tpm2.NVDefineSpace{AuthHandle: owner, PublicInfo: tpm2.New2B(foreign)}).Execute(tpm); err != nil {
+			t.Fatal(err)
+		}
+		if err := persist.WriteVar(own, []byte(`{broken`)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RemoveCA(tpm, own, Handles{}); !errors.Is(err, ErrLeft) {
+			t.Fatalf("got %v", err)
+		}
+		if _, _, err := persist.ReadNVPublic(tpm, DefaultPINHandle); err != nil {
+			t.Errorf("the foreign index went: %v", err)
+		}
+		if _, err := persist.ReadVar(own); !os.IsNotExist(err) {
+			t.Errorf("the variable is still there: %v", err)
+		}
+	})
+
+	t.Run("not aSSH's stays", func(t *testing.T) {
+		_, tpm, _ := pinCA(t)
+		file := filepath.Join(t.TempDir(), "passwd")
+		other := "efi:PK-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+		if err := os.WriteFile(file, []byte("root:x:0:0"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := persist.WriteVar(other, []byte("not a CA")); err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range []string{file, other} {
+			if _, err := RemoveCA(tpm, path, Handles{}); err == nil || errors.Is(err, ErrLeft) {
+				t.Errorf("%s: got %v", path, err)
+			}
+		}
+		if _, err := os.Stat(file); err != nil {
+			t.Errorf("the file went: %v", err)
+		}
+		if _, err := persist.ReadVar(other); err != nil {
+			t.Errorf("the variable went: %v", err)
+		}
+		for _, h := range []tpm2.TPMHandle{DefaultPINHandle, DefaultCounterHandle} {
+			if _, _, err := persist.ReadNVPublic(tpm, h); err != nil {
+				t.Errorf("0x%08X went: %v", uint32(h), err)
+			}
+		}
+	})
 }
 
 // What a CA file names is no proof: a file edited to name another owner
