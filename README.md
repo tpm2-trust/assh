@@ -9,7 +9,7 @@ line, which stays the same through reboots, updates and new PCR states.
 
 It is a Go library and a command, `assh`. Who uses it:
 
-- [tpm2-kira](https://github.com/mrwiora/tpm2-kira), as a library (a git
+- [tpm2-kira](https://github.com/tpm2-trust/tpm2-kira), as a library (a git
   submodule): the SSH server of its boot image, the CA approved by its
   signing key, kept outside the disk with `persist`.
 - [safearch](https://github.com/tpm2-trust/safearch), as the command in
