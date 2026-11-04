@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/google/go-tpm v0.9.9-0.20261030171821-c395998989d7
 	golang.org/x/crypto v0.57.0
-	golang.org/x/sys v0.48.0
+	golang.org/x/sys v0.49.0
 )
 
 // EFI variables (efivarfs): the workspace's go-uefi-slim module, pinned as the
