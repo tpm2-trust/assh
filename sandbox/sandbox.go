@@ -102,7 +102,7 @@ func landlock(readBeneath []string) (int, error) {
 	abi := int(v)
 	var attr unix.LandlockRulesetAttr
 	size := uintptr(8) // access_fs alone, ABI 1-3
-	attr.Access_fs = unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_WRITE_FILE |
+	attr.Handled_access_fs = unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_WRITE_FILE |
 		unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR |
 		unix.LANDLOCK_ACCESS_FS_REMOVE_DIR | unix.LANDLOCK_ACCESS_FS_REMOVE_FILE |
 		unix.LANDLOCK_ACCESS_FS_MAKE_CHAR | unix.LANDLOCK_ACCESS_FS_MAKE_DIR |
@@ -110,17 +110,17 @@ func landlock(readBeneath []string) (int, error) {
 		unix.LANDLOCK_ACCESS_FS_MAKE_FIFO | unix.LANDLOCK_ACCESS_FS_MAKE_BLOCK |
 		unix.LANDLOCK_ACCESS_FS_MAKE_SYM
 	if abi >= 2 {
-		attr.Access_fs |= unix.LANDLOCK_ACCESS_FS_REFER
+		attr.Handled_access_fs |= unix.LANDLOCK_ACCESS_FS_REFER
 	}
 	if abi >= 3 {
-		attr.Access_fs |= unix.LANDLOCK_ACCESS_FS_TRUNCATE
+		attr.Handled_access_fs |= unix.LANDLOCK_ACCESS_FS_TRUNCATE
 	}
 	if abi >= 4 {
-		attr.Access_net = unix.LANDLOCK_ACCESS_NET_BIND_TCP | unix.LANDLOCK_ACCESS_NET_CONNECT_TCP
+		attr.Handled_access_net = unix.LANDLOCK_ACCESS_NET_BIND_TCP | unix.LANDLOCK_ACCESS_NET_CONNECT_TCP
 		size = 16
 	}
 	if abi >= 5 {
-		attr.Access_fs |= unix.LANDLOCK_ACCESS_FS_IOCTL_DEV
+		attr.Handled_access_fs |= unix.LANDLOCK_ACCESS_FS_IOCTL_DEV
 	}
 	if abi >= 6 {
 		attr.Scoped = unix.LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | unix.LANDLOCK_SCOPE_SIGNAL
