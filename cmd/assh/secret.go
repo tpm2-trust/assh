@@ -11,7 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/tpm2-trust/assh/hostkey"
-	"github.com/tpm2-trust/assh/sandbox"
+	"github.com/tpm2-trust/go-tui-slim/secret"
+	"github.com/tpm2-trust/go-tui-slim/termguard"
 )
 
 // A secret - a PIN, a lockout authorization - comes from a file descriptor
@@ -25,7 +26,7 @@ const maxSecret = 1024
 // is stopped by a lock it cannot take. A user with a limit on locked memory, the
 // usual case (and the tests'), goes on: it is said, and it is theirs to raise.
 var lockForSecret = sync.OnceValue(func() error {
-	err := sandbox.LockMemory()
+	err := secret.LockProcess()
 	if err != nil && os.Geteuid() != 0 {
 		fmt.Fprintf(os.Stderr, "assh: this secret can reach swap: %v\n", err)
 		return nil
@@ -51,10 +52,10 @@ func readSecret(fd int, prompt string, confirm bool) ([]byte, error) {
 		n, err := io.ReadFull(f, b)
 		switch {
 		case n > maxSecret:
-			clear(b)
+			secret.Wipe(b)
 			return nil, fmt.Errorf("fd %d: more than %d bytes", fd, maxSecret)
 		case err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF):
-			clear(b)
+			secret.Wipe(b)
 			return nil, fmt.Errorf("reading the %s from fd %d: %w", prompt, fd, err)
 		}
 		return b[:n], nil
@@ -69,38 +70,39 @@ func readSecret(fd int, prompt string, confirm bool) ([]byte, error) {
 		return b, err
 	}
 	again, err := askTerminal(tty, prompt+" again: ")
-	defer clear(again)
+	defer secret.Wipe(again)
 	if err != nil {
-		clear(b)
+		secret.Wipe(b)
 		return nil, err
 	}
 	if !bytes.Equal(b, again) {
-		clear(b)
+		secret.Wipe(b)
 		return nil, fmt.Errorf("the two %ss differ", prompt)
 	}
 	return b, nil
 }
 
-// askTerminal reads one line from tty with its echo off.
+// askTerminal reads one line from tty with its echo off. The terminal is given
+// back on every way out, a signal's too (go-tui-slim's termguard), and what was
+// typed and not read goes with it: it must not answer whoever reads next.
 func askTerminal(tty *os.File, prompt string) ([]byte, error) {
-	fd := int(tty.Fd())
-	old, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	restore, err := termguard.Hold{
+		Change: func(t *unix.Termios) {
+			t.Lflag &^= unix.ECHO
+			t.Lflag |= unix.ICANON | unix.ECHONL
+		},
+		Flush: true,
+	}.Take(int(tty.Fd()))
 	if err != nil {
 		return nil, fmt.Errorf("the terminal: %w", err)
 	}
-	noEcho := *old
-	noEcho.Lflag &^= unix.ECHO
-	noEcho.Lflag |= unix.ICANON | unix.ECHONL
-	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &noEcho); err != nil {
-		return nil, fmt.Errorf("the terminal: %w", err)
-	}
-	defer unix.IoctlSetTermios(fd, unix.TCSETS, old)
+	defer restore()
 	if _, err := tty.WriteString(prompt); err != nil {
 		return nil, err
 	}
 	line := make([]byte, 0, maxSecret)
 	buf := make([]byte, 1)
-	defer clear(buf)
+	defer secret.Wipe(buf)
 	for {
 		n, err := tty.Read(buf)
 		if n == 1 {
@@ -108,13 +110,13 @@ func askTerminal(tty *os.File, prompt string) ([]byte, error) {
 				return line, nil
 			}
 			if len(line) == maxSecret {
-				clear(line)
+				secret.Wipe(line)
 				return nil, fmt.Errorf("more than %d bytes", maxSecret)
 			}
 			line = append(line, buf[0])
 		}
 		if err != nil {
-			clear(line)
+			secret.Wipe(line)
 			if errors.Is(err, io.EOF) {
 				return nil, errors.New("no line on the terminal")
 			}
@@ -139,7 +141,7 @@ func (p *pinSource) get() ([]byte, error) {
 			return nil, err
 		}
 		if err := hostkey.CheckPIN(b); err != nil {
-			clear(b)
+			secret.Wipe(b)
 			return nil, err
 		}
 		p.pin = b
@@ -147,4 +149,4 @@ func (p *pinSource) get() ([]byte, error) {
 	return append([]byte(nil), p.pin...), nil
 }
 
-func (p *pinSource) wipe() { clear(p.pin) }
+func (p *pinSource) wipe() { secret.Wipe(p.pin) }

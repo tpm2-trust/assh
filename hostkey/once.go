@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/rand"
 	"fmt"
+	"github.com/tpm2-trust/go-tui-slim/secret"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -25,7 +26,7 @@ func CreateOnceCA(t transport.TPM, o CAOptions, values map[int][]byte) (*CA, err
 	if _, err := rand.Read(auth); err != nil {
 		return nil, err
 	}
-	defer clear(auth)
+	defer secret.Wipe(auth)
 	tmpl, err := keyTemplate(P256, nil)
 	if err != nil {
 		return nil, err

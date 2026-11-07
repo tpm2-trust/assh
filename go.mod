@@ -14,3 +14,10 @@ require (
 require github.com/tpm2-trust/go-uefi-slim v0.0.0
 
 replace github.com/tpm2-trust/go-uefi-slim => ./go-uefi-slim
+
+// A process locked in memory and not dumpable (secret.LockProcess): the
+// workspace's go-tui-slim module, pinned as the submodule go-tui-slim/, as
+// tpm2-kira and the vault pin it too.
+require github.com/tpm2-trust/go-tui-slim v0.0.0
+
+replace github.com/tpm2-trust/go-tui-slim => ./go-tui-slim
