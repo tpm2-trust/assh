@@ -392,7 +392,7 @@ assh tpm da --ask-lockout-auth --reset                    # end a lockout
   from a file descriptor (`--pin-fd N`, every byte as it is: `printf
   '%s'`, not `echo`) - never from argv or the environment, never stored,
   never logged. The process locks its memory first and is not dumpable
-  (`sandbox.LockMemory`): nothing of the PIN or the lockout authorization reaches swap or a core file. Root
+  (`secret.LockProcess`, the workspace's go-tui-slim): nothing of the PIN or the lockout authorization reaches swap or a core file. Root
   stops if it cannot lock (a limit on locked memory without `CAP_IPC_LOCK`); a
   user, with the usual limit, goes on and is told. Whatever proves it runs in a salted HMAC
   session, whatever carries it is encrypted.
@@ -883,7 +883,7 @@ Not protected against:
 ## Building and testing
 
 ```bash
-git clone --recurse-submodules https://github.com/tpm2-trust/assh.git   # go-uefi-slim/ is a submodule
+git clone --recurse-submodules https://github.com/tpm2-trust/assh.git   # go-uefi-slim/ and go-tui-slim/ are submodules
 go build ./cmd/assh
 go test -count=1 ./...
 ```

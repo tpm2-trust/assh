@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/tpm2-trust/assh/hostkey"
-	"github.com/tpm2-trust/assh/sandbox"
+	"github.com/tpm2-trust/go-tui-slim/secret"
 )
 
 // A secret - a PIN, a lockout authorization - comes from a file descriptor
@@ -25,7 +25,7 @@ const maxSecret = 1024
 // is stopped by a lock it cannot take. A user with a limit on locked memory, the
 // usual case (and the tests'), goes on: it is said, and it is theirs to raise.
 var lockForSecret = sync.OnceValue(func() error {
-	err := sandbox.LockMemory()
+	err := secret.LockProcess()
 	if err != nil && os.Geteuid() != 0 {
 		fmt.Fprintf(os.Stderr, "assh: this secret can reach swap: %v\n", err)
 		return nil

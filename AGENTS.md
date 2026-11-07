@@ -14,7 +14,7 @@ name is a change to them: build and test tpm2-kira after one.
   cleared TPM loses the CA, and that is accepted: no backup, no export.
 - **The PIN is never stored, logged or passed in argv or the environment.**
   It comes from the terminal or a file descriptor, into one buffer of the final
-  size, and no further than a process that took `sandbox.LockMemory` first (out
+  size, and no further than a process that took `secret.LockProcess` (go-tui-slim) first (out
   of swap and core files; root stops if it cannot, a user goes on and is told).
   Whatever proves it to the TPM runs in a salted session, whatever carries it
   is encrypted.
