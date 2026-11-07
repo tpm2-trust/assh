@@ -1,11 +1,11 @@
 # Notes for agents working on aSSH
 
-aSSH is used by other projects (tpm2-kira includes it as the git
+aSSH is used by other projects (kira includes it as the git
 submodule `assh/`, through a `replace` in its go.mod; safearch as a
 submodule too). In the tpm2-trust workspace this checkout is the one that
-is edited: `go.work` builds tpm2-kira and the vault against it, and
+is edited: `go.work` builds kira and the vault against it, and
 `../pin assh` moves the submodules to its HEAD. A change to an exported
-name is a change to them: build and test tpm2-kira after one.
+name is a change to them: build and test kira after one.
 
 - **No host key and no secret of one is stored.** The CA lives in the TPM;
   host keys are made in the TPM under the NULL hierarchy, one per boot;
@@ -23,7 +23,7 @@ name is a change to them: build and test tpm2-kira after one.
   after wrong PINs never stops `Issue`. Anything that holds the PIN must
   be counted, and anything else must not be.
 - **go-tpm upstream, one version with its users.** No `replace` of
-  go-tpm: tpm2-kira compiles assh with its own go-tpm, and a replace here
+  go-tpm: kira compiles assh with its own go-tpm, and a replace here
   would not reach it. A go-tpm move is made in every module of the
   workspace at once (its AGENTS.md).
 - **The close is PCR 15 in the CA's own policy, and it fails closed.**
@@ -83,7 +83,7 @@ name is a change to them: build and test tpm2-kira after one.
   after the PIN is proven, and `ca remove --force` removes what a person
   saw and confirmed (`persist.Any`) - absent is not an error, and a
   variable is written in place, never removed first. Inside aSSH, everything
-  goes through it. tpm2-kira uses it for NV indices and keeps EFI variables
+  goes through it. kira uses it for NV indices and keeps EFI variables
   of its own; safearch's scripts use the `assh efivar` command.
 - **A confinement step covers every thread.** prctl, Landlock and
   seccomp act on the thread that asks, and a Go program has several from

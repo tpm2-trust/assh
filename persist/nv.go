@@ -1,6 +1,6 @@
 // Package persist is how what is kept across reboots outside a file - NV
 // indices in the TPM, EFI variables - is written and removed, by aSSH and
-// by the programs built on it (tpm2-kira, safearch's scripts through the
+// by the programs built on it (kira, safearch's scripts through the
 // assh command), one way for all:
 //
 //   - Only what is provably one's own is removed: an NV index whose public

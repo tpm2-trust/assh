@@ -9,7 +9,7 @@ line, which stays the same through reboots, updates and new PCR states.
 
 It is a Go library and a command, `assh`. Who uses it:
 
-- [tpm2-kira](https://github.com/tpm2-trust/tpm2-kira), as a library (a git
+- [kira](https://github.com/tpm2-trust/kira), as a library (a git
   submodule): the SSH server of its boot image, the CA approved by its
   signing key, kept outside the disk with `persist`.
 - [safearch](https://github.com/tpm2-trust/safearch), as the command in
@@ -311,7 +311,7 @@ have edited a slot to read PCR 7 alone.
 | Approves | whoever holds the key, on any machine | whoever knows the PIN, at the device, in any boot state | at creation only, every slot; never again |
 | Revocation | none: an old approval works whenever that state boots | a counter: `--next-generation` ends every older approval | nothing to revoke |
 | Guessing | the key's own protection | the TPM's dictionary attack lockout | nothing to guess |
-| Suits | an administrator of many machines, a build host, tpm2-kira's signing key | one machine with its owner at it (safearch) | an image that never changes its boot path, with signed PCRs for updates |
+| Suits | an administrator of many machines, a build host, kira's signing key | one machine with its owner at it (safearch) | an image that never changes its boot path, with signed PCRs for updates |
 
 Any of them can be combined with [signed PCRs](#pcrs-a-build-signs).
 
@@ -465,7 +465,7 @@ the clients' trust in it stay as they are.
    effect at the next.
 
 The values may come from elsewhere: a program that knows the next boot's
-PCRs - tpm2-kira replays the firmware's event log and predicts PCR 11 -
+PCRs - kira replays the firmware's event log and predicts PCR 11 -
 approves them with the library (`CA.Approve`, `CA.AddApproval`) before the
 reboot. `ca approve --events PCR:EVENT` calculates a PCR from zero with
 the events given (a move ahead: a PCR as another combination's boot
@@ -701,7 +701,7 @@ Nothing in it is secret, and nothing in it is trusted: it says what the
 CA should look like, and the TPM checks the CA and its approvals. No PIN
 goes into it. Other programs read and write the same file through
 `config.Load`, `config.Write` (keeps comments and unknown lines) and
-`Config.Match` (what every command applies); tpm2-kira keeps its SSH
+`Config.Match` (what every command applies); kira keeps its SSH
 server's settings in one.
 
 ## Commands
@@ -784,7 +784,7 @@ hostkey.RemoveCA(tpm, "efi:AsshCA", hostkey.Handles{}) // the CA and its indices
 ### persist: what is kept outside a file
 
 NV indices and EFI variables are written and removed one way within aSSH;
-tpm2-kira uses it for NV indices, safearch's scripts reach aSSH's variables
+kira uses it for NV indices, safearch's scripts reach aSSH's variables
 through `assh efivar`. EFI variables go through the workspace's `go-uefi-slim`
 module (`efivar`: the standard library and x/sys alone; the submodule
 `go-uefi-slim/`):
@@ -896,7 +896,7 @@ recorded state with a signature openssl made, move a CA with a PIN to
 another state, certify through a broader slot after the OS changed, and
 run the agent across reboots of the software TPM. A CA in an EFI variable
 is tested against a directory in place of efivarfs; on a machine efivarfs
-itself is used (tpm2-kira's and safearch's VM runs).
+itself is used (kira's and safearch's VM runs).
 
 ## Known limits
 

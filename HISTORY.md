@@ -36,7 +36,7 @@ Three ways to close were tried side by side on the VMs (tpm2-trust's
 branches `exp/close-counter`, `exp/close-pcr15`, `exp/debian-uki`). The
 other two, and why not:
 
-- *A window on another project's counter* (`--window-external`: tpm2-kira's
+- *A window on another project's counter* (`--window-external`: kira's
   slot 0 generation index, one read-lock for its codes and the CA). It
   tied the CA to a user's index - no such index, no CA; the index
   deleted, the CA stopped - and kept the window open as long as the user
@@ -68,7 +68,7 @@ library and x/sys alone; `persist` keeps its API on top of it.
 Before W, the window was a PCR (15) every slot had to read, extended when
 the window closed. With W in the CA's policy (2026-10-29) the PCR stayed as
 an extra, `--close-pcr` / `ASSH_CLOSE_PCR`, for what others bound to it
-(tpm2-kira's code screen, safearch). It was removed so that a CA closes one
+(kira's code screen, safearch). It was removed so that a CA closes one
 way everywhere: W alone. A PCR extended at the close also broke anything
 bound to it afterwards (a volume enrolled with `--tpm2-pcrs=15`), and a
 slot that leaves the PCR out was never stopped by it.
@@ -88,7 +88,7 @@ bytes in every position). TPM2_NV_ChangeAuth for `tpmadmin` came from a
 fork (`github.com/mrwiora/go-tpm`, google/go-tpm#452) until upstream took
 it (`c395998`, 2026-10-30), which go.mod now requires.
 
-## One CA layout for tpm2-kira and safearch, the CA in an EFI variable (2026-10-25/26)
+## One CA layout for kira and safearch, the CA in an EFI variable (2026-10-25/26)
 
 Done 2026-10-26 (VM runs below). Built on the slots, the window and the
 temporary key; it brought the CA in an EFI variable, `ca approve --slot
@@ -113,10 +113,10 @@ file to PCR 11 (systemd-creds) was dropped with it.
 
 ### Who signs in each project
 
-| | tpm2-kira | safearch |
+| | kira | safearch |
 |---|---|---|
 | authority | the signing key (`seal.key`, or the YubiKey) - the one that reseals | the authority key in the TPM, opened by the PIN |
-| policyRef | `tpm2-kira ssh ca` | `safespace identity` |
+| policyRef | `kira ssh ca` | `safespace identity` |
 | counter | none | yes: `--next-generation` revokes every older approval |
 
 ### Why the EFI variable is safe for it
@@ -129,7 +129,7 @@ Whatever is in the variable is checked by the TPM, never trusted.
 | forge or edit an approval | the TPM refuses the signature, or the PCRs do not match |
 | copy it to another machine | the CA does not load there: temporary key |
 | delete or corrupt it (root, or a firmware reset of the NVRAM) | no certificate (temporary key), and the CA is gone, as with a TPM clear |
-| write back an older approval (root) | the CA signs only if the machine boots that older state: with a counter (safearch) revoked; without one (tpm2-kira) it works for an older, still signed kernel - a downgrade, listed in tpm2-kira's known limits |
+| write back an older approval (root) | the CA signs only if the machine boots that older state: with a counter (safearch) revoked; without one (kira) it works for an older, still signed kernel - a downgrade, listed in kira's known limits |
 
 Writing an EFI variable takes root (or the firmware), and root can delete
 the identity in any design. Attributes: non-volatile, boot service and
@@ -140,9 +140,9 @@ Size: the variable keeps the approvals of the next boot alone. Firmware
 limits per variable are usually 8 KB or more; a compact encoding (CBOR,
 zstd) was left for a machine that refuses, none has.
 
-### tpm2-kira's side
+### kira's side
 
-- The CA's home is `KIRAasshCA`; `/etc/tpm2-kira/ssh_ca.json` and the
+- The CA's home is `KIRAasshCA`; `/etc/kira/ssh_ca.json` and the
   image's copy of the CA went away (the `.pub` stays: what clients trust).
 - Values of the next boot's code screen: PCR 0, 2, 7 replayed from the
   event log; PCR 11 predicted from the built UKI with the phase
@@ -176,7 +176,7 @@ was left for later; signed PCRs (`ASSH_CA_SLOT_<N>_SIGNED`) came instead.
 
 ### Decisions (2026-10-25)
 
-1. Variable names `KIRAasshCA` (tpm2-kira), `SAFEasshCA` (safearch),
+1. Variable names `KIRAasshCA` (kira), `SAFEasshCA` (safearch),
    aSSH's GUID `24415b90-39be-45c0-a9a3-d547ebe28ea0`.
 2. The variable is the CA's only copy, in both: a wiped NVRAM loses it,
    as a TPM clear does.
@@ -186,13 +186,13 @@ was left for later; signed PCRs (`ASSH_CA_SLOT_<N>_SIGNED`) came instead.
 5. Slot 1 is PCR 7, 15 in both projects: a firmware update costs slot 0
    only.
 
-What broke: tpm2-kira's existing CAs were not read; `control` created the
+What broke: kira's existing CAs were not read; `control` created the
 CA again and clients needed the new `@cert-authority` line.
 
 ### VM test, Arch UKI (2026-10-26)
 
 QEMU/OVMF, Secure Boot with sbctl, a TPM, LUKS2 + btrfs, systemd 262;
-tpm2-kira set up with `control`.
+kira set up with `control`.
 
 - `control` created the CA in `KIRAasshCA` (1294 bytes, attributes 7,
   immutable flag set again); the image build's reseal rewrote it with the
@@ -208,7 +208,7 @@ tpm2-kira set up with `control`.
 
 Learned: the boot image's DHCP client asked with another identity than
 the running system's (no machine-id in the image), so the code screen got
-another address; tpm2-kira's image now asks as the running system does.
+another address; kira's image now asks as the running system does.
 
 ### VM test, Debian GRUB (2026-10-26)
 
