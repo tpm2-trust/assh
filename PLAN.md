@@ -17,7 +17,7 @@ CA again".
       error says what to do. The path may not be a CA at all (`--ca /etc/passwd`, `efi:PK-...`).
 - [x] 3. Tests in `hostkey/remove_test.go`: another version and damaged content in a variable
       removed, indices too; a plain file and another GUID left; a foreign index left.
-- [x] 4. README `ca remove`; `../pin assh`; safearch's `tests/run.sh` and tpm2-kira's
+- [x] 4. README `ca remove`; `../pin assh`; safearch's `tests/run.sh` and kira's
       `make test-all` against it.
 
 ## What breaks
@@ -29,11 +29,11 @@ Nothing to redo. `ca remove` now removes an unreadable aSSH variable where it re
 # PLAN: the close is PCR 15 in the CA's own policy; no window index
 
 Status: **implemented** (2026-11-01) on `feat/close-pcr15`, the variant chosen of three
-(the workspace's PLAN.md); VM test PASS on Arch and Debian. tpm2-kira's side is in its PLAN.md.
+(the workspace's PLAN.md); VM test PASS on Arch and Debian. kira's side is in its PLAN.md.
 
 - [x] The close is PCR 15 in the CA's policy (below).
 - [x] `openTPM` waits for a TPM that is not there or does not answer yet: at least 3
-      attempts within 5 s (`openAttempts`, `openWait`), as tpm2-kira's `tpmdev.Open`.
+      attempts within 5 s (`openAttempts`, `openWait`), as kira's `tpmdev.Open`.
 - [x] E2. `hostkey.Close` is a ladder, each step read back: PCR 15 twice, the kill switch
       (`shEnable`, `ehEnable`, `phEnable` last, the platform's authorization random first), PCR 7;
       `CloseResult` says how, `*CloseError` whether the TPM answers; `assh close` prints it.
@@ -111,12 +111,12 @@ take the fork's changes, and it cost 422 KB and three modules.
          refused;
        - `go test -count=1 ./...` passes, also with `GOWORK=off`.
 - [x] 4. README (persist, clone with submodules), TODO-SEC, HISTORY.
-- [ ] 5. tpm2-kira's suite against it; safearch's `tests/run.sh` after `./pin assh` (its
+- [ ] 5. kira's suite against it; safearch's `tests/run.sh` after `./pin assh` (its
        build needs the submodule: `--recurse-submodules`).
 
 # PLAN: the window W alone; a window left open for a creation by `--authority-once`
 
-Status: **aSSH done** (2026-10-30), uncommitted. aSSH first; tpm2-kira and safearch follow after the
+Status: **aSSH done** (2026-10-30), uncommitted. aSSH first; kira and safearch follow after the
 owner is told.
 
 ## Goal
@@ -142,19 +142,19 @@ owner is told.
        `--authority-once` refused; `ASSH_CLOSE_PCR` an unknown key.
 - [x] 5. README (flag, key table, security), AGENTS.md (the window rule's one exception),
        HISTORY.md (the close PCR).
-- [x] 6. `go test -count=1 ./...` (passes); then tell the owner what tpm2-kira and safearch need.
+- [x] 6. `go test -count=1 ./...` (passes); then tell the owner what kira and safearch need.
 
 ## What breaks
 
-- `ASSH_CLOSE_PCR` in an assh.conf is an unknown key: tpm2-kira writes it (to be removed
+- `ASSH_CLOSE_PCR` in an assh.conf is an unknown key: kira writes it (to be removed
   there, with PCR 15 dropped from its default slots), safearch does not.
-- `hostkey.ExtendPCR` is gone: tpm2-kira's code screen calls it (removed there).
+- `hostkey.ExtendPCR` is gone: kira's code screen calls it (removed there).
 
 ## Decisions (2026-10-30)
 
 1. The opt-in only with `--authority-once`.
 2. `--close-pcr` removed entirely.
-3. tpm2-kira drops PCR 15 from its default slots (after aSSH, once the owner is told).
+3. kira drops PCR 15 from its default slots (after aSSH, once the owner is told).
 
 ---
 
@@ -212,7 +212,7 @@ CA policy = PolicyAuthorize(A, ref) ; PolicyCommandCode(TPM2_Sign) ; PolicyNV(W 
   not an empty password (an info item, taken with the format change).
 - **Slots no longer need the window PCR.** `ASSH_CA_WINDOW` and the "every slot reads the
   window" rule go. `--close-pcr`/`ASSH_CLOSE_PCR` stays as an extra: a PCR extended at
-  the close for others that bind to it (tpm2-kira's PCR 15 event; safearch's combination
+  the close for others that bind to it (kira's PCR 15 event; safearch's combination
   in PCR 15 stays a slot's PCR as before).
 
 **What the owner signs is shown.** The window is now safe from the file; the selection is
@@ -232,10 +232,10 @@ booted under the same Secure Boot keys (before the close).
 A PIN typed into a root-controlled system is lost anyway (README); the statement is the
 defence for a key elsewhere, and a check for the owner at the device.
 
-**API (tpm2-kira follows):** `CAOptions.Window` becomes `WindowHandle`;
+**API (kira follows):** `CAOptions.Window` becomes `WindowHandle`;
 `hostkey.Close(tpm, pcr, event)` becomes `ca.Close(tpm)` (lock W) plus
 `hostkey.ExtendPCR(tpm, pcr, event)` for the extra; `CA.Window` goes;
-`RemoveCA` removes W too. tpm2-kira's `remote_hostkey.go`, `sshscreen/hostkey.go`,
+`RemoveCA` removes W too. kira's `remote_hostkey.go`, `sshscreen/hostkey.go`,
 `remote_assh.go` and their tests change with it.
 
 **Tests (swtpm):** after `Close` the CA signs nothing in an approved state; after a
@@ -295,7 +295,7 @@ In the seccomp filter, before the deny list:
   `BPF_JSET` on the low word of args[0] (amd64 and arm64 alike).
 
 **Tests:** after `Apply`, a raw `clone(CLONE_NEWUSER|SIGCHLD)` fails with EPERM, `clone3`
-with ENOSYS, goroutines that need new threads still run. tpm2-kira's `gate-child` suite
+with ENOSYS, goroutines that need new threads still run. kira's `gate-child` suite
 runs against it.
 
 ### P1-4: not dumpable, and a uid of its own
@@ -330,17 +330,17 @@ runs against it.
 - [x] 5. README (window, approvals, statement, commands, security), AGENTS.md rules: the
        window is the CA's policy; nothing returns before the close; persist removes by
        shape and Name
-- [x] 6. `go test -count=1 ./...`; tpm2-kira adapted to the API (its working tree,
+- [x] 6. `go test -count=1 ./...`; kira adapted to the API (its working tree,
        uncommitted), its unit and swtpm suites run; `../pin assh`
 - [ ] 7. VM runs (`tools/vmtest.py --target both`, safearch's `tests/vm.sh`): later
 
 ## What breaks
 
-- **Every CA is made again** (format and policy): tpm2-kira's `KIRAasshCA`, safearch's
+- **Every CA is made again** (format and policy): kira's `KIRAasshCA`, safearch's
   `SAFEasshCA`; clients need the new `@cert-authority` line.
 - `ASSH_CA_WINDOW` and `ca create --window` go; `ASSH_WINDOW_HANDLE`,
   `ASSH_CHILD_UIDS`, `assh close`, `ca sign` come.
-- tpm2-kira: `CAOptions.Window`, `CA.Window`, `hostkey.Close` change (above).
+- kira: `CAOptions.Window`, `CA.Window`, `hostkey.Close` change (above).
 - The unprivileged half runs as a uid from the range, not nobody.
 
 Found while implementing: W is closed when the CA is made, since before the
