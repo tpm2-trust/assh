@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/tpm2-trust/go-tui-slim/secret"
 	"io"
 
 	"github.com/google/go-tpm/tpm2"
@@ -286,7 +287,7 @@ func CreatePINCA(t transport.TPM, o PINCAOptions) (ca *CA, err error) {
 	if err != nil {
 		return nil, err
 	}
-	defer clear(pin)
+	defer secret.Wipe(pin)
 	if err := CheckPIN(pin); err != nil {
 		return nil, err
 	}
@@ -459,7 +460,7 @@ func askPIN(pin PIN) ([]byte, error) {
 		return nil, err
 	}
 	if err := CheckPIN(b); err != nil {
-		clear(b)
+		secret.Wipe(b)
 		return nil, err
 	}
 	return b, nil
@@ -501,7 +502,7 @@ func (a *tpmAuthority) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 	if err != nil {
 		return nil, err
 	}
-	defer clear(pin)
+	defer secret.Wipe(pin)
 	p, err := createPrimary(t, tpm2.TPMRHOwner)
 	if err != nil {
 		return nil, err
@@ -627,7 +628,7 @@ func (f *CA) NextGeneration(t transport.TPM, pin PIN) error {
 	if err != nil {
 		return err
 	}
-	defer clear(b)
+	defer secret.Wipe(b)
 	p, err := createPrimary(t, tpm2.TPMRHOwner)
 	if err != nil {
 		return err
@@ -657,7 +658,7 @@ func (f *CA) RedefineCounter(t transport.TPM, pin PIN) error {
 	if err != nil {
 		return err
 	}
-	defer clear(b)
+	defer secret.Wipe(b)
 	p, err := createPrimary(t, tpm2.TPMRHOwner)
 	if err != nil {
 		return err

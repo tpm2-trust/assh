@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/tpm2-trust/go-tui-slim/secret"
 	"maps"
 	"os"
 	"os/signal"
@@ -824,14 +825,14 @@ func tpmCommand(args []string) error {
 		if lockout, err = readSecret(*lockoutFd, "lockout authorization", false); err != nil {
 			return err
 		}
-		defer clear(lockout)
+		defer secret.Wipe(lockout)
 	}
 	if *newLockout || *newLockoutFd >= 0 {
 		n, err := readSecret(*newLockoutFd, "new lockout authorization", true)
 		if err != nil {
 			return err
 		}
-		defer clear(n)
+		defer secret.Wipe(n)
 		if err := tpmadmin.SetLockoutAuth(tpm, lockout, n); err != nil {
 			return err
 		}

@@ -10,6 +10,7 @@ package tpmadmin
 import (
 	"errors"
 	"fmt"
+	"github.com/tpm2-trust/go-tui-slim/secret"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -146,7 +147,7 @@ func ChangePIN(t transport.TPM, ca *hostkey.CA, old, new hostkey.PIN) error {
 	if err != nil {
 		return err
 	}
-	defer clear(o)
+	defer secret.Wipe(o)
 	if err := hostkey.CheckPIN(o); err != nil {
 		return err
 	}
@@ -154,7 +155,7 @@ func ChangePIN(t transport.TPM, ca *hostkey.CA, old, new hostkey.PIN) error {
 	if err != nil {
 		return err
 	}
-	defer clear(n)
+	defer secret.Wipe(n)
 	if err := hostkey.CheckPIN(n); err != nil {
 		return fmt.Errorf("the new PIN: %w", err)
 	}
