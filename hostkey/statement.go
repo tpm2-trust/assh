@@ -21,7 +21,8 @@ import (
 type Statement struct {
 	CA         string            `json:"ca"`        // the CA's fingerprint
 	Authority  string            `json:"authority"` // the authority's fingerprint
-	Ref        string            `json:"ref"`       // the policy reference, hex
+	Use        string            `json:"use"`       // what the CA is for
+	Nonce      string            `json:"nonce"`     // the CA's nonce, hex: with Use, what the approval is bound to
 	Bank       Bank              `json:"bank"`
 	Slot       int               `json:"slot"`
 	PCRs       map[string]string `json:"pcrs"` // index: value, hex
@@ -43,7 +44,8 @@ func (f *CA) Statement(slot int, values map[int][]byte) (*Statement, error) {
 	st := &Statement{
 		CA:         f.Fingerprint(),
 		Authority:  fingerprintOf(f),
-		Ref:        hex.EncodeToString(f.PolicyRef),
+		Use:        f.Use,
+		Nonce:      hex.EncodeToString(f.Nonce),
 		Bank:       f.Bank,
 		Slot:       slot,
 		PCRs:       map[string]string{},
@@ -97,9 +99,9 @@ func (s *Statement) Digest() ([]byte, error) {
 	if s.Bank != SHA256 && s.Bank != SHA1 {
 		return nil, fmt.Errorf("unknown PCR bank %q", s.Bank)
 	}
-	ref, err := hex.DecodeString(s.Ref)
+	nonce, err := hex.DecodeString(s.Nonce)
 	if err != nil {
-		return nil, errors.New("the policy reference is not hex")
+		return nil, errors.New("the CA's nonce is not hex")
 	}
 	values, pcrs, err := s.values()
 	if err != nil {
@@ -109,7 +111,7 @@ func (s *Statement) Digest() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := &CA{Bank: s.Bank, PolicyRef: ref, Slots: []Slot{slot}}
+	f := &CA{Bank: s.Bank, Use: s.Use, Nonce: nonce, Slots: []Slot{slot}}
 	if s.Signed != nil {
 		if _, err := s.Signed.key(); err != nil {
 			return nil, err
@@ -125,7 +127,8 @@ func (s *Statement) Digest() ([]byte, error) {
 // String is the statement for a person.
 func (s *Statement) String() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "CA %s, authority %s, reference %q\n", s.CA, s.Authority, refText(s.Ref))
+	fmt.Fprintf(&b, "CA %s, authority %s\n", s.CA, s.Authority)
+	fmt.Fprintf(&b, "for the use %q of the CA with the nonce %s alone (its slots with the same PCRs share it)\n", s.Use, s.Nonce)
 	fmt.Fprintf(&b, "slot %d: the CA signs while these PCRs (%s) hold:\n", s.Slot, s.Bank)
 	_, pcrs, _ := s.values()
 	for _, i := range pcrs {
@@ -144,14 +147,6 @@ func (s *Statement) String() string {
 		fmt.Fprintf(&b, "  while the counter is at generation %d\n", s.Generation)
 	}
 	return b.String()
-}
-
-func refText(h string) string {
-	b, err := hex.DecodeString(h)
-	if err != nil {
-		return h
-	}
-	return string(b)
 }
 
 // ParseStatement reads a statement as Marshal writes it.

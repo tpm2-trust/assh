@@ -120,10 +120,15 @@ CA policy = PolicyAuthorize(Name of the authority, policyRef)
 ```
 
 The Name is a hash of the authority's public key as the TPM loads it. The
-policyRef (`--ref`, `assh` by default, at most 32 bytes) binds the
-approvals to this use: an authority with several CAs signs approvals that
-do not cross over. Since no PCR is in the policy, the CA and the clients'
-line stay the same through every change of the PCRs.
+policyRef binds the approvals to this one CA: it is `SHA-256` over the CA's
+use (`--ref`, `assh` by default, at most 64 bytes) and a nonce of 32 random
+bytes drawn at its creation, both in the CA file. An authority with several
+CAs - on one machine or on many - signs approvals that do not cross over,
+whatever use and PCRs the CAs share; the statement an approval is signed
+from shows the use and the nonce, and its digest follows from them. Within
+one CA, slots with the same PCRs share an approval. Since no PCR is in the
+policy, the CA and the clients' line stay the same through every change of
+the PCRs.
 
 **Slots.** A CA has up to 16 slots, 0 to 15, each a PCR selection
 (`ASSH_CA_SLOT_<N>`; `ca create --pcrs` is slot 0). A slot needs no key to
@@ -761,7 +766,7 @@ the build's key:
 signed, _ := hostkey.NewSigned([]int{11}, buildKey)
 ca, _ := hostkey.CreateCA(tpm, authorityPub, hostkey.CAOptions{Type: hostkey.P256, Bank: hostkey.SHA256,
 	Slots: []hostkey.SlotSpec{{Number: 0, PCRs: []int{0, 2, 4, 7}, Signed: signed}, {Number: 1, PCRs: []int{7}, Signed: signed}},
-	PolicyRef: []byte("myapp")})                // PCR 15 extended: it signs from the next boot on
+	Use: "myapp"})                              // PCR 15 extended: it signs from the next boot on
 d, _ := ca.ApprovalDigest(0, values)        // sign d elsewhere, then:
 ca.AddApproval(0, values, sig)              // or ca.Approve(signer, 0, values) with the key at hand
 ca.Save("efi:AsshCA")

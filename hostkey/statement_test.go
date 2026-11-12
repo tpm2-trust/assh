@@ -2,8 +2,10 @@ package hostkey
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"strings"
 	"testing"
 
 	"github.com/tpm2-trust/assh/internal/swtpmtest"
@@ -19,7 +21,7 @@ func TestStatement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ca, err := CreateCA(tpm, authority(t).Public(), CAOptions{Type: P256, Bank: SHA256, PolicyRef: []byte("assh test"),
+	ca, err := CreateCA(tpm, authority(t).Public(), CAOptions{Type: P256, Bank: SHA256, Use: "assh test",
 		Slots: []SlotSpec{{Number: 0, PCRs: []int{0, 7}, Signed: signed}, {Number: 1, PCRs: []int{7}}}})
 	if err != nil {
 		t.Fatal(err)
@@ -57,5 +59,65 @@ func TestStatement(t *testing.T) {
 	want, _ := pca.ApprovalDigest(0, pvalues)
 	if !bytes.Equal(got, want) || st.Generation != 1 {
 		t.Fatalf("with a counter: the statement's digest differs, generation %d", st.Generation)
+	}
+}
+
+// An approval opens the CA it was made for alone: a second CA with the same
+// authority, use and PCRs has another nonce, so another digest; it does not
+// take the first one's signature, and with the approval copied into its
+// file, the TPM refuses it.
+func TestApprovalBoundToItsCA(t *testing.T) {
+	sw := swtpmtest.Start(t)
+	tpm := sw.Open(t)
+	auth := authority(t)
+	opts := CAOptions{Type: P256, Bank: SHA256, PCRs: []int{0, 7}, Use: "assh test"}
+	one, err := CreateCA(tpm, auth.Public(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := CreateCA(tpm, auth.Public(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sw.Reboot(t)
+	values, err := one.ReadPCRs(tpm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1, _ := one.ApprovalDigest(0, values)
+	d2, _ := two.ApprovalDigest(0, values)
+	if bytes.Equal(d1, d2) || bytes.Equal(one.Nonce, two.Nonce) || len(one.Nonce) != NonceSize {
+		t.Fatal("two CAs of one authority, use and PCRs share an approval digest")
+	}
+	sig, err := auth.Sign(rand.Reader, d1, crypto.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := two.AddApproval(0, values, sig); err == nil {
+		t.Fatal("a CA took an approval signed for another")
+	}
+	if err := one.AddApproval(0, values, sig); err != nil {
+		t.Fatal(err)
+	}
+	issue := IssueOptions{Type: P256, KeyID: "test", Principals: []string{"host.example"}, Open: sw.Opener()}
+	certified(t, tpm, one, issue, 0)
+	two.Approvals = append(two.Approvals[:0], one.Approvals...)
+	hk, err := Issue(tpm, two, issue)
+	swtpmtest.NoneLeft(t, tpm, "Issue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkTemporary(t, two, hk)
+	if hk.Temporary == nil || !strings.Contains(hk.Temporary.Error(), "does not accept the approval's signature") {
+		t.Fatalf("the other CA with the copied approval: %v", hk.Temporary)
+	}
+	// A statement names what binds it: without the nonce there is no digest.
+	st, _ := one.Statement(0, values)
+	if got, _ := st.Digest(); !bytes.Equal(got, d1) {
+		t.Fatal("the statement's digest is not the CA's")
+	}
+	st.Nonce = ""
+	if _, err := st.Digest(); err == nil {
+		t.Fatal("a statement without a nonce has a digest")
 	}
 }

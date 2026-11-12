@@ -166,10 +166,11 @@ type CAOptions struct {
 	// CreateCA and CreatePINCA refuse them. Without them the CA is open at
 	// zero, PCR 15 as a boot starts it, and closed at its creation.
 	OpenEvents []string
-	// PolicyRef ties the authority's signatures to this CA's use ("assh
-	// boot", say): an approval made for a CA with another reference does
-	// not let this one sign. At most 32 bytes.
-	PolicyRef []byte
+	// Use says what the CA is for ("assh boot", say), at most MaxUse
+	// bytes. The authority's signatures are bound to it and to a nonce
+	// the creation draws: an approval made for another CA does not let
+	// this one sign.
+	Use string
 }
 
 // SlotSpec is a slot of a new CA: the PCRs approved for it, and PCRs a key
@@ -195,10 +196,14 @@ func newCA(t transport.TPM, o CAOptions) (*CA, error) {
 	if o.Bank != SHA256 && o.Bank != SHA1 {
 		return nil, fmt.Errorf("unknown PCR bank %q", o.Bank)
 	}
-	if len(o.PolicyRef) > 32 {
-		return nil, errors.New("a policy reference of more than 32 bytes")
+	nonce := make([]byte, NonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
 	}
-	ca := &CA{Version: fileVersion, Type: o.Type, Bank: o.Bank, PolicyRef: append([]byte(nil), o.PolicyRef...), OpenValue: make([]byte, o.Bank.size())}
+	if _, err := PolicyRefOf(o.Use, nonce); err != nil {
+		return nil, err
+	}
+	ca := &CA{Version: fileVersion, Type: o.Type, Bank: o.Bank, Use: o.Use, Nonce: nonce, OpenValue: make([]byte, o.Bank.size())}
 	if len(o.OpenEvents) > 0 {
 		if ca.OpenValue, err = EventChain(o.Bank, o.OpenEvents); err != nil {
 			return nil, err
@@ -529,6 +534,10 @@ func (s *caSigner) open() (key *tpm2.LoadResponse, session tpm2.Session, done fu
 	}
 	cleanup = append(cleanup, func() { closeSession() })
 	h := session.Handle()
+	ref, err := f.policyRef()
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	err = func() error {
 		if slot.Signed != nil {
 			// The signed PCRs first: PolicyAuthorize by their key resets
@@ -567,7 +576,7 @@ func (s *caSigner) open() (key *tpm2.LoadResponse, session tpm2.Session, done fu
 		if _, err := (tpm2.PolicyAuthorize{
 			PolicySession:  h,
 			ApprovedPolicy: tpm2.TPM2BDigest{Buffer: approved},
-			PolicyRef:      tpm2.TPM2BDigest{Buffer: f.PolicyRef},
+			PolicyRef:      tpm2.TPM2BDigest{Buffer: ref},
 			KeySign:        name,
 			CheckTicket:    ticket.Validation,
 		}).Execute(t); err != nil {

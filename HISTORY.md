@@ -4,6 +4,23 @@ Reasoning behind aSSH's design that the code and the README no longer
 carry: why it is as it is, what was tried and measured. The README says
 what it is.
 
+## An approval is bound to one CA: a nonce in the policy reference (2026-11-12)
+
+Until CA file version 5 the policy reference was the text of `--ref` alone
+(`assh`, a constant in every user). With an authority key elsewhere - no
+counter - a signature over `SHA-256(approved policy || reference)` was then
+valid for every CA that named the same authority and the same reference: a
+loose slot ("PCR 7 only") approved for one machine opened another at an
+equal PCR 7, and the statement showed a CA fingerprint the signature did
+not cover (the workspace's security review, item 6).
+
+Since version 6 the reference is `SHA-256("assh ca reference v1" || len ||
+use || nonce)`, the nonce 32 random bytes of the CA's creation. The CA's
+fingerprint itself cannot enter: the key's policy holds the reference, so
+the public key follows from it. The slot number is still not signed - a key
+has one policy reference - so slots of one CA with the same PCRs share an
+approval, which the statement says. Every CA is made again.
+
 ## The window index W replaced by PCR 15 in the CA's policy (2026-11-01)
 
 W (an NV counter, read-locked at the close; 2026-10-29 to 2026-11-01) was
