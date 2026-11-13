@@ -4,6 +4,25 @@ Reasoning behind aSSH's design that the code and the README no longer
 carry: why it is as it is, what was tried and measured. The README says
 what it is.
 
+## The system call filter became an allowlist; a signal closes the CA (2026-11-13)
+
+The filter refused a list of calls and allowed every other. What was not on
+it stayed reachable behind a first bug in the half that parses the network:
+`memfd_create` (code written into a memory file and mapped executable, past
+`PR_SET_MDWE`), `socket` of any family (Landlock covers TCP alone, and only
+from ABI 4), `kill` and `pidfd_open`. It is an allowlist now, by policy
+(files, sockets), with arguments checked where a call is needed in one form
+only (the workspace's security review, item 7). A kernel without seccomp or
+Landlock still serves, with a warning - the owner's decision; the refusal
+of a filter by the kernel (`EINVAL`) is now told apart from a kernel
+without seccomp, and warned of as such.
+
+`issue()` closed the CA in a defer and caught signals only afterwards, while
+it could wait a minute for the TPM: a SIGTERM in between ended the process
+with the CA open for the rest of the boot under `serve`, which has no
+`ExecStopPost`. `hostkey.CloseOnSignal` closes from the signal on, through
+the caller's TPM connection a command at a time (item 9).
+
 ## An approval is bound to one CA: a nonce in the policy reference (2026-11-12)
 
 Until CA file version 5 the policy reference was the text of `--ref` alone

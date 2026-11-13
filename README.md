@@ -216,7 +216,10 @@ the PCR; a resume from hibernation is a boot, which starts it at zero
 again - whoever resumes must close first.
 
 - `agent` and `serve` close it right after the host key is certified - and
-  on every other way out, a failure at any step included. The unit runs
+  on every other way out, a failure at any step included, and a signal
+  (SIGTERM, SIGINT, SIGHUP) from before the TPM is opened on
+  (`hostkey.CloseOnSignal`: a signal's default action would end the
+  process without its defers). The unit runs
   `assh close` after the agent too (`ExecStopPost=`), which also closes it
   when the agent could not start, or assh.conf does not parse. `close`
   needs no CA file.
@@ -660,8 +663,11 @@ socket and one end of a control socket. It runs as a uid no one else has
 before it reads a byte from the network takes from itself, on every thread
 (`sandbox`): new privileges, being traced or read by another process of
 its uid (not dumpable), memory that becomes executable, every file
-(Landlock), the system calls that administer the machine and those that
-make a namespace (seccomp: `clone` with a `CLONE_NEW*` flag, `clone3`). It
+(Landlock), and every system call but those on an allowlist (seccomp: what
+a Go program needs for its threads and for what it holds open; no file
+opened, no socket made, no memory file, no signal to another process, no
+`clone` with a `CLONE_NEW*` flag). Where the kernel lacks one of these it
+warns in the log and still serves. It
 holds no host key - every signature is asked over the control socket - and
 runs nothing: a login's shell becomes one end of a socket pair that it
 relays. A compromise of the SSH code gets what a login gets, and no key.
@@ -817,9 +823,28 @@ module (`efivar`: the standard library and x/sys alone; the submodule
 process for the rest of its life: no new privileges, not dumpable (no
 other process of its uid traces it or reads its memory), no memory that
 becomes executable (`PR_SET_MDWE`), no file but beneath `dirs` (Landlock;
-none with an empty policy), and none of the system calls that administer
-the machine or make a namespace (seccomp). It returns what it did, for the log; a kernel
-without Landlock or MDWE is said there, not an error.
+none with an empty policy), and no system call but those on an allowlist
+(seccomp).
+
+The allowlist is what a Go program needs to run its threads and to read
+and write what it already holds open; every other call answers `ENOSYS`,
+as a kernel without it would, so an unexpected one fails the call and not
+the process. A policy adds to it: `ReadBeneath` the calls that open and
+list files (never to write: `openat` with write access or creation is
+`EPERM`), `Sockets: []int{unix.AF_BLUETOOTH}` the making of sockets of
+those address families, with bind, connect and ioctl. Some calls are
+allowed by an argument alone: `clone` without a namespace, `kill` and
+`tgkill` to the process itself (the Go runtime signals its own threads),
+`socketpair` for `AF_UNIX`. A new Go version that needs another call shows
+in the tests, which run the confined halves under the filter.
+
+`Apply` returns a `Result`: what it took (`NoExecMemory`, `LandlockABI`,
+`Seccomp`), `String()` for the log, and `Missing()` - what this kernel did
+not take, with the reason. A kernel without Landlock, seccomp or MDWE, or
+one that refuses the filter, is no error: what is there holds, the
+description says `WARNING, not confined in full`, and the caller goes on
+(the owner's decision: a server that does not come up is the greater
+harm).
 
 prctl, Landlock and seccomp act on the thread that asks, and a Go program
 runs on several from its start: each step is taken on every thread

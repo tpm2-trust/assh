@@ -1144,10 +1144,15 @@ func (h *hostKeyFlags) issue(log func(string)) (hk *hostkey.HostKey, err error) 
 		log("this process can be dumped: " + err.Error())
 	}
 	open := openTPM(h.tpm)
+	// A signal from here until the close below has run closes the CA too:
+	// its default action would end the process without the defers.
+	guard := hostkey.CloseOnSignal(open, log)
+	defer guard.Stop()
 	tpm, err := waitTPM(h.tpm, open, log)
 	if err != nil {
 		return nil, err
 	}
+	tpm = guard.TPM(tpm)
 	defer tpm.Close()
 	defer func() {
 		if cerr := closeCA(tpm, log); cerr != nil {
