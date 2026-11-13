@@ -237,7 +237,7 @@ func caCommand(args []string) error {
 		}
 		pcrs := fs.String("pcrs", slot0, "slot 0's PCRs (the other slots are assh.conf's)")
 		bank := fs.String("bank", string(cfg.Bank), "their bank: sha256, sha1, or auto (sha256 where the TPM has it, else sha1 where 'tpm sha1 --allow' allows it)")
-		ref := fs.String("ref", cfg.PolicyRef, "what the authority's approvals are bound to (at most 32 bytes)")
+		ref := fs.String("ref", cfg.PolicyRef, "the CA's use: the authority's approvals are bound to it and to the CA's own nonce (at most 64 bytes)")
 		authOnce := fs.Bool("authority-once", cfg.AuthOnce, "an authority for the creation alone: it approves every slot now and is gone - no approval ever after")
 		openEvents := fs.String("open-events", strings.Join(cfg.OpenEvents, ","), "--authority-once: the CA is open while PCR 15 holds what these events (comma-separated) make it from zero, not zero, and is left open in this boot until 'agent' or 'serve' closes it - only where nothing untrusted runs before them (an initrd)")
 		valuesPath := fs.String("values", "", "--authority-once: the PCR values to approve, as 'agent' recorded them; default: what the TPM holds now")
@@ -279,7 +279,7 @@ func caCommand(args []string) error {
 			return err
 		}
 		defer tpm.Close()
-		opts := hostkey.CAOptions{Type: t, Bank: b, Slots: slots, OpenEvents: opened, PolicyRef: []byte(*ref)}
+		opts := hostkey.CAOptions{Type: t, Bank: b, Slots: slots, OpenEvents: opened, Use: *ref}
 		var ca *hostkey.CA
 		if *authOnce {
 			// The values every slot is approved for, as the slots will hold
@@ -1144,10 +1144,15 @@ func (h *hostKeyFlags) issue(log func(string)) (hk *hostkey.HostKey, err error) 
 		log("this process can be dumped: " + err.Error())
 	}
 	open := openTPM(h.tpm)
+	// A signal from here until the close below has run closes the CA too:
+	// its default action would end the process without the defers.
+	guard := hostkey.CloseOnSignal(open, log)
+	defer guard.Stop()
 	tpm, err := waitTPM(h.tpm, open, log)
 	if err != nil {
 		return nil, err
 	}
+	tpm = guard.TPM(tpm)
 	defer tpm.Close()
 	defer func() {
 		if cerr := closeCA(tpm, log); cerr != nil {

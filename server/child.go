@@ -101,7 +101,7 @@ func sandboxSelf() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return desc + ", " + confined, nil
+	return desc + ", " + confined.String(), nil
 }
 
 // child is the SSH side of the unprivileged half.

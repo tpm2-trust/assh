@@ -438,8 +438,8 @@ func (c Config) Match(ca *hostkey.CA) (changed bool, err error) {
 		return false, fmt.Errorf("ASSH_CA_TYPE is %s, the CA's key %s: create the CA again", c.CAType, ca.Type)
 	case c.Bank != hostkey.Auto && c.Bank != ca.Bank:
 		return false, fmt.Errorf("ASSH_CA_BANK is %s, the CA's bank %s: create the CA again", c.Bank, ca.Bank)
-	case c.PolicyRef != string(ca.PolicyRef):
-		return false, fmt.Errorf("ASSH_CA_REF is %q, the CA's %q: create the CA again", c.PolicyRef, ca.PolicyRef)
+	case c.PolicyRef != ca.Use:
+		return false, fmt.Errorf("ASSH_CA_REF is %q, the CA's use %q: create the CA again", c.PolicyRef, ca.Use)
 	}
 	if len(c.Slots) == 0 {
 		return false, nil

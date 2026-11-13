@@ -45,6 +45,7 @@ package hostkey
 import (
 	"bytes"
 	"crypto"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -140,7 +141,38 @@ func (b Bank) size() int {
 
 // fileVersion is the one format read; another is an error that says to
 // create the CA again.
-const fileVersion = 5
+const fileVersion = 6
+
+// NonceSize is the size of a CA's nonce; MaxUse the longest use a CA names.
+const (
+	NonceSize = 32
+	MaxUse    = 64
+)
+
+// refLabel separates the policy reference from every other SHA-256.
+const refLabel = "assh ca reference v1"
+
+// PolicyRefOf is the policy reference of a CA with this use and nonce: what
+// the TPM's PolicyAuthorize is given, and so what an approval is bound to.
+// The nonce is the CA's own, random at its creation: an approval signed for
+// one CA is none for another, whatever authority, use and PCRs they share.
+func PolicyRefOf(use string, nonce []byte) ([]byte, error) {
+	if len(use) > MaxUse {
+		return nil, fmt.Errorf("a use of more than %d bytes", MaxUse)
+	}
+	if len(nonce) != NonceSize {
+		return nil, fmt.Errorf("a CA's nonce of %d bytes, not %d", len(nonce), NonceSize)
+	}
+	h := sha256.New()
+	h.Write([]byte(refLabel))
+	h.Write([]byte{byte(len(use))})
+	h.Write([]byte(use))
+	h.Write(nonce)
+	return h.Sum(nil), nil
+}
+
+// policyRef is this CA's policy reference.
+func (f *CA) policyRef() ([]byte, error) { return PolicyRefOf(f.Use, f.Nonce) }
 
 // MaxSlots is how many slots a CA has room for: 0 to MaxSlots-1.
 const MaxSlots = 16
@@ -164,8 +196,12 @@ type CA struct {
 	Public  []byte `json:"public"`  // the CA key's TPMT_PUBLIC
 	Private []byte `json:"private"` // its TPM2B_PRIVATE buffer
 
-	Authority []byte `json:"authority"`  // the authority's public key, PKIX DER
-	PolicyRef []byte `json:"policy_ref"` // what its signatures are bound to
+	Authority []byte `json:"authority"` // the authority's public key, PKIX DER
+	// Use says what the CA is for ("assh boot"); Nonce is random at its
+	// creation. The authority's signatures are bound to both (PolicyRefOf):
+	// an approval opens this CA alone.
+	Use   string `json:"use"`
+	Nonce []byte `json:"nonce"`
 
 	// AuthorityTPM is the authority when it is a key in this TPM, opened
 	// by a PIN; nil for a key elsewhere.

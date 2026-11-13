@@ -105,7 +105,7 @@ func TestWrite(t *testing.T) {
 // Match makes the CA's slots the file's, keeps the approvals of the slots
 // that stay as they were, and refuses what only a new CA can change.
 func TestMatch(t *testing.T) {
-	ca := &hostkey.CA{Type: hostkey.P256, Bank: hostkey.SHA256, PolicyRef: []byte("assh"),
+	ca := &hostkey.CA{Type: hostkey.P256, Bank: hostkey.SHA256, Use: "assh", Nonce: make([]byte, hostkey.NonceSize),
 		Slots:     []hostkey.Slot{{Number: 0, PCRs: []int{0, 2, 7, 15}}, {Number: 1, PCRs: []int{7, 15}}},
 		Approvals: []hostkey.Approval{{Slot: 0}, {Slot: 1}},
 	}

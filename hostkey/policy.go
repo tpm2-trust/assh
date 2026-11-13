@@ -182,7 +182,11 @@ func (f *CA) caPolicy() ([]byte, error) {
 	if err := f.checkOpenValue(); err != nil {
 		return nil, err
 	}
-	return caPolicyFor(name, f.PolicyRef, f.Bank, f.OpenValue), nil
+	ref, err := f.policyRef()
+	if err != nil {
+		return nil, err
+	}
+	return caPolicyFor(name, ref, f.Bank, f.OpenValue), nil
 }
 
 // selection is pcrs of bank as the TPM takes them.
@@ -250,7 +254,7 @@ func (f *CA) approvedPolicy(s *Slot, values map[int][]byte, gen uint64) ([]byte,
 
 // ApprovalDigest is what the authority signs to approve values in slot at
 // the file's generation: SHA-256 over the approved policy and the CA's
-// policy reference. A signer that is not at hand (a token elsewhere) signs
+// policy reference (PolicyRefOf: its use and its nonce). A signer that is not at hand (a token elsewhere) signs
 // it there; AddApproval takes the signature. Values of PCRs the slot does
 // not read are no part of it.
 func (f *CA) ApprovalDigest(slot int, values map[int][]byte) ([]byte, error) {
@@ -266,9 +270,13 @@ func (f *CA) approvalDigestAt(s *Slot, values map[int][]byte, gen uint64) ([]byt
 	if err != nil {
 		return nil, err
 	}
+	ref, err := f.policyRef()
+	if err != nil {
+		return nil, err
+	}
 	h := sha256.New()
 	h.Write(policy)
-	h.Write(f.PolicyRef)
+	h.Write(ref)
 	return h.Sum(nil), nil
 }
 

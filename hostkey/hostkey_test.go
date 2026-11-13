@@ -37,7 +37,7 @@ func TestCertifiedHostKey(t *testing.T) {
 			sw := swtpmtest.Start(t)
 			tpm := sw.Open(t)
 			auth := authority(t)
-			ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: typ, Bank: SHA256, PCRs: []int{15, 7, 0}, PolicyRef: []byte("assh test")})
+			ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: typ, Bank: SHA256, PCRs: []int{15, 7, 0}, Use: "assh test"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -331,7 +331,7 @@ func checkSigns(t *testing.T, hk *HostKey) {
 func TestApprovalChecked(t *testing.T) {
 	auth := authority(t)
 	tpm := swtpmtest.Start(t).Open(t)
-	ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{0, 7}, PolicyRef: []byte("assh test")})
+	ca, err := CreateCA(tpm, auth.Public(), CAOptions{Type: P256, Bank: SHA256, PCRs: []int{0, 7}, Use: "assh test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +363,7 @@ func TestApprovalChecked(t *testing.T) {
 		t.Fatal("took values for too few PCRs")
 	}
 	rsaAuth, _ := rsa.GenerateKey(rand.Reader, 2048)
-	ca2, err := CreateCA(tpm, rsaAuth.Public(), CAOptions{Type: RSA2048, Bank: SHA256, PCRs: []int{0, 7}, PolicyRef: []byte("assh test")})
+	ca2, err := CreateCA(tpm, rsaAuth.Public(), CAOptions{Type: RSA2048, Bank: SHA256, PCRs: []int{0, 7}, Use: "assh test"})
 	if err != nil {
 		t.Fatal(err)
 	}

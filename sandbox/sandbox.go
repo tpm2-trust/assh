@@ -1,9 +1,9 @@
 // Package sandbox confines the process that calls it - every thread of it -
 // for the rest of its life: no new privileges, not dumpable (no other
 // process of its uid may trace it or read its memory), no memory that
-// becomes executable, no file but what the policy names (Landlock), and
-// none of the system calls that administer the machine (seccomp). Nothing of it
-// can be undone, and threads made later inherit it.
+// becomes executable, no file but what the policy names (Landlock), and no
+// system call but those on an allowlist (seccomp). Nothing of it can be
+// undone, and threads made later inherit it.
 //
 // Go runs a program on several threads from its start, and prctl, Landlock
 // and seccomp act on the thread that asks: each step is taken on every
@@ -29,57 +29,101 @@ import (
 type Policy struct {
 	// ReadBeneath are directories the process may read files and list
 	// beneath; nothing else of the file system is reachable. Empty: no file
-	// at all.
+	// at all, and no system call that opens one.
 	ReadBeneath []string
+	// Sockets are the address families the process may make sockets of
+	// (unix.AF_BLUETOOTH, say), and bind, connect and ioctl with them.
+	// Empty: it makes none, and works on those it was handed.
+	Sockets []int
 }
 
-// Apply confines this process to the policy. It describes what it did, for
-// the log; an error means a step that this kernel has did not take, and the
-// process should not go on. A kernel without Landlock, seccomp or the
-// memory protection is said in the description, not an error: what is
-// there still holds.
-func Apply(p Policy) (string, error) {
-	var desc []string
-	if err := allThreads(unix.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); err != nil {
-		return "", fmt.Errorf("no new privileges: %w", err)
+// Result is what Apply took from the process.
+type Result struct {
+	// NoExecMemory: no mapping turns executable (PR_SET_MDWE).
+	NoExecMemory bool
+	// LandlockABI is the kernel's Landlock version; 0: no Landlock, the
+	// file system is as open as the process's uid has it.
+	LandlockABI int
+	// Seccomp: the system call allowlist is on every thread; Allowed is
+	// how many calls it leaves.
+	Seccomp bool
+	Allowed int
+
+	policy  Policy
+	missing []string
+}
+
+// Missing says what this kernel did not take, each with its reason; empty
+// when the process is confined in full. The process still runs: what is
+// there holds, and the caller warns with these.
+func (r Result) Missing() []string { return r.missing }
+
+// String describes the result for the log.
+func (r Result) String() string {
+	desc := []string{"no new privileges", "not dumpable"}
+	if r.NoExecMemory {
+		desc = append(desc, "no executable memory")
 	}
-	desc = append(desc, "no new privileges")
+	switch {
+	case r.LandlockABI == 0:
+	case len(r.policy.ReadBeneath) == 0:
+		desc = append(desc, fmt.Sprintf("Landlock ABI %d: no file access", r.LandlockABI))
+	default:
+		desc = append(desc, fmt.Sprintf("Landlock ABI %d: reads %s alone", r.LandlockABI, strings.Join(r.policy.ReadBeneath, ", ")))
+	}
+	if r.Seccomp {
+		desc = append(desc, fmt.Sprintf("%d system calls allowed", r.Allowed))
+	}
+	s := strings.Join(desc, ", ")
+	if len(r.missing) > 0 {
+		s += "; WARNING, not confined in full: " + strings.Join(r.missing, "; ")
+	}
+	return s
+}
+
+// Apply confines this process to the policy and says what it took. An error
+// means a step failed for a reason of the process's own, and it should not
+// go on. A kernel without Landlock, seccomp or the memory protection, or
+// one that refuses the filter, is no error: what is there holds, the result
+// names what is missing (Missing), and the caller warns.
+func Apply(p Policy) (Result, error) {
+	r := Result{policy: p}
+	if err := allThreads(unix.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); err != nil {
+		return r, fmt.Errorf("no new privileges: %w", err)
+	}
 
 	// Process-wide: no ptrace, no /proc/<pid>/mem for others of its uid.
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
-		return "", fmt.Errorf("not dumpable: %w", err)
+		return r, fmt.Errorf("not dumpable: %w", err)
 	}
-	desc = append(desc, "not dumpable")
 
 	// Process-wide: no mapping turns executable, none is both.
 	if err := unix.Prctl(unix.PR_SET_MDWE, unix.PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0); err != nil {
-		desc = append(desc, "no memory protection ("+err.Error()+")")
+		r.missing = append(r.missing, "memory may become executable ("+err.Error()+")")
 	} else {
-		desc = append(desc, "no executable memory")
+		r.NoExecMemory = true
 	}
 
 	abi, err := landlock(p.ReadBeneath)
 	switch {
 	case errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP):
-		desc = append(desc, "no Landlock ("+err.Error()+")")
+		r.missing = append(r.missing, "no Landlock, files are as open as the uid has them ("+err.Error()+")")
 	case err != nil:
-		return "", fmt.Errorf("Landlock: %w", err)
-	case len(p.ReadBeneath) == 0:
-		desc = append(desc, fmt.Sprintf("Landlock ABI %d: no file access", abi))
+		return r, fmt.Errorf("Landlock: %w", err)
 	default:
-		desc = append(desc, fmt.Sprintf("Landlock ABI %d: reads %s alone", abi, strings.Join(p.ReadBeneath, ", ")))
+		r.LandlockABI = abi
 	}
 
-	n, err := seccomp()
+	n, err := seccomp(p)
 	switch {
-	case errors.Is(err, errNoFilter):
-		desc = append(desc, "no system call filter ("+err.Error()+")")
+	case errors.Is(err, errNoFilter), errors.Is(err, errFilterRefused):
+		r.missing = append(r.missing, "no system call filter ("+err.Error()+")")
 	case err != nil:
-		return "", fmt.Errorf("seccomp: %w", err)
+		return r, fmt.Errorf("seccomp: %w", err)
 	default:
-		desc = append(desc, fmt.Sprintf("%d system calls refused", n))
+		r.Seccomp, r.Allowed = true, n
 	}
-	return strings.Join(desc, ", "), nil
+	return r, nil
 }
 
 // allThreads makes the system call on every thread of the process.
@@ -153,22 +197,40 @@ func landlock(readBeneath []string) (int, error) {
 	return abi, nil
 }
 
-// errNoFilter: no filter for this architecture.
+// errNoFilter: no filter for this architecture, or a kernel without seccomp.
 var errNoFilter = errors.New("not built for this architecture")
 
-// seccomp refuses the system calls that administer the machine - mounts,
-// modules, the clock, other processes' memory, namespaces, user IDs,
-// keyrings, BPF, running a program - with EPERM, so that an unexpected one
-// fails the call and not the process; a system call of another
-// architecture's ABI ends the process. clone is refused with EPERM when it
-// asks for a namespace, and clone3, whose flags the filter cannot read,
-// with ENOSYS: Go then makes its threads with clone. It reports how many
-// calls are refused. TSYNC puts the filter on every thread.
-func seccomp() (int, error) {
+// errFilterRefused: the kernel has seccomp and did not take the filter.
+var errFilterRefused = errors.New("the kernel refused the filter")
+
+// seccomp leaves the process the system calls on its allowlist - what a Go
+// program needs to run its threads and to read and write what it holds
+// open, with the policy's files and sockets on top - and answers every
+// other with ENOSYS, as a kernel without it would: an unexpected one fails
+// the call and not the process, and nothing new in a kernel is reachable
+// before someone lists it. A system call of another architecture's ABI ends
+// the process. Some are allowed by their first argument alone:
+//
+//   - clone without a namespace (EPERM with one); clone3, whose flags the
+//     filter cannot read, is ENOSYS: Go then makes its threads with clone
+//   - kill and tgkill to this process alone (the Go runtime signals its
+//     own threads)
+//   - socket for the policy's address families, socketpair for AF_UNIX
+//   - openat without write access or creation
+//
+// It reports how many calls are allowed. TSYNC puts the filter on every
+// thread.
+func seccomp(p Policy) (int, error) {
 	if auditArch == 0 {
 		return 0, errNoFilter
 	}
-	denied := append(append([]uintptr{}, deniedCommon...), deniedArch...)
+	allowed := append(append([]uintptr{}, allowedCommon...), allowedArch...)
+	if len(p.ReadBeneath) > 0 {
+		allowed = append(append(allowed, filesCommon...), filesArch...)
+	}
+	if len(p.Sockets) > 0 {
+		allowed = append(allowed, socketsCommon...)
+	}
 	const (
 		ldAbsW = unix.BPF_LD | unix.BPF_W | unix.BPF_ABS
 		jeqK   = unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K
@@ -176,12 +238,14 @@ func seccomp() (int, error) {
 		jsetK  = unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K
 		retK   = unix.BPF_RET | unix.BPF_K
 		// struct seccomp_data: int nr; __u32 arch; __u64 ip; __u64 args[6].
-		// args[0]'s low word: both architectures are little-endian.
+		// An argument's low word: both architectures are little-endian.
 		offNr    = 0
 		offArch  = 4
 		offArg0  = 16
+		offArg2  = 32
 		newSpace = unix.CLONE_NEWNS | unix.CLONE_NEWCGROUP | unix.CLONE_NEWUTS | unix.CLONE_NEWIPC |
 			unix.CLONE_NEWUSER | unix.CLONE_NEWPID | unix.CLONE_NEWNET
+		writes = unix.O_WRONLY | unix.O_RDWR | unix.O_CREAT | unix.O_TRUNC | unix.O_APPEND
 	)
 	var b filter
 	b.op(unix.SockFilter{Code: ldAbsW, K: offArch})
@@ -189,22 +253,46 @@ func seccomp() (int, error) {
 	b.label("nr")
 	b.op(unix.SockFilter{Code: ldAbsW, K: offNr})
 	if syscallBit != 0 {
-		b.jump(jgeK, syscallBit, "refuse", "")
+		b.jump(jgeK, syscallBit, "nosys", "")
 	}
-	b.jump(jeqK, unix.SYS_CLONE3, "nosys", "")
 	b.jump(jeqK, unix.SYS_CLONE, "clone", "")
-	for _, nr := range denied {
-		b.jump(jeqK, uint32(nr), "refuse", "")
+	b.jump(jeqK, unix.SYS_KILL, "self", "")
+	b.jump(jeqK, unix.SYS_TGKILL, "self", "")
+	b.jump(jeqK, unix.SYS_SOCKETPAIR, "unix", "")
+	if len(p.Sockets) > 0 {
+		b.jump(jeqK, unix.SYS_SOCKET, "socket", "")
 	}
+	if len(p.ReadBeneath) > 0 {
+		b.jump(jeqK, unix.SYS_OPENAT, "open", "")
+	}
+	for _, nr := range allowed {
+		b.jump(jeqK, uint32(nr), "allow", "")
+	}
+	b.label("nosys")
+	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ERRNO | uint32(unix.ENOSYS)})
+	b.label("allow")
 	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ALLOW})
 	b.label("clone")
 	b.op(unix.SockFilter{Code: ldAbsW, K: offArg0})
-	b.jump(jsetK, newSpace, "refuse", "")
-	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ALLOW})
+	b.jump(jsetK, newSpace, "refuse", "allow2")
+	b.label("self")
+	b.op(unix.SockFilter{Code: ldAbsW, K: offArg0})
+	b.jump(jeqK, uint32(unix.Getpid()), "allow2", "refuse")
+	b.label("unix")
+	b.op(unix.SockFilter{Code: ldAbsW, K: offArg0})
+	b.jump(jeqK, unix.AF_UNIX, "allow2", "refuse")
+	b.label("open")
+	b.op(unix.SockFilter{Code: ldAbsW, K: offArg2})
+	b.jump(jsetK, writes, "refuse", "allow2")
+	b.label("socket")
+	b.op(unix.SockFilter{Code: ldAbsW, K: offArg0})
+	for _, family := range p.Sockets {
+		b.jump(jeqK, uint32(family), "allow2", "")
+	}
 	b.label("refuse")
 	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)})
-	b.label("nosys")
-	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ERRNO | uint32(unix.ENOSYS)})
+	b.label("allow2")
+	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_ALLOW})
 	b.label("kill")
 	b.op(unix.SockFilter{Code: retK, K: unix.SECCOMP_RET_KILL_PROCESS})
 	prog, err := b.assemble()
@@ -214,12 +302,15 @@ func seccomp() (int, error) {
 	fprog := unix.SockFprog{Len: uint16(len(prog)), Filter: &prog[0]}
 	if _, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC,
 		uintptr(unsafe.Pointer(&fprog))); errno != 0 {
-		if errno == unix.ENOSYS || errno == unix.EINVAL {
+		switch errno {
+		case unix.ENOSYS:
 			return 0, fmt.Errorf("%w: %v", errNoFilter, errno)
+		case unix.EINVAL:
+			return 0, fmt.Errorf("%w: %v", errFilterRefused, errno)
 		}
 		return 0, errno
 	}
-	return len(denied) + 2, nil
+	return len(allowed) + 4 + min(len(p.Sockets), 1) + min(len(p.ReadBeneath), 1), nil
 }
 
 // filter is a BPF program whose jumps name labels; "" goes on with the
@@ -274,31 +365,4 @@ func (f *filter) assemble() ([]unix.SockFilter, error) {
 		}
 	}
 	return f.prog, nil
-}
-
-// deniedCommon are the refused system calls every architecture has.
-var deniedCommon = []uintptr{
-	// file systems and mounts
-	unix.SYS_MOUNT, unix.SYS_UMOUNT2, unix.SYS_PIVOT_ROOT, unix.SYS_CHROOT,
-	unix.SYS_OPEN_TREE, unix.SYS_MOVE_MOUNT, unix.SYS_FSOPEN, unix.SYS_FSCONFIG,
-	unix.SYS_FSMOUNT, unix.SYS_FSPICK, unix.SYS_MOUNT_SETATTR, unix.SYS_SWAPON,
-	unix.SYS_SWAPOFF, unix.SYS_QUOTACTL, unix.SYS_ACCT, unix.SYS_MKNODAT,
-	unix.SYS_OPEN_BY_HANDLE_AT, unix.SYS_NAME_TO_HANDLE_AT, unix.SYS_FANOTIFY_INIT,
-	// the machine
-	unix.SYS_REBOOT, unix.SYS_KEXEC_LOAD, unix.SYS_KEXEC_FILE_LOAD,
-	unix.SYS_INIT_MODULE, unix.SYS_FINIT_MODULE, unix.SYS_DELETE_MODULE,
-	unix.SYS_SETTIMEOFDAY, unix.SYS_CLOCK_SETTIME, unix.SYS_CLOCK_ADJTIME, unix.SYS_ADJTIMEX,
-	unix.SYS_SETHOSTNAME, unix.SYS_SETDOMAINNAME, unix.SYS_SYSLOG, unix.SYS_VHANGUP,
-	// other processes, and the kernel's insides
-	unix.SYS_PTRACE, unix.SYS_PROCESS_VM_READV, unix.SYS_PROCESS_VM_WRITEV,
-	unix.SYS_KCMP, unix.SYS_PIDFD_GETFD, unix.SYS_PERF_EVENT_OPEN, unix.SYS_BPF,
-	unix.SYS_USERFAULTFD, unix.SYS_IO_URING_SETUP, unix.SYS_IO_URING_ENTER,
-	unix.SYS_IO_URING_REGISTER, unix.SYS_KEYCTL, unix.SYS_ADD_KEY, unix.SYS_REQUEST_KEY,
-	unix.SYS_PERSONALITY, unix.SYS_SCHED_SETSCHEDULER, unix.SYS_SCHED_SETATTR,
-	// namespaces and user IDs
-	unix.SYS_UNSHARE, unix.SYS_SETNS, unix.SYS_SETUID, unix.SYS_SETGID,
-	unix.SYS_SETREUID, unix.SYS_SETREGID, unix.SYS_SETRESUID, unix.SYS_SETRESGID,
-	unix.SYS_SETGROUPS, unix.SYS_SETFSUID, unix.SYS_SETFSGID,
-	// running a program
-	unix.SYS_EXECVE, unix.SYS_EXECVEAT,
 }

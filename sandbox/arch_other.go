@@ -7,4 +7,4 @@ const auditArch = 0
 
 const syscallBit = 0
 
-var deniedArch []uintptr
+var allowedCommon, allowedArch, filesCommon, filesArch, socketsCommon []uintptr

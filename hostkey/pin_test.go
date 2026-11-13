@@ -30,7 +30,7 @@ func pinCA(t *testing.T) (*swtpmtest.SWTPM, transport.TPM, *CA) {
 	sw := swtpmtest.Start(t)
 	sw.SetLockout(t, 3, 1800, 1800)
 	tpm := sw.Open(t)
-	ca, err := CreatePINCA(tpm, PINCAOptions{CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 14}, PolicyRef: []byte("assh test")}, PIN: pinOf(testPIN)})
+	ca, err := CreatePINCA(tpm, PINCAOptions{CAOptions: CAOptions{Type: P256, Bank: SHA256, PCRs: []int{7, 14}, Use: "assh test"}, PIN: pinOf(testPIN)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,8 @@ func TestPINAuthority(t *testing.T) {
 	flush(tpm, a.ObjectHandle)
 	name, _ := ca.authorityName()
 	caPub, _ := tpm2.Unmarshal[tpm2.TPMTPublic](ca.Public)
-	if !bytes.Equal(name.Buffer, a.Name.Buffer) || !bytes.Equal(caPub.AuthPolicy.Buffer, caPolicyFor(a.Name, ca.PolicyRef, ca.Bank, ca.OpenValue)) {
+	ref, _ := ca.policyRef()
+	if !bytes.Equal(name.Buffer, a.Name.Buffer) || !bytes.Equal(caPub.AuthPolicy.Buffer, caPolicyFor(a.Name, ref, ca.Bank, ca.OpenValue)) {
 		t.Fatal("the CA's policy does not name the authority's key")
 	}
 
@@ -512,15 +513,18 @@ func TestPINCAFileChecked(t *testing.T) {
 		"no open value":                        func(c *CA) { c.OpenValue = nil },
 		"another open value":                   func(c *CA) { c.OpenValue = bytes.Repeat([]byte{1}, 32) },
 		"slot 16":                              func(c *CA) { c.Slots[0].Number = 16 },
+		"another use":                          func(c *CA) { c.Use += "x" },
+		"another nonce":                        func(c *CA) { c.Nonce = bytes.Repeat([]byte{1}, NonceSize) },
+		"no nonce":                             func(c *CA) { c.Nonce = nil },
 	} {
 		if err := edit(change); err == nil {
 			t.Errorf("%s: taken", name)
 		}
 	}
 	b, _ := ca.Marshal()
-	b = bytes.Replace(b, []byte(`"version": 5`), []byte(`"version": 4`), 1)
+	b = bytes.Replace(b, []byte(`"version": 6`), []byte(`"version": 5`), 1)
 	if _, err := ParseCA(b); err == nil || !strings.Contains(err.Error(), "create the CA again") {
-		t.Fatalf("version 4: %v", err)
+		t.Fatalf("version 5: %v", err)
 	}
 }
 
